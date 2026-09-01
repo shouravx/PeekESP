@@ -1,9 +1,22 @@
+<div align="center">
+
+<img src="img/Git_Logo.png" alt="PeekESP" width="560">
+
 # PeekESP
 
-A physical system-metrics dashboard powered by an ESP32 (LilyGO TTGO T-Display)
-and LVGL. It reaches a remote DietPi box over an encrypted WireGuard tunnel,
-polls it every 5 seconds, and sweeps the readings into place with 500 ms eased
-animations instead of snapping.
+**A physical system-metrics dashboard for a remote Linux box.**
+
+![board](https://img.shields.io/badge/board-TTGO_T--Display-00E5FF?style=flat-square)
+![build](https://img.shields.io/badge/build-Arduino_IDE_%7C_PlatformIO-8CC63F?style=flat-square)
+![ui](https://img.shields.io/badge/UI-LVGL_8.3-FF2E7E?style=flat-square)
+![license](https://img.shields.io/badge/license-MIT-5C6B82?style=flat-square)
+
+</div>
+
+An ESP32 (LilyGO TTGO T-Display) reaches a remote DietPi box over an encrypted
+WireGuard tunnel, polls it every 5 seconds, and sweeps the readings into place
+with 500 ms eased animations instead of snapping. Two pinned FreeRTOS tasks keep
+the network off the render thread, so a slow tunnel never costs a frame.
 
 ```
 ┌──────────────────────────────────────────────┐
