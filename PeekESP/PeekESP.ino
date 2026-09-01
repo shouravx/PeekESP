@@ -9,6 +9,12 @@
  *           telemetry and drives 500 ms eased animations. Network latency on
  *           core 0 can never stall a frame on core 1.
  *
+ *  Two run modes, chosen at boot:
+ *    DASHBOARD - the normal display, using settings stored in NVS.
+ *    SETUP     - no usable config yet, or the left button was held at boot.
+ *                The device raises its own access point and serves a config
+ *                page; the screen shows a QR code that joins you to it.
+ *
  *  ----------------------------------------------------------------------
  *  ARDUINO IDE SETUP (do these once, or nothing will compile / display)
  *  ----------------------------------------------------------------------
@@ -16,6 +22,7 @@
  *       Core 3.x is built on ESP-IDF 5, which removed the tcpip_adapter API
  *       that WireGuard-ESP32 still uses. Stay on 2.0.x.
  *     Board: "LilyGo T-Display" (or "ESP32 Dev Module" - both verified)
+ *     Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)"
  *
  *  2. Library Manager: "TFT_eSPI", "lvgl" (8.3.x - NOT 9.x), "ArduinoJson".
  *     Library Manager offers lvgl 9.x first; pick 8.3.9. This sketch uses the
@@ -33,18 +40,21 @@
  *
  *  5. LVGL config. Copy this repo's lv_conf.h to
  *       <Arduino>/libraries/lv_conf.h     (next to the lvgl folder, NOT inside it)
- *     It is already set for 16-bit colour, a 64 KB LVGL heap, manual ticks,
- *     and the Montserrat 12/14/20 fonts this sketch uses.
+ *     LV_USE_SPINNER and LV_USE_QRCODE both default to 0 upstream, so the
+ *     stock config link-errors on two widgets this sketch uses.
  *
- *  6. Copy secrets.example.h to secrets.h in this sketch folder and fill it
- *     in. secrets.h is gitignored so your WireGuard private key stays out of
- *     the repo. Without it, the defaults below are used.
+ *  6. secrets.h is now OPTIONAL - it only seeds the factory defaults. Real
+ *     configuration happens on-device through the setup portal. Copy
+ *     secrets.example.h to secrets.h if you would rather bake yours in.
  * ============================================================================
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
 #include <time.h>
 #include <math.h>
 #include <esp_system.h>
@@ -59,43 +69,35 @@
 #include "freertos/semphr.h"
 
 // ============================================================================
-//  CONFIG
-//  Anything defined in secrets.h wins; the fallbacks below keep the sketch
-//  compiling out of the box.
+//  FACTORY DEFAULTS
+//  These are only the values a freshly-flashed device starts from. Whatever
+//  you save through the setup portal lives in NVS and wins over all of them.
 // ============================================================================
 #if __has_include("secrets.h")
   #include "secrets.h"
 #endif
 
 #ifndef WIFI_SSID
-  #define WIFI_SSID              "YOUR_WIFI_SSID"
+  #define WIFI_SSID              ""
 #endif
 #ifndef WIFI_PASSWORD
-  #define WIFI_PASSWORD          "YOUR_WIFI_PASSWORD"
+  #define WIFI_PASSWORD          ""
 #endif
-
-// --- WireGuard tunnel into the DietPi ---------------------------------------
-// Run dietpi-wireguard-setup.sh on the DietPi; it prints every value below.
 #ifndef WG_LOCAL_IP
-  #define WG_LOCAL_IP            "10.10.44.2"                  // the ESP32 inside the tunnel
+  #define WG_LOCAL_IP            "10.10.44.2"
 #endif
 #ifndef WG_PRIVATE_KEY
-  #define WG_PRIVATE_KEY         "ESP32_PRIVATE_KEY_HERE"      // ttgo-dashboard.key
+  #define WG_PRIVATE_KEY         ""
 #endif
 #ifndef WG_PEER_PUBLIC_KEY
-  #define WG_PEER_PUBLIC_KEY     "DIETPI_WG_PUBLIC_KEY_HERE"   // dietpi_wg.pub
+  #define WG_PEER_PUBLIC_KEY     ""
 #endif
 #ifndef WG_ENDPOINT_HOST
-  #define WG_ENDPOINT_HOST       "your-home.ddns.net"          // DietPi public IP / DDNS
+  #define WG_ENDPOINT_HOST       ""
 #endif
 #ifndef WG_ENDPOINT_PORT
   #define WG_ENDPOINT_PORT       51820
 #endif
-
-// --- Telemetry endpoint, reached through the tunnel -------------------------
-// The DietPi's own Tailscale address (`tailscale ip -4`). It answers because
-// the tunnel terminates on the very box that owns that address - see the note
-// on Tailscale at the bottom of this file.
 #ifndef DIETPI_HOST
   #define DIETPI_HOST            "100.64.12.3"
 #endif
@@ -106,12 +108,10 @@
   #define DIETPI_PATH            "/telemetry"
 #endif
 
-// --- Behaviour --------------------------------------------------------------
-#define USE_WIREGUARD            1     // 0 = plain LAN HTTP, handy for bring-up
-#define POLL_INTERVAL_MS         5000
 #define ANIM_MS                  500   // the sweep duration the arcs/bar use
 #define HTTP_TIMEOUT_MS          4000
 #define MAX_CONSECUTIVE_FAILURES 12    // ~60 s of nothing -> reboot the stack
+#define SETUP_HOLD_MS            1500  // left-button hold that forces setup mode
 
 // Expected JSON (see dietpi/peek-agent.py):
 //   { "host":"dietpi", "cpu_percent":12.5, "ram_percent":43.2,
@@ -135,8 +135,6 @@
 static const uint16_t SCREEN_W = 240;   // rotation 1 = landscape
 static const uint16_t SCREEN_H = 135;
 
-// The built-in Montserrat faces are optional in lv_conf.h. Fall back to the
-// default face rather than failing to build if someone trims their config.
 #if LV_FONT_MONTSERRAT_12
   #define F_SM  &lv_font_montserrat_12
 #else
@@ -149,7 +147,12 @@ static const uint16_t SCREEN_H = 135;
 #endif
 
 // ============================================================================
-//  State shared between core 0 (network) and core 1 (UI)
+//  TYPES
+//  Every type used in a function signature must be declared here, above the
+//  first function definition. The Arduino IDE generates prototypes for the
+//  whole sketch and injects them immediately before that first definition, so
+//  a type declared lower down produces "'X' was not declared in this scope"
+//  pointing at a line that looks perfectly valid.
 // ============================================================================
 struct Telemetry {
   float    cpu_percent     = 0;
@@ -166,18 +169,36 @@ enum NetState : uint8_t {
   NET_BOOT, NET_WIFI, NET_TIME, NET_TUNNEL, NET_ONLINE, NET_ERROR
 };
 
-// Gauge belongs with the widgets further down, but it has to be declared up
-// here: the Arduino IDE generates prototypes for every function in the sketch
-// and injects them immediately before the FIRST function definition. Any type
-// used in a signature must therefore be declared above that point, or the
-// generated prototypes fail to compile with "'Gauge' was not declared in this
-// scope" pointing at a line that looks perfectly valid.
 struct Gauge {
   lv_obj_t  *arc   = nullptr;
   lv_obj_t  *value = nullptr;
   lv_color_t base  = COL_CYAN;
   int32_t    shown = 0;   // current on-screen value, 0..1000 (tenths of a %)
 };
+
+// Everything the setup portal can change. Sizes are the protocol maxima:
+// an SSID is 32 bytes, a WPA2 passphrase 63, a WireGuard key 44 base64 chars.
+struct Config {
+  char     wifi_ssid[33]   = WIFI_SSID;
+  char     wifi_pass[64]   = WIFI_PASSWORD;
+  bool     wg_enabled      = true;
+  char     wg_local_ip[16] = WG_LOCAL_IP;
+  char     wg_priv[48]     = WG_PRIVATE_KEY;
+  char     wg_peer_pub[48] = WG_PEER_PUBLIC_KEY;
+  char     wg_host[64]     = WG_ENDPOINT_HOST;
+  uint16_t wg_port         = WG_ENDPOINT_PORT;
+  char     host[64]        = DIETPI_HOST;
+  uint16_t port            = DIETPI_PORT;
+  char     path[48]        = DIETPI_PATH;
+  uint16_t poll_s          = 5;
+  uint8_t  bl_idx          = 0;
+};
+
+// ============================================================================
+//  Shared state between core 0 (network) and core 1 (UI)
+// ============================================================================
+static Config            cfg;
+static Preferences       prefs;
 
 static Telemetry         g_telemetry;              // guarded by g_lock
 static SemaphoreHandle_t g_lock = nullptr;
@@ -187,8 +208,15 @@ static volatile bool     g_busy     = false;       // an HTTP GET is in flight
 static volatile uint32_t g_seq      = 0;           // bumped on every good parse
 static volatile uint32_t g_latency  = 0;           // ms for the last GET
 static volatile bool     g_force    = false;       // button-triggered refresh
+static volatile uint32_t g_reboot_at = 0;          // 0 = not scheduled
+
+static bool     g_setup_mode = false;
+static char     g_ap_ssid[24];
+static char     g_ap_pass[16];
 
 static WireGuard wg;
+static WebServer server(80);
+static DNSServer dns;
 
 // ============================================================================
 //  Display + LVGL plumbing
@@ -202,12 +230,12 @@ static lv_disp_draw_buf_t draw_buf;
 static lv_color_t lv_buf[SCREEN_W * 40];
 
 static const int PIN_BL      = 4;
-static const int PIN_BTN_L   = 0;    // "BOOT" - force an immediate refresh
+static const int PIN_BTN_L   = 0;    // "BOOT" - refresh, or hold for setup mode
 static const int PIN_BTN_R   = 35;   // cycle backlight brightness
 static const int BL_CHANNEL  = 0;
 
 static const uint8_t BL_LEVELS[] = { 255, 150, 70, 20 };
-static uint8_t s_bl_idx = 0;
+#define BL_LEVEL_COUNT (sizeof(BL_LEVELS) / sizeof(BL_LEVELS[0]))
 
 static void backlight_init() {
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -241,8 +269,86 @@ static void disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *c
 }
 
 // ============================================================================
-//  Widgets   (struct Gauge is declared up in the shared-state section — see
-//             the note there about Arduino's generated prototypes)
+//  Configuration in NVS
+//  Preferences keys are capped at 15 characters, hence the terse names.
+// ============================================================================
+static void config_load() {
+  prefs.begin("peek", true);            // read-only
+  prefs.getString("ssid",   cfg.wifi_ssid,   sizeof cfg.wifi_ssid);
+  prefs.getString("pass",   cfg.wifi_pass,   sizeof cfg.wifi_pass);
+  prefs.getString("wgip",   cfg.wg_local_ip, sizeof cfg.wg_local_ip);
+  prefs.getString("wgpriv", cfg.wg_priv,     sizeof cfg.wg_priv);
+  prefs.getString("wgpub",  cfg.wg_peer_pub, sizeof cfg.wg_peer_pub);
+  prefs.getString("wghost", cfg.wg_host,     sizeof cfg.wg_host);
+  prefs.getString("host",   cfg.host,        sizeof cfg.host);
+  prefs.getString("path",   cfg.path,        sizeof cfg.path);
+  cfg.wg_enabled = prefs.getBool("wgen",   cfg.wg_enabled);
+  cfg.wg_port    = prefs.getUShort("wgport", cfg.wg_port);
+  cfg.port       = prefs.getUShort("port",   cfg.port);
+  cfg.poll_s     = prefs.getUShort("poll",   cfg.poll_s);
+  cfg.bl_idx     = prefs.getUChar("bl",      cfg.bl_idx);
+  prefs.end();
+
+  if (cfg.bl_idx >= BL_LEVEL_COUNT) cfg.bl_idx = 0;
+  if (cfg.poll_s < 1)   cfg.poll_s = 1;      // a 0 here would busy-loop core 0
+  if (cfg.poll_s > 600) cfg.poll_s = 600;
+}
+
+static void config_save() {
+  prefs.begin("peek", false);
+  prefs.putString("ssid",   cfg.wifi_ssid);
+  prefs.putString("pass",   cfg.wifi_pass);
+  prefs.putString("wgip",   cfg.wg_local_ip);
+  prefs.putString("wgpriv", cfg.wg_priv);
+  prefs.putString("wgpub",  cfg.wg_peer_pub);
+  prefs.putString("wghost", cfg.wg_host);
+  prefs.putString("host",   cfg.host);
+  prefs.putString("path",   cfg.path);
+  prefs.putBool  ("wgen",   cfg.wg_enabled);
+  prefs.putUShort("wgport", cfg.wg_port);
+  prefs.putUShort("port",   cfg.port);
+  prefs.putUShort("poll",   cfg.poll_s);
+  prefs.putUChar ("bl",     cfg.bl_idx);
+  prefs.end();
+}
+
+static void config_save_backlight() {      // called from the button handler
+  prefs.begin("peek", false);
+  prefs.putUChar("bl", cfg.bl_idx);
+  prefs.end();
+}
+
+static void config_erase() {
+  prefs.begin("peek", false);
+  prefs.clear();
+  prefs.end();
+}
+
+// A device with no SSID has nothing to connect to, so it goes to setup.
+// The placeholder is treated as unset too: an older secrets.h carrying
+// "YOUR_WIFI_SSID" is non-empty, and without this check the device would
+// consider itself configured and never offer the setup portal at all.
+static bool config_usable() {
+  return cfg.wifi_ssid[0] != '\0' && strcmp(cfg.wifi_ssid, "YOUR_WIFI_SSID") != 0;
+}
+
+static void request_setup_mode() {
+  prefs.begin("peek", false);
+  prefs.putBool("forcecfg", true);
+  prefs.end();
+  g_reboot_at = millis() + 300;
+}
+
+static bool consume_setup_request() {
+  prefs.begin("peek", false);
+  const bool forced = prefs.getBool("forcecfg", false);
+  if (forced) prefs.putBool("forcecfg", false);   // one-shot
+  prefs.end();
+  return forced;
+}
+
+// ============================================================================
+//  Widgets   (struct Gauge is declared up in the TYPES section)
 // ============================================================================
 static Gauge     g_cpu, g_ram;
 static lv_obj_t *g_bar       = nullptr;
@@ -385,6 +491,15 @@ static lv_obj_t *make_label(lv_obj_t *parent, const lv_font_t *font, lv_color_t 
   return l;
 }
 
+static void screen_base(lv_obj_t *scr) {
+  lv_obj_set_style_bg_color(scr, COL_BG, 0);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+  lv_obj_set_style_pad_all(scr, 0, 0);
+  lv_obj_set_style_border_width(scr, 0, 0);
+  lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
+}
+
 static void make_gauge(Gauge *g, lv_obj_t *parent, int16_t x, int16_t y,
                        lv_color_t accent, const char *caption) {
   g->base  = accent;
@@ -422,14 +537,9 @@ static void make_gauge(Gauge *g, lv_obj_t *parent, int16_t x, int16_t y,
   lv_obj_align(cap, LV_ALIGN_CENTER, 0, 14);
 }
 
-static void build_ui() {
+static void build_dashboard_ui() {
   lv_obj_t *scr = lv_scr_act();
-  lv_obj_set_style_bg_color(scr, COL_BG, 0);
-  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
-  lv_obj_set_style_pad_all(scr, 0, 0);
-  lv_obj_set_style_border_width(scr, 0, 0);
-  lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
+  screen_base(scr);
 
   // ---- header ----
   make_label(scr, F_SM, COL_CYAN, 8, 3, "PEEK");
@@ -514,6 +624,45 @@ static void build_ui() {
   lv_obj_set_style_text_align(g_lbl_state, LV_TEXT_ALIGN_RIGHT, 0);
 
   apply_state(NET_BOOT);
+}
+
+// ---------------------------------------------------------------------------
+//  Setup screen. The QR encodes a WIFI: join string, so scanning it with a
+//  phone camera joins the access point directly - nobody has to read a
+//  generated password off a 1.14" panel and retype it.
+// ---------------------------------------------------------------------------
+static void build_setup_ui() {
+  lv_obj_t *scr = lv_scr_act();
+  screen_base(scr);
+
+  make_label(scr, F_SM, COL_CYAN, 8, 3, "PEEK");
+  make_label(scr, F_SM, COL_AMBER, 44, 3, "// SETUP MODE");
+
+  lv_obj_t *rule = lv_obj_create(scr);
+  lv_obj_remove_style_all(rule);
+  lv_obj_set_size(rule, 224, 1);
+  lv_obj_set_pos(rule, 8, 19);
+  lv_obj_set_style_bg_color(rule, COL_AMBER, 0);
+  lv_obj_set_style_bg_opa(rule, LV_OPA_30, 0);
+
+  // The QR needs a light quiet zone to scan reliably, so it keeps a white
+  // background even on this dark theme - that is a scanning requirement,
+  // not an aesthetic slip.
+  lv_obj_t *qr = lv_qrcode_create(scr, 100, lv_color_black(), lv_color_white());
+  lv_obj_set_pos(qr, 10, 26);
+  lv_obj_set_style_border_color(qr, lv_color_white(), 0);
+  lv_obj_set_style_border_width(qr, 3, 0);
+
+  char join[96];
+  const int n = snprintf(join, sizeof join, "WIFI:T:WPA;S:%s;P:%s;;", g_ap_ssid, g_ap_pass);
+  lv_qrcode_update(qr, join, n);
+
+  make_label(scr, F_SM, COL_TEXT_DIM, 122, 26, "SCAN TO JOIN");
+  make_label(scr, F_SM, COL_TEXT,     122, 41, g_ap_ssid);
+  make_label(scr, F_SM, COL_TEXT_DIM, 122, 58, "PASSWORD");
+  make_label(scr, F_SM, COL_TEXT,     122, 73, g_ap_pass);
+  make_label(scr, F_SM, COL_TEXT_DIM, 122, 92, "THEN OPEN");
+  make_label(scr, F_SM, COL_CYAN,     122, 107, "192.168.4.1");
 }
 
 // ---------------------------------------------------------------------------
@@ -603,7 +752,7 @@ static bool wifi_connect(uint32_t timeout_ms) {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);              // modem sleep adds ~100 ms of jitter
   WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(cfg.wifi_ssid, cfg.wifi_pass);
 
   const uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED) {
@@ -630,29 +779,31 @@ static bool time_sync(uint32_t timeout_ms) {
 }
 
 static bool tunnel_up() {
-#if USE_WIREGUARD
-  g_state = NET_TUNNEL;
-  IPAddress local;
-  if (!local.fromString(WG_LOCAL_IP)) {
-    Serial.println("[wg] WG_LOCAL_IP is not a valid address");
+  if (!cfg.wg_enabled) return true;
+  if (cfg.wg_priv[0] == '\0' || cfg.wg_peer_pub[0] == '\0' || cfg.wg_host[0] == '\0') {
+    Serial.println("[wg] tunnel enabled but keys/endpoint are blank - skipping");
     return false;
   }
-  const bool ok = wg.begin(local, WG_PRIVATE_KEY, WG_ENDPOINT_HOST,
-                           WG_PEER_PUBLIC_KEY, WG_ENDPOINT_PORT);
+
+  g_state = NET_TUNNEL;
+  IPAddress local;
+  if (!local.fromString(cfg.wg_local_ip)) {
+    Serial.println("[wg] local IP is not a valid address");
+    return false;
+  }
+  const bool ok = wg.begin(local, cfg.wg_priv, cfg.wg_host,
+                           cfg.wg_peer_pub, cfg.wg_port);
   // begin() only builds the interface; the handshake happens asynchronously
   // and the library retries it on its own, so the first GET or two below can
   // legitimately time out before traffic starts flowing.
   Serial.printf("[wg] begin -> %s\n", ok ? "interface up" : "FAILED");
   return ok;
-#else
-  return true;
-#endif
 }
 
 static bool fetch(Telemetry &out, uint32_t &latency_ms) {
-  char url[128];
+  char url[160];
   snprintf(url, sizeof url, "http://%s:%u%s",
-           DIETPI_HOST, (unsigned)DIETPI_PORT, DIETPI_PATH);
+           cfg.host, (unsigned)cfg.port, cfg.path);
 
   WiFiClient client;
   HTTPClient http;
@@ -748,11 +899,189 @@ static void netTask(void *arg) {
     }
 
     // Sleep in slices so a button press can cut the wait short.
-    const uint32_t wake = millis() + POLL_INTERVAL_MS;
+    const uint32_t wake = millis() + (uint32_t)cfg.poll_s * 1000u;
     while ((int32_t)(millis() - wake) < 0 && !g_force) {
+      if (g_reboot_at) break;
       vTaskDelay(pdMS_TO_TICKS(50));
     }
     g_force = false;
+  }
+}
+
+// ============================================================================
+//  Setup portal - a captive access point serving the configuration form.
+//
+//  Everything typed here (WiFi passphrase, WireGuard private key) crosses a
+//  local WPA2 link in plain HTTP. That is a deliberate trade: TLS would need
+//  a certificate no phone would trust, and the alternative - typing a 44
+//  character base64 key with two buttons - is not a real alternative. The AP
+//  is up only while you are configuring, and its password is per-device.
+// ============================================================================
+static const char PAGE_CSS[] PROGMEM =
+  "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+  "<title>PeekESP setup</title><style>"
+  "*{box-sizing:border-box}"
+  "body{margin:0;padding:20px;background:#05070E;color:#E6EDF7;"
+  "font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}"
+  "main{max-width:520px;margin:0 auto}"
+  "h1{font-size:20px;margin:0 0 2px;color:#00E5FF;letter-spacing:.06em}"
+  "p.sub{margin:0 0 22px;color:#5C6B82;font-size:13px}"
+  "fieldset{border:1px solid #1A2334;border-radius:8px;padding:14px 14px 4px;"
+  "margin:0 0 16px;background:#0B1220}"
+  "legend{color:#5C6B82;font-size:12px;letter-spacing:.12em;padding:0 6px}"
+  "label{display:block;margin:0 0 12px}"
+  "span{display:block;font-size:12px;color:#5C6B82;margin-bottom:4px}"
+  "input[type=text],input[type=password],input[type=number],select{width:100%;"
+  "padding:9px 10px;border:1px solid #1A2334;border-radius:6px;background:#05070E;"
+  "color:#E6EDF7;font:inherit}"
+  "input:focus,select:focus{outline:none;border-color:#00E5FF}"
+  ".row{display:flex;gap:10px}.row label{flex:1}"
+  "label.chk{display:flex;align-items:center;gap:8px;color:#E6EDF7;font-size:14px}"
+  "label.chk span{margin:0;color:#E6EDF7;font-size:14px}"
+  "button{width:100%;padding:12px;border:0;border-radius:6px;background:#00E5FF;"
+  "color:#05070E;font:600 15px/1 inherit;letter-spacing:.04em;cursor:pointer}"
+  "a.reset{display:block;text-align:center;margin-top:14px;color:#FF4D6D;font-size:13px}"
+  "</style>";
+
+static String field(const char *label, const char *name, const char *value,
+                    const char *type = "text") {
+  String s = F("<label><span>");
+  s += label;
+  s += F("</span><input type=");
+  s += type;
+  s += F(" name=");
+  s += name;
+  s += F(" value=\"");
+  s += value;                      // values here are our own stored config
+  s += F("\"></label>");
+  return s;
+}
+
+static void handle_root() {
+  String p = FPSTR(PAGE_CSS);
+  p += F("<main><h1>PeekESP</h1><p class=sub>");
+  p += g_ap_ssid;
+  p += F(" &middot; settings are saved to flash and survive a reflash of the"
+         " sketch.</p><form method=POST action=/save>");
+
+  p += F("<fieldset><legend>WIFI</legend>");
+  p += F("<label><span>Network (SSID)</span><input type=text name=ssid list=nets value=\"");
+  p += cfg.wifi_ssid;
+  p += F("\"><datalist id=nets>");
+  const int n = WiFi.scanComplete();
+  for (int i = 0; i < n && i < 20; i++) {
+    p += F("<option value=\"");
+    p += WiFi.SSID(i);
+    p += F("\">");
+  }
+  p += F("</datalist></label>");
+  p += field("Password", "pass", cfg.wifi_pass, "password");
+  p += F("</fieldset>");
+
+  p += F("<fieldset><legend>WIREGUARD TUNNEL</legend><label class=chk>"
+         "<input type=checkbox name=wgen value=1 ");
+  if (cfg.wg_enabled) p += F("checked");
+  p += F("><span>Route telemetry through the tunnel</span></label>");
+  p += field("This device's tunnel IP", "wgip", cfg.wg_local_ip);
+  p += field("Private key (this device)", "wgpriv", cfg.wg_priv);
+  p += field("Peer public key (DietPi)", "wgpub", cfg.wg_peer_pub);
+  p += F("<div class=row>");
+  p += field("Endpoint host", "wghost", cfg.wg_host);
+  p += F("</div>");
+  p += F("<label><span>Endpoint port</span><input type=number name=wgport value=");
+  p += cfg.wg_port;
+  p += F("></label></fieldset>");
+
+  p += F("<fieldset><legend>TELEMETRY</legend>");
+  p += field("Host (DietPi Tailscale IP)", "host", cfg.host);
+  p += F("<div class=row><label><span>Port</span><input type=number name=port value=");
+  p += cfg.port;
+  p += F("></label><label><span>Poll seconds</span><input type=number name=poll min=1 max=600 value=");
+  p += cfg.poll_s;
+  p += F("></label></div>");
+  p += field("Path", "path", cfg.path);
+  p += F("</fieldset>");
+
+  p += F("<button type=submit>SAVE &amp; REBOOT</button></form>"
+         "<a class=reset href=/reset>erase all settings</a></main>");
+
+  server.send(200, "text/html", p);
+}
+
+static void copy_arg(const char *name, char *dst, size_t n) {
+  if (!server.hasArg(name)) return;
+  strlcpy(dst, server.arg(name).c_str(), n);
+}
+
+static void handle_save() {
+  copy_arg("ssid",   cfg.wifi_ssid,   sizeof cfg.wifi_ssid);
+  copy_arg("pass",   cfg.wifi_pass,   sizeof cfg.wifi_pass);
+  copy_arg("wgip",   cfg.wg_local_ip, sizeof cfg.wg_local_ip);
+  copy_arg("wgpriv", cfg.wg_priv,     sizeof cfg.wg_priv);
+  copy_arg("wgpub",  cfg.wg_peer_pub, sizeof cfg.wg_peer_pub);
+  copy_arg("wghost", cfg.wg_host,     sizeof cfg.wg_host);
+  copy_arg("host",   cfg.host,        sizeof cfg.host);
+  copy_arg("path",   cfg.path,        sizeof cfg.path);
+
+  cfg.wg_enabled = server.hasArg("wgen");     // an unchecked box sends nothing
+  if (server.hasArg("wgport")) cfg.wg_port = server.arg("wgport").toInt();
+  if (server.hasArg("port"))   cfg.port    = server.arg("port").toInt();
+  if (server.hasArg("poll"))   cfg.poll_s  = server.arg("poll").toInt();
+  if (cfg.poll_s < 1)   cfg.poll_s = 1;
+  if (cfg.poll_s > 600) cfg.poll_s = 600;
+
+  config_save();
+
+  String p = FPSTR(PAGE_CSS);
+  p += F("<main><h1>Saved</h1><p class=sub>Rebooting into the dashboard. This"
+         " access point is about to disappear - that is expected.</p></main>");
+  server.send(200, "text/html", p);
+
+  // Restart from the task loop, not here: the response still has to drain.
+  g_reboot_at = millis() + 1200;
+}
+
+static void handle_reset() {
+  config_erase();
+  String p = FPSTR(PAGE_CSS);
+  p += F("<main><h1>Erased</h1><p class=sub>Back to factory defaults."
+         " Rebooting into setup mode.</p></main>");
+  server.send(200, "text/html", p);
+  g_reboot_at = millis() + 1200;
+}
+
+static void setupTask(void *arg) {
+  (void)arg;
+
+  // AP_STA rather than plain AP so the scan that fills the SSID dropdown can
+  // run without tearing the access point down under the phone that is on it.
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(g_ap_ssid, g_ap_pass);
+  vTaskDelay(pdMS_TO_TICKS(300));
+  WiFi.scanNetworks(true);                 // async; the form reads whatever is ready
+
+  dns.setErrorReplyCode(DNSReplyCode::NoError);
+  dns.start(53, "*", WiFi.softAPIP());     // wildcard -> captive portal prompt
+
+  server.on("/", handle_root);
+  server.on("/save", HTTP_POST, handle_save);
+  server.on("/reset", handle_reset);
+  server.onNotFound(handle_root);          // any URL lands on the form
+  server.begin();
+
+  Serial.printf("[setup] AP %s / %s at %s\n",
+                g_ap_ssid, g_ap_pass, WiFi.softAPIP().toString().c_str());
+
+  for (;;) {
+    dns.processNextRequest();
+    server.handleClient();
+    if (g_reboot_at && (int32_t)(millis() - g_reboot_at) >= 0) {
+      server.stop();
+      dns.stop();
+      vTaskDelay(pdMS_TO_TICKS(100));
+      esp_restart();
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
@@ -768,6 +1097,16 @@ void setup() {
   pinMode(PIN_BTN_R, INPUT);      // GPIO35 is input-only; the board pulls it up
 
   g_lock = xSemaphoreCreateMutex();
+  config_load();
+
+  const uint64_t mac = ESP.getEfuseMac();
+  snprintf(g_ap_ssid, sizeof g_ap_ssid, "PeekESP-%04X", (unsigned)(mac >> 32) & 0xFFFF);
+  snprintf(g_ap_pass, sizeof g_ap_pass, "peek%06X",     (unsigned)(mac & 0xFFFFFF));
+
+  // Three ways into setup mode: nothing configured yet, the left button held
+  // at power-on, or a request left in NVS by a long-press during normal use.
+  const bool held = (digitalRead(PIN_BTN_L) == LOW);
+  g_setup_mode = !config_usable() || held || consume_setup_request();
 
   tft.init();
   tft.setRotation(1);             // landscape, 240x135
@@ -789,8 +1128,12 @@ void setup() {
   disp_drv.draw_buf = &draw_buf;
   lv_disp_drv_register(&disp_drv);
 
-  build_ui();
-  lv_timer_create(ui_sync_cb, 120, NULL);
+  if (g_setup_mode) {
+    build_setup_ui();
+  } else {
+    build_dashboard_ui();
+    lv_timer_create(ui_sync_cb, 120, NULL);
+  }
 
   // Paint frame 0 before the lights come up. lv_refr_now() rather than
   // lv_timer_handler() because no ticks have elapsed yet, so the refresh
@@ -798,33 +1141,57 @@ void setup() {
   // uninitialised panel.
   lv_refr_now(NULL);
 
-  for (int d = 0; d <= BL_LEVELS[0]; d += 5) {   // ~400 ms fade-in
+  const uint8_t level = BL_LEVELS[cfg.bl_idx];
+  for (int d = 0; d <= level; d += 5) {   // ~400 ms fade-in
     backlight_set(d);
     delay(8);
   }
-  backlight_set(BL_LEVELS[0]);
+  backlight_set(level);
 
   // Core 0: everything that can block. Core 1: everything that must not.
-  xTaskCreatePinnedToCore(netTask, "net", 10240, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(uiTask,  "ui",   8192, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(g_setup_mode ? setupTask : netTask,
+                          "net", 10240, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(uiTask, "ui", 8192, NULL, 2, NULL, 1);
 }
 
 void loop() {
   // Buttons only. This runs on core 1 alongside uiTask, so it must not call
   // into LVGL - it sets flags and pokes the backlight, nothing more.
-  static uint32_t last_press = 0;
+  static uint32_t left_down  = 0;
+  static bool     left_fired = false;
+  static uint32_t last_right = 0;
+
   const uint32_t now = millis();
 
-  if (now - last_press > 220) {
-    if (digitalRead(PIN_BTN_L) == LOW) {
-      g_force = true;                       // refresh now instead of waiting
-      last_press = now;
-    } else if (digitalRead(PIN_BTN_R) == LOW) {
-      s_bl_idx = (s_bl_idx + 1) % (sizeof(BL_LEVELS) / sizeof(BL_LEVELS[0]));
-      backlight_set(BL_LEVELS[s_bl_idx]);
-      last_press = now;
+  // --- left: tap to refresh, hold to drop into setup mode ---
+  if (digitalRead(PIN_BTN_L) == LOW) {
+    if (!left_down) {
+      left_down  = now;
+      left_fired = false;
+    } else if (!left_fired && now - left_down > SETUP_HOLD_MS && !g_setup_mode) {
+      left_fired = true;
+      Serial.println("[peek] entering setup mode");
+      request_setup_mode();
     }
+  } else {
+    if (left_down && !left_fired && now - left_down > 30) g_force = true;
+    left_down = 0;
   }
+
+  // --- right: cycle brightness, remembered across reboots ---
+  if (digitalRead(PIN_BTN_R) == LOW && now - last_right > 250) {
+    last_right = now;
+    cfg.bl_idx = (cfg.bl_idx + 1) % BL_LEVEL_COUNT;
+    backlight_set(BL_LEVELS[cfg.bl_idx]);
+    config_save_backlight();
+  }
+
+  // A reboot requested from the dashboard side lands here; the setup portal
+  // handles its own inside setupTask so it can shut the server down first.
+  if (!g_setup_mode && g_reboot_at && (int32_t)(now - g_reboot_at) >= 0) {
+    esp_restart();
+  }
+
   vTaskDelay(pdMS_TO_TICKS(20));
 }
 
@@ -833,7 +1200,9 @@ void loop() {
  * ----------------------------------------------------------------------------
  *  An ESP32 cannot join a tailnet directly. Tailscale is WireGuard plus a
  *  control plane - node registration, rotating keys, NAT traversal and DERP
- *  relays - and none of that has an embedded client.
+ *  relays - and none of that has an embedded client. tailscaled is Go, the
+ *  keys are issued and rotated by the coordination server, and the relay
+ *  fallback is a second transport on top.
  *
  *  What this project does instead: the DietPi runs a plain WireGuard listener
  *  (wg0) next to its existing tailscale0 interface, and the ESP32 dials that.
@@ -841,5 +1210,5 @@ void loop() {
  *  on that same machine, the kernel answers regardless of which interface the
  *  packet arrived on - no forwarding or NAT rules needed. Run
  *  dietpi-wireguard-setup.sh on the DietPi and it sets all of this up and
- *  prints the keys to paste into secrets.h.
+ *  prints the keys to paste into the setup portal.
  * ==========================================================================*/

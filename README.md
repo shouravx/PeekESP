@@ -38,7 +38,7 @@ the network off the render thread, so a slow tunnel never costs a frame.
 | Path | What it is |
 |---|---|
 | [PeekESP/PeekESP.ino](PeekESP/PeekESP.ino) | The firmware. Open this one in the Arduino IDE. |
-| [PeekESP/secrets.example.h](PeekESP/secrets.example.h) | Copy to `secrets.h`, fill in, stays out of git. |
+| [PeekESP/secrets.example.h](PeekESP/secrets.example.h) | Optional factory defaults. Real config happens on-device. |
 | [lv_conf.h](lv_conf.h) | LVGL config for this board. |
 | [platformio.ini](platformio.ini) + [main.cpp](main.cpp) | PlatformIO build of the exact same sketch. |
 | [dietpi-wireguard-setup.sh](dietpi-wireguard-setup.sh) | Run on the DietPi: creates the tunnel, prints the keys. |
@@ -61,9 +61,19 @@ into ~30 distinct steps and reads as a sweep, not a staircase.
 
 ## The Tailscale part, honestly
 
-**An ESP32 cannot join a tailnet directly.** Tailscale is WireGuard plus a control
-plane — node registration, rotating keys, NAT traversal, DERP relays — and there
-is no embedded client for any of that.
+**An ESP32 cannot join a tailnet directly** — this is not a preference, and the
+gap is not small:
+
+| What Tailscale needs | Why the ESP32 can't |
+|---|---|
+| A control-plane client | `tailscaled` is Go. No implementation in C/C++, no Go runtime for Xtensa. |
+| Node registration + key rotation | Keys are issued and **rotated** by the coordination server over an authenticated Noise channel. A static config pulled out of a tailnet goes stale on its own. |
+| DERP relay fallback | When direct UDP fails, traffic falls back to HTTPS relays — a second full transport. |
+| Disco / NAT traversal | Continuous peer discovery and endpoint negotiation. |
+
+Tailscale *is* WireGuard for the data plane; everything above is the control
+plane, and that's the part with no embedded client. Headscale doesn't help —
+it reimplements the *server*, so you'd still need a client speaking the protocol.
 
 What this project does instead: the DietPi runs a **plain WireGuard listener
 (`wg0`) alongside its existing `tailscale0` interface**, and the ESP32 dials that.
@@ -72,7 +82,7 @@ that same machine, the kernel answers it regardless of which interface the packe
 arrived on. No forwarding rules, no NAT, no route advertisement needed.
 
 `dietpi-wireguard-setup.sh` sets all of this up and prints the keys to paste into
-`secrets.h`.
+the device's setup portal.
 
 ## Setup
 
@@ -83,7 +93,7 @@ sudo bash dietpi-wireguard-setup.sh
 ```
 
 It generates both keypairs, writes `/etc/wireguard/wg0.conf`, starts the tunnel,
-and prints the block of values you need for `secrets.h`.
+and prints the block of values you paste into the setup portal.
 
 Then start the telemetry endpoint:
 
@@ -131,22 +141,25 @@ has a directly reachable public IP.
    MOSI=19 SCLK=18 CS=5 DC=16 RST=23 BL=4 pinout **and** the CGRAM offset the
    135×240 panel needs — without it the image sits 40 px off.
 5. Copy this repo's `lv_conf.h` to `<Arduino>/libraries/lv_conf.h` — *next to*
-   the `lvgl` folder, not inside it.
-6. Copy `PeekESP/secrets.example.h` to `PeekESP/secrets.h` and paste in the
-   values the setup script printed.
-7. Open `PeekESP/PeekESP.ino`, upload.
+   the `lvgl` folder, not inside it. `LV_USE_SPINNER` and `LV_USE_QRCODE` both
+   default to **0** upstream, so a stock config link-errors on two widgets this
+   sketch uses.
+6. Open `PeekESP/PeekESP.ino`, set *Tools → Partition Scheme → Huge APP*,
+   upload. **No credentials needed at compile time** — you configure the device
+   from its own screen. `secrets.h` is optional and only seeds factory defaults.
 
 **Verified build** — ESP32 core 2.0.17, TFT_eSPI 2.5.43, lvgl 8.3.9,
 ArduinoJson 7.4.3, WireGuard-ESP32 0.1.5. Compiles clean with no warnings on
 both `lilygo_t_display` and `esp32` (Dev Module):
 
 ```
-Sketch uses 1064317 bytes (81%) of program storage space.
-Global variables use 117328 bytes (35%) of dynamic memory.
+Sketch uses 1111097 bytes (35%) of program storage space.
+Global variables use 118648 bytes (36%) of dynamic memory.
 ```
 
-Flash sits at 81 % of the default partition, so there is room but not a lot —
-if you add much, switch to a "Huge APP" partition scheme.
+That 35 % is with **Huge APP**. On the default 1.2 MB partition the same image
+is 84 % — it fits, but with little room to grow, so set
+*Tools → Partition Scheme → Huge APP (3MB No OTA/1MB SPIFFS)*.
 
 ### 2b. On the ESP32 — PlatformIO
 
@@ -159,16 +172,44 @@ pio run -t upload -t monitor
 
 ## Bringing it up without the tunnel
 
-Set `USE_WIREGUARD 0` in `PeekESP.ino` and point `DIETPI_HOST` at the DietPi's
-plain LAN address. That isolates display and UI problems from tunnel problems,
-which is worth doing once before you debug a handshake.
+In the setup portal, untick **"Route telemetry through the tunnel"** and point
+the telemetry host at the DietPi's plain LAN address. That isolates display and
+UI problems from tunnel problems, which is worth doing once before you debug a
+handshake.
+
+## Configuration
+
+There is no compile-time setup. A freshly flashed device has no WiFi
+credentials, so it boots straight into **setup mode**: it raises its own access
+point and the screen shows a QR code.
+
+1. Scan the QR with a phone camera — it encodes a `WIFI:` join string, so the
+   phone joins the AP directly. No typing the generated password off a 1.14"
+   panel.
+2. The captive portal opens the form (or browse to `192.168.4.1`).
+3. Fill in WiFi, the WireGuard keys, and the telemetry host. The SSID field is
+   a dropdown populated by a live scan.
+4. **Save & Reboot** — settings go to NVS and survive reflashing the sketch.
+
+To change something later, hold the **left button for 1.5 s**; the device
+reboots into setup mode. Holding it during power-on does the same, which is the
+way back in if you typo the WiFi password. "Erase all settings" at the bottom of
+the form returns the device to factory defaults.
+
+> The portal serves plain HTTP over its own WPA2 link — your WireGuard private
+> key crosses that link unencrypted. TLS would need a certificate no phone would
+> trust, and the alternative is entering a 44-character base64 key with two
+> buttons. The AP is only up while you are configuring it, and its password is
+> derived per-device from the MAC.
 
 ## Buttons
 
 | Button | Action |
 |---|---|
-| Left (GPIO 0) | Refresh now instead of waiting out the 5 s interval |
-| Right (GPIO 35) | Cycle backlight brightness — 100 / 59 / 27 / 8 % |
+| Left (GPIO 0) — tap | Refresh now instead of waiting out the poll interval |
+| Left — hold 1.5 s | Reboot into setup mode |
+| Left — held at power-on | Boot straight into setup mode |
+| Right (GPIO 35) | Cycle backlight brightness — 100 / 59 / 27 / 8 %, remembered across reboots |
 
 ## Telemetry contract
 
@@ -200,6 +241,9 @@ what hosts with no thermal zone report.
 | Compile error on `tcpip_adapter.h` | ESP32 core 3.x. Downgrade to 2.0.17. |
 | Boots, then reboots every ~60 s | Twelve failed polls in a row triggers the deliberate `esp_restart()`. The underlying failure is on the network side — watch the serial log at 115200. |
 | Backlight on, screen black | LVGL found no `lv_conf.h`. Step 5 — it belongs *beside* the `lvgl` folder. |
+| Always boots to the QR setup screen | No SSID saved yet, or the left button is reading LOW at power-on (stuck button / something pulling GPIO 0 down). |
+| Typo'd the WiFi password | Hold the left button while powering on to force setup mode back up. |
+| `undefined reference to lv_qrcode_create` | Stock `lv_conf.h`. `LV_USE_QRCODE` and `LV_USE_SPINNER` default to 0 — use this repo's copy. |
 | `region 'dram0_0_seg' overflowed` | LVGL's heap is a static array counted against a ~160 KB segment. Lower `LV_MEM_SIZE` in `lv_conf.h` (48 KB here) or shrink the draw buffer in the sketch. |
 | `'Gauge' was not declared in this scope` | You added a function above the type it uses. The Arduino IDE injects generated prototypes before the *first* function definition, so every type used in a signature must be declared above that point. See the note on `struct Gauge`. |
 
