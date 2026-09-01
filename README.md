@@ -118,8 +118,10 @@ has a directly reachable public IP.
 1. **Boards Manager** → *esp32* by Espressif → install **2.0.17**.
    Core 3.x sits on ESP-IDF 5, which removed the `tcpip_adapter` API that
    WireGuard-ESP32 still calls; it will not compile there.
-   Board: *ESP32 Dev Module*, Flash 4MB, default partition scheme.
-2. **Library Manager** → `TFT_eSPI`, `lvgl` (**8.3.x**, not 9.x), `ArduinoJson`.
+   Board: *LilyGo T-Display* (*ESP32 Dev Module* also works — both verified).
+2. **Library Manager** → `TFT_eSPI`, `lvgl`, `ArduinoJson`.
+   Library Manager offers **lvgl 9.x** first — pick **8.3.9**. This sketch uses
+   the v8 API and will not build against v9.
 3. **Sketch → Include Library → Add .ZIP Library** →
    [WireGuard-ESP32-Arduino](https://github.com/ciniml/WireGuard-ESP32-Arduino)
    (Code → Download ZIP).
@@ -133,6 +135,18 @@ has a directly reachable public IP.
 6. Copy `PeekESP/secrets.example.h` to `PeekESP/secrets.h` and paste in the
    values the setup script printed.
 7. Open `PeekESP/PeekESP.ino`, upload.
+
+**Verified build** — ESP32 core 2.0.17, TFT_eSPI 2.5.43, lvgl 8.3.9,
+ArduinoJson 7.4.3, WireGuard-ESP32 0.1.5. Compiles clean with no warnings on
+both `lilygo_t_display` and `esp32` (Dev Module):
+
+```
+Sketch uses 1064317 bytes (81%) of program storage space.
+Global variables use 117328 bytes (35%) of dynamic memory.
+```
+
+Flash sits at 81 % of the default partition, so there is room but not a lot —
+if you add much, switch to a "Huge APP" partition scheme.
 
 ### 2b. On the ESP32 — PlatformIO
 
@@ -186,6 +200,8 @@ what hosts with no thermal zone report.
 | Compile error on `tcpip_adapter.h` | ESP32 core 3.x. Downgrade to 2.0.17. |
 | Boots, then reboots every ~60 s | Twelve failed polls in a row triggers the deliberate `esp_restart()`. The underlying failure is on the network side — watch the serial log at 115200. |
 | Backlight on, screen black | LVGL found no `lv_conf.h`. Step 5 — it belongs *beside* the `lvgl` folder. |
+| `region 'dram0_0_seg' overflowed` | LVGL's heap is a static array counted against a ~160 KB segment. Lower `LV_MEM_SIZE` in `lv_conf.h` (48 KB here) or shrink the draw buffer in the sketch. |
+| `'Gauge' was not declared in this scope` | You added a function above the type it uses. The Arduino IDE injects generated prototypes before the *first* function definition, so every type used in a signature must be declared above that point. See the note on `struct Gauge`. |
 
 ## License
 

@@ -15,9 +15,11 @@
  *  1. Boards Manager -> "esp32" by Espressif, install 2.0.17.
  *       Core 3.x is built on ESP-IDF 5, which removed the tcpip_adapter API
  *       that WireGuard-ESP32 still uses. Stay on 2.0.x.
- *     Board: "ESP32 Dev Module"   Flash size: 4MB   Partition: Default
+ *     Board: "LilyGo T-Display" (or "ESP32 Dev Module" - both verified)
  *
  *  2. Library Manager: "TFT_eSPI", "lvgl" (8.3.x - NOT 9.x), "ArduinoJson".
+ *     Library Manager offers lvgl 9.x first; pick 8.3.9. This sketch uses the
+ *     v8 API and will not build against v9.
  *
  *  3. WireGuard-ESP32: Sketch -> Include Library -> Add .ZIP Library, using
  *       https://github.com/ciniml/WireGuard-ESP32-Arduino  (Code -> Download ZIP)
@@ -164,6 +166,19 @@ enum NetState : uint8_t {
   NET_BOOT, NET_WIFI, NET_TIME, NET_TUNNEL, NET_ONLINE, NET_ERROR
 };
 
+// Gauge belongs with the widgets further down, but it has to be declared up
+// here: the Arduino IDE generates prototypes for every function in the sketch
+// and injects them immediately before the FIRST function definition. Any type
+// used in a signature must therefore be declared above that point, or the
+// generated prototypes fail to compile with "'Gauge' was not declared in this
+// scope" pointing at a line that looks perfectly valid.
+struct Gauge {
+  lv_obj_t  *arc   = nullptr;
+  lv_obj_t  *value = nullptr;
+  lv_color_t base  = COL_CYAN;
+  int32_t    shown = 0;   // current on-screen value, 0..1000 (tenths of a %)
+};
+
 static Telemetry         g_telemetry;              // guarded by g_lock
 static SemaphoreHandle_t g_lock = nullptr;
 
@@ -226,15 +241,9 @@ static void disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *c
 }
 
 // ============================================================================
-//  Widgets
+//  Widgets   (struct Gauge is declared up in the shared-state section — see
+//             the note there about Arduino's generated prototypes)
 // ============================================================================
-struct Gauge {
-  lv_obj_t  *arc   = nullptr;
-  lv_obj_t  *value = nullptr;
-  lv_color_t base  = COL_CYAN;
-  int32_t    shown = 0;   // current on-screen value, 0..1000 (tenths of a %)
-};
-
 static Gauge     g_cpu, g_ram;
 static lv_obj_t *g_bar       = nullptr;
 static lv_obj_t *g_bar_value = nullptr;

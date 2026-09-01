@@ -20,7 +20,12 @@
  * Memory
  *-----------------*/
 #define LV_MEM_CUSTOM      0
-#define LV_MEM_SIZE        (64U * 1024U)   /* internal LVGL heap for objects/styles/anims */
+/* LVGL's heap is a STATIC array, so it counts against the ~160 KB dram0_0_seg
+ * limit alongside the draw buffer and the WiFi stack. 64 KB overflows that
+ * segment by ~9 KB on this board. This dashboard is a couple of dozen objects,
+ * a handful of styles and at most four concurrent animations — call it 10 KB —
+ * so 48 KB still leaves a wide margin. */
+#define LV_MEM_SIZE        (48U * 1024U)
 
 /*------------------
  * Timing
