@@ -1,3 +1,16 @@
+# Credentials — WiFi password + WireGuard private key live here
+secrets.h
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+
 # Prerequisites
 *.d
 
