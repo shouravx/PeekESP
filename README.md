@@ -84,6 +84,50 @@ arrived on. No forwarding rules, no NAT, no route advertisement needed.
 `dietpi-wireguard-setup.sh` sets all of this up and prints the keys to paste into
 the device's setup portal.
 
+### How the ESP32 actually reaches the tailnet
+
+```
+ESP32 ──WiFi──▶ your router ──Internet──▶ DietPi  :51820/udp
+                                             │
+                                        wg0  10.10.44.1
+                                             │
+                                      ── DietPi kernel ──
+                                             │
+                                 tailscale0  100.x.x.x
+                                             │
+                                        the tailnet
+```
+
+The ESP32's WireGuard client makes the tunnel its **default route**, so every
+packet it sends — including the telemetry request — goes down `wg0`. From there:
+
+**Reaching the DietPi itself** (the default, and all this dashboard needs):
+nothing extra. `100.x.x.x` is a local address on that machine, so the kernel
+answers it no matter which interface the packet arrived on.
+
+**Reaching other tailnet peers**: the DietPi has to forward. The `PostUp` rules
+in `wg0.conf` do this by masquerading `wg0` traffic out of `tailscale0`, so other
+peers see it as coming from the DietPi. Nothing needs approving in the admin
+console. The trade is that it's one-way — other peers can't open connections
+*to* the ESP32. If you want that, drop the `MASQUERADE` line and advertise the
+subnet instead:
+
+```bash
+sudo tailscale up --advertise-routes=10.10.44.0/24
+```
+
+then approve the route at `login.tailscale.com/admin/machines`.
+
+> **MagicDNS names will not resolve on the ESP32** — it has no route to
+> Tailscale's resolver. Always give the setup portal a literal `100.x.x.x`
+> address.
+
+Two ordering constraints worth knowing, both already handled in the sketch:
+NTP has to complete *before* the tunnel comes up (WireGuard's handshake carries
+a replay-protection timestamp, and the ESP32 boots at epoch 0), and because the
+tunnel becomes the default route, anything that must not go through it has to
+happen first.
+
 ## Setup
 
 ### 1. On the DietPi

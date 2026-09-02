@@ -50,6 +50,29 @@ Address = ${WG_SUBNET_BASE}.1/24
 ListenPort = ${WG_PORT}
 PrivateKey = ${DIETPI_PRIV}
 
+# --- gateway into the tailnet -------------------------------------------
+# Reaching THIS box's own 100.x.x.x address needs none of the following: the
+# kernel accepts packets addressed to a local IP off any interface. These
+# rules are for reaching OTHER tailnet peers, by making the DietPi forward
+# and masquerade for the ESP32.
+#
+# MASQUERADE rather than route advertisement on purpose: the other peers then
+# see the traffic as coming from this machine's own tailscale address, so
+# nothing needs approving in the admin console. The trade is that it is
+# one-way -- other peers cannot open connections back to the ESP32. If you
+# want that too, drop the MASQUERADE line and instead run
+#   tailscale up --advertise-routes=${WG_SUBNET_BASE}.0/24
+# then approve the route at https://login.tailscale.com/admin/machines
+#
+# iptables accepts rules naming an interface that does not exist yet, so these
+# are harmless if Tailscale is not installed.
+PostUp = iptables -A FORWARD -i %i -o tailscale0 -j ACCEPT
+PostUp = iptables -A FORWARD -i tailscale0 -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = iptables -t nat -A POSTROUTING -o tailscale0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -o tailscale0 -j ACCEPT
+PostDown = iptables -D FORWARD -i tailscale0 -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -o tailscale0 -j MASQUERADE
+
 [Peer]
 # ${ESP32_NAME}
 PublicKey = ${ESP32_PUB}
@@ -58,7 +81,7 @@ PersistentKeepalive = 25
 EOF
 chmod 600 ${WG_IF}.conf
 
-echo "==> Enabling IP forwarding (defensive default; not strictly required for this single-box setup)..."
+echo "==> Enabling IP forwarding (needed to reach tailnet peers other than this box)..."
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 grep -q '^net.ipv4.ip_forward' /etc/sysctl.conf 2>/dev/null || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
@@ -91,10 +114,24 @@ Next steps:
      has a directly reachable public IP.
   2. Make sure your telemetry HTTP server (returning the JSON the ESP32
      expects) is listening on 0.0.0.0:8080, not just 127.0.0.1.
-  3. Check handshake status any time with:  sudo wg show
+  3. Enter the values above in the ESP32's setup portal (scan the QR code on
+     its screen, or browse to 192.168.4.1 while joined to its access point).
+  4. Check handshake status any time with:  sudo wg show
+     "latest handshake: (none)" means the ESP32's packets are not arriving —
+     look at the port forward, not at the keys.
 
-Optional — only needed if OTHER Tailscale devices (not just this ESP32
-dashboard) should be able to reach the ESP32 by its own address:
-  sudo tailscale up --advertise-routes=${WG_SUBNET_BASE}.0/24
-  (then approve the route at https://login.tailscale.com/admin/machines)
+Reaching the tailnet from the ESP32
+  This box's own ${TS_IP} works with no extra setup: the kernel answers a
+  local address off any interface. Forwarding to OTHER tailnet peers is
+  handled by the PostUp rules in ${WG_IF}.conf, which masquerade wg0 traffic
+  out of tailscale0 — so those peers see it as coming from this machine.
+
+  That is one-way. If other Tailscale devices should be able to open
+  connections TO the ESP32, remove the MASQUERADE line from ${WG_IF}.conf and
+  advertise the subnet instead:
+    sudo tailscale up --advertise-routes=${WG_SUBNET_BASE}.0/24
+    (then approve the route at https://login.tailscale.com/admin/machines)
+
+  Note: MagicDNS names do not resolve on the ESP32 — it has no route to
+  Tailscale's resolver. Always give it a literal 100.x.x.x address.
 EOF
