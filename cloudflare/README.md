@@ -32,13 +32,23 @@ npx wrangler deploy
 They're **secrets, not vars** — `wrangler.toml` is committed, so nothing
 sensitive belongs in it.
 
+> **These are Cloudflare Worker secrets, not GitHub Actions secrets.** They are
+> separate stores and a GitHub secret never reaches the running Worker. If every
+> endpoint returns
+> `{"error":"PUSH_TOKEN and READ_TOKEN secrets are not set"}`, the deploy
+> succeeded and this is the step that's missing. `wrangler deploy` uploads code
+> only and deliberately leaves Worker secrets alone, which is why you set them
+> once and they survive every later deploy. You can also set them in the
+> dashboard: **Workers & Pages → your worker → Settings → Variables and Secrets
+> → Add → type Secret**, which takes effect without a redeploy.
+
 ## Endpoints
 
 | Method | Path | Token | Purpose |
 |---|---|---|---|
 | `POST` | `/ingest` | `PUSH_TOKEN` | The host publishes a telemetry snapshot |
 | `GET` | `/telemetry` | `READ_TOKEN` | The ESP32 reads the latest one |
-| `GET` | `/health` | none | Confirm the Worker deployed |
+| `GET` | `/health` | none | Confirm the Worker deployed — answers even with no secrets set, reporting `configured: true/false` |
 
 `/telemetry` returns the stored JSON with an added **`age_s`** — seconds since
 the host last pushed. The firmware shows `STALE` above 30 s, which is what

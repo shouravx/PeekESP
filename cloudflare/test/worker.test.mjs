@@ -40,7 +40,14 @@ async function check(name, res, expectStatus, bodyTest) {
 const SAMPLE = JSON.stringify({ host: "dietpi", cpu_percent: 12.5, ram_percent: 43.2 });
 
 await check("health needs no token",
-  await worker.fetch(req("/health"), env), 200);
+  await worker.fetch(req("/health"), env), 200,
+  (j) => j && j.ok === true && j.configured === true);
+
+// /health must survive a missing-secrets deploy: it is the only way to tell
+// "deployed but unconfigured" from "not deployed", and CI pings it.
+await check("health still answers 200 with secrets unset, and says so",
+  await worker.fetch(req("/health"), { ...env, PUSH_TOKEN: "", READ_TOKEN: "" }), 200,
+  (j) => j && j.ok === true && j.configured === false && typeof j.hint === "string");
 
 await check("telemetry before any push -> 503",
   await worker.fetch(req("/telemetry", { token: env.READ_TOKEN }), env), 503);

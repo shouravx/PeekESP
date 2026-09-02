@@ -93,8 +93,29 @@ export default {
       return new Response(null, { status: 204, headers: CORS });
     }
 
-    if (!env.PUSH_TOKEN || !env.READ_TOKEN) {
-      return json({ error: "PUSH_TOKEN and READ_TOKEN secrets are not set" }, 500);
+    const configured = Boolean(env.PUSH_TOKEN && env.READ_TOKEN);
+
+    // /health answers BEFORE the secret gate on purpose. It exists to confirm
+    // a deploy landed, and "deployed but not yet configured" is a different
+    // problem from "not deployed at all" - collapsing both into a 500 sends
+    // you looking at the wrong thing. It still says nothing about whether any
+    // telemetry exists, and an unconfigured Worker rejects every real request
+    // anyway, so reporting the flag gives nothing away.
+    if (url.pathname === "/health") {
+      return json({
+        ok: true,
+        configured,
+        ...(configured ? {} : { hint: "set PUSH_TOKEN and READ_TOKEN with: wrangler secret put" }),
+      });
+    }
+
+    if (!configured) {
+      return json({
+        error: "PUSH_TOKEN and READ_TOKEN secrets are not set",
+        hint: "These are Cloudflare Worker secrets, not GitHub Actions secrets. " +
+              "Set them with 'wrangler secret put PUSH_TOKEN' (and READ_TOKEN), or in " +
+              "the dashboard under Workers > your worker > Settings > Variables and Secrets.",
+      }, 500);
     }
 
     const id = env.TELEMETRY.idFromName("singleton");
@@ -110,11 +131,6 @@ export default {
       if (!tokenMatches(token, env.READ_TOKEN)) return json({ error: "unauthorized" }, 401);
       return stub.fetch("https://do/");
     }
-
-    // Deliberately unauthenticated, and deliberately says nothing about
-    // whether any telemetry exists - it is only here so you can confirm the
-    // Worker deployed without handing out a token.
-    if (url.pathname === "/health") return json({ ok: true });
 
     return json({ error: "not found" }, 404);
   },
