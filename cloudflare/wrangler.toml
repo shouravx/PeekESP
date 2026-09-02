@@ -1,0 +1,21 @@
+name = "peek-relay"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# The Durable Object holds the latest telemetry blob. One instance, addressed
+# by the fixed name "singleton" - there is only ever one host being reported.
+[[durable_objects.bindings]]
+name = "TELEMETRY"
+class_name = "TelemetryStore"
+
+# SQLite-backed Durable Objects are the ones available on the Workers free
+# plan. If `wrangler deploy` complains that Durable Objects are unavailable
+# for your account, that is the thing to check first.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TelemetryStore"]
+
+# PUSH_TOKEN and READ_TOKEN are secrets, NOT vars - never put them in this
+# file, it is committed. Set them with:
+#   npx wrangler secret put PUSH_TOKEN
+#   npx wrangler secret put READ_TOKEN

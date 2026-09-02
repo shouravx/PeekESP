@@ -24,19 +24,23 @@
  *     Board: "LilyGo T-Display" (or "ESP32 Dev Module" - both verified)
  *     Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)"
  *
- *  2. Library Manager: "TFT_eSPI", "lvgl" (8.3.x - NOT 9.x), "ArduinoJson".
+ *  2. Library Manager: "lvgl" (8.3.x - NOT 9.x) and "ArduinoJson".
  *     Library Manager offers lvgl 9.x first; pick 8.3.9. This sketch uses the
  *     v8 API and will not build against v9.
  *
- *  3. WireGuard-ESP32: Sketch -> Include Library -> Add .ZIP Library, using
- *       https://github.com/ciniml/WireGuard-ESP32-Arduino  (Code -> Download ZIP)
+ *  3. TFT_eSPI from LilyGO, who ship a copy already configured for this exact
+ *     board - copy the TFT_eSPI folder out of
+ *       https://github.com/Xinyuan-LilyGO/TTGO-T-Display
+ *     into <Arduino>/libraries/. Its User_Setup_Select.h already points at
+ *     Setup25_TTGO_T_Display.h, so there is nothing to edit and no way to end
+ *     up with the image offset by 40 px.
+ *     (Library Manager's TFT_eSPI 2.5.43 also works - both are verified - but
+ *     then you must edit User_Setup_Select.h by hand: comment out
+ *     "#include <User_Setup.h>" and uncomment the Setup25 line.)
  *
- *  4. TFT_eSPI pin config. Edit
- *       <Arduino>/libraries/TFT_eSPI/User_Setup_Select.h
- *     comment out   #include <User_Setup.h>
- *     uncomment     #include <User_Setups/Setup25_TTGO_T_Display.h>
- *     That header already carries the MOSI=19 SCLK=18 CS=5 DC=16 RST=23 BL=4
- *     pinout and, importantly, the CGRAM offset the 135x240 panel needs.
+ *  4. WireGuard-ESP32, only if you use the DIRECT transport: Sketch ->
+ *     Include Library -> Add .ZIP Library, using
+ *       https://github.com/ciniml/WireGuard-ESP32-Arduino  (Code -> Download ZIP)
  *
  *  5. LVGL config. Copy this repo's lv_conf.h to
  *       <Arduino>/libraries/lv_conf.h     (next to the lvgl folder, NOT inside it)
@@ -51,6 +55,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -58,6 +63,8 @@
 #include <time.h>
 #include <math.h>
 #include <esp_system.h>
+
+#include "ca_certs.h"
 
 #include <TFT_eSPI.h>
 #include <lvgl.h>
@@ -109,9 +116,20 @@
 #endif
 
 #define ANIM_MS                  500   // the sweep duration the arcs/bar use
-#define HTTP_TIMEOUT_MS          4000
+#define HTTP_TIMEOUT_MS          8000  // TLS handshakes need more than plain HTTP
 #define MAX_CONSECUTIVE_FAILURES 12    // ~60 s of nothing -> reboot the stack
 #define SETUP_HOLD_MS            1500  // left-button hold that forces setup mode
+#define STALE_AFTER_S            30    // relay data older than this reads as stale
+
+// How the device reaches its telemetry.
+//   DIRECT - straight HTTP to the host, over a WireGuard tunnel or the LAN.
+//            Needs the host to accept an inbound connection: a port forward,
+//            or a tunnel terminating on it.
+//   RELAY  - HTTPS to a Cloudflare Worker that the host pushes to. Both ends
+//            only dial OUT, so it works behind CGNAT and on networks you do
+//            not administer. See cloudflare/ in this repo.
+#define TRANSPORT_DIRECT 0
+#define TRANSPORT_RELAY  1
 
 // Expected JSON (see dietpi/peek-agent.py):
 //   { "host":"dietpi", "cpu_percent":12.5, "ram_percent":43.2,
@@ -162,11 +180,12 @@ struct Telemetry {
   float    rx_kbps         = 0;
   float    tx_kbps         = 0;
   uint32_t uptime_seconds  = 0;
+  uint32_t age_s           = 0;       // relay only: seconds since the host pushed
   char     host[20]        = "dietpi";
 };
 
 enum NetState : uint8_t {
-  NET_BOOT, NET_WIFI, NET_TIME, NET_TUNNEL, NET_ONLINE, NET_ERROR
+  NET_BOOT, NET_WIFI, NET_TIME, NET_TUNNEL, NET_ONLINE, NET_STALE, NET_ERROR
 };
 
 struct Gauge {
@@ -181,6 +200,12 @@ struct Gauge {
 struct Config {
   char     wifi_ssid[33]   = WIFI_SSID;
   char     wifi_pass[64]   = WIFI_PASSWORD;
+
+  uint8_t  transport       = TRANSPORT_DIRECT;
+  char     relay_url[128]  = "";      // https://<name>.workers.dev/telemetry
+  char     relay_token[65] = "";      // READ_TOKEN from the Worker
+  bool     tls_verify      = true;    // pin the roots in ca_certs.h
+
   bool     wg_enabled      = true;
   char     wg_local_ip[16] = WG_LOCAL_IP;
   char     wg_priv[48]     = WG_PRIVATE_KEY;
@@ -282,6 +307,10 @@ static void config_load() {
   prefs.getString("wghost", cfg.wg_host,     sizeof cfg.wg_host);
   prefs.getString("host",   cfg.host,        sizeof cfg.host);
   prefs.getString("path",   cfg.path,        sizeof cfg.path);
+  prefs.getString("rurl",   cfg.relay_url,   sizeof cfg.relay_url);
+  prefs.getString("rtok",   cfg.relay_token, sizeof cfg.relay_token);
+  cfg.transport  = prefs.getUChar("tport", cfg.transport);
+  cfg.tls_verify = prefs.getBool("tlsv",   cfg.tls_verify);
   cfg.wg_enabled = prefs.getBool("wgen",   cfg.wg_enabled);
   cfg.wg_port    = prefs.getUShort("wgport", cfg.wg_port);
   cfg.port       = prefs.getUShort("port",   cfg.port);
@@ -304,6 +333,10 @@ static void config_save() {
   prefs.putString("wghost", cfg.wg_host);
   prefs.putString("host",   cfg.host);
   prefs.putString("path",   cfg.path);
+  prefs.putString("rurl",   cfg.relay_url);
+  prefs.putString("rtok",   cfg.relay_token);
+  prefs.putUChar ("tport",  cfg.transport);
+  prefs.putBool  ("tlsv",   cfg.tls_verify);
   prefs.putBool  ("wgen",   cfg.wg_enabled);
   prefs.putUShort("wgport", cfg.wg_port);
   prefs.putUShort("port",   cfg.port);
@@ -457,6 +490,7 @@ static void apply_state(NetState st) {
     case NET_TIME:   lv_label_set_text(g_lbl_state, "NTP SYNC");  pulse(COL_AMBER,    450); break;
     case NET_TUNNEL: lv_label_set_text(g_lbl_state, "TUNNEL..."); pulse(COL_AMBER,    450); break;
     case NET_ONLINE: lv_label_set_text(g_lbl_state, "LINK OK");   pulse(COL_GREEN,   1400); break;
+    case NET_STALE:  lv_label_set_text(g_lbl_state, "STALE");     pulse(COL_AMBER,    700); break;
     case NET_ERROR:  lv_label_set_text(g_lbl_state, "NO LINK");   pulse(COL_RED,      300); break;
   }
 }
@@ -800,7 +834,33 @@ static bool tunnel_up() {
   return ok;
 }
 
-static bool fetch(Telemetry &out, uint32_t &latency_ms) {
+static bool parse_payload(const String &payload, Telemetry &out) {
+  // ArduinoJson 7 sizes itself; 6 needs the capacity up front.
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+  JsonDocument doc;
+#else
+  StaticJsonDocument<640> doc;
+#endif
+  const DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.printf("[json] %s\n", err.c_str());
+    return false;
+  }
+
+  out.cpu_percent     = doc["cpu_percent"]     | 0.0f;
+  out.ram_percent     = doc["ram_percent"]     | 0.0f;
+  out.storage_percent = doc["storage_percent"] | 0.0f;
+  out.cpu_temp_c      = doc["cpu_temp_c"]      | -1.0f;
+  out.rx_kbps         = doc["net_rx_kbps"]     | 0.0f;
+  out.tx_kbps         = doc["net_tx_kbps"]     | 0.0f;
+  out.uptime_seconds  = doc["uptime_seconds"]  | 0u;
+  out.age_s           = doc["age_s"]           | 0u;   // relay only
+  strlcpy(out.host, doc["host"] | "dietpi", sizeof out.host);
+  return true;
+}
+
+// --- DIRECT: plain HTTP straight at the host, over the tunnel or the LAN ----
+static bool fetch_direct(Telemetry &out, uint32_t &latency_ms) {
   char url[160];
   snprintf(url, sizeof url, "http://%s:%u%s",
            cfg.host, (unsigned)cfg.port, cfg.path);
@@ -824,28 +884,58 @@ static bool fetch(Telemetry &out, uint32_t &latency_ms) {
   const String payload = http.getString();
   latency_ms = millis() - t0;
   http.end();
+  return parse_payload(payload, out);
+}
 
-  // ArduinoJson 7 sizes itself; 6 needs the capacity up front.
-#if ARDUINOJSON_VERSION_MAJOR >= 7
-  JsonDocument doc;
-#else
-  StaticJsonDocument<640> doc;
-#endif
-  const DeserializationError err = deserializeJson(doc, payload);
-  if (err) {
-    Serial.printf("[json] %s\n", err.c_str());
+// --- RELAY: HTTPS to the Cloudflare Worker the host pushes into -------------
+static bool fetch_relay(Telemetry &out, uint32_t &latency_ms) {
+  if (cfg.relay_url[0] == '\0') {
+    Serial.println("[relay] no URL configured");
     return false;
   }
 
-  out.cpu_percent     = doc["cpu_percent"]     | 0.0f;
-  out.ram_percent     = doc["ram_percent"]     | 0.0f;
-  out.storage_percent = doc["storage_percent"] | 0.0f;
-  out.cpu_temp_c      = doc["cpu_temp_c"]      | -1.0f;
-  out.rx_kbps         = doc["net_rx_kbps"]     | 0.0f;
-  out.tx_kbps         = doc["net_tx_kbps"]     | 0.0f;
-  out.uptime_seconds  = doc["uptime_seconds"]  | 0u;
-  strlcpy(out.host, doc["host"] | "dietpi", sizeof out.host);
-  return true;
+  // Stack-allocating the TLS client means its ~40 KB of session state is
+  // released the moment this function returns, rather than being held for the
+  // 5 seconds until the next poll.
+  WiFiClientSecure tls;
+  if (cfg.tls_verify) tls.setCACert(RELAY_ROOT_CAS);
+  else                tls.setInsecure();          // portal escape hatch
+  tls.setTimeout(HTTP_TIMEOUT_MS / 1000);         // WiFiClient's unit is seconds
+  tls.setHandshakeTimeout(HTTP_TIMEOUT_MS / 1000);
+
+  HTTPClient http;
+  http.setReuse(false);
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+
+  const uint32_t t0 = millis();
+  if (!http.begin(tls, cfg.relay_url)) {
+    Serial.println("[relay] bad URL");
+    return false;
+  }
+  http.addHeader("Authorization", String("Bearer ") + cfg.relay_token);
+
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    // 401 means the token is wrong and will never fix itself; 503 means the
+    // Worker is up but the host has not pushed anything yet. Both are worth
+    // distinguishing from a generic timeout in the log.
+    Serial.printf("[relay] GET -> %d%s\n", code,
+                  code == 401 ? " (token rejected)" :
+                  code == 503 ? " (worker has no data yet)" : "");
+    http.end();
+    return false;
+  }
+
+  const String payload = http.getString();
+  latency_ms = millis() - t0;
+  http.end();
+  return parse_payload(payload, out);
+}
+
+static bool fetch(Telemetry &out, uint32_t &latency_ms) {
+  return cfg.transport == TRANSPORT_RELAY ? fetch_relay(out, latency_ms)
+                                          : fetch_direct(out, latency_ms);
 }
 
 static void netTask(void *arg) {
@@ -855,8 +945,14 @@ static void netTask(void *arg) {
     g_state = NET_ERROR;
     vTaskDelay(pdMS_TO_TICKS(2000));
   }
-  if (!time_sync(20000)) Serial.println("[net] NTP timed out - handshake may be rejected");
-  tunnel_up();
+  // Both transports want a real clock: WireGuard for its handshake timestamp,
+  // TLS for certificate validity dates. A device stuck at epoch 0 fails either
+  // way, and in both cases it fails silently.
+  if (!time_sync(20000)) Serial.println("[net] NTP timed out - handshake/TLS may fail");
+
+  // The relay talks to the public internet, so the tunnel stays down: bringing
+  // it up would make it the default route and send the HTTPS request into it.
+  if (cfg.transport == TRANSPORT_DIRECT) tunnel_up();
 
   uint8_t failures = 0;
 
@@ -882,7 +978,11 @@ static void netTask(void *arg) {
         g_latency = latency;
         g_seq++;                 // publish last: the UI polls on this
       }
-      g_state  = NET_ONLINE;
+      // A reachable relay holding old data is a different fault from an
+      // unreachable one: the network is fine, the host stopped reporting.
+      // Showing LINK OK over frozen numbers would be the worst outcome.
+      g_state  = (cfg.transport == TRANSPORT_RELAY && fresh.age_s > STALE_AFTER_S)
+                   ? NET_STALE : NET_ONLINE;
       failures = 0;
     } else {
       g_state = NET_ERROR;
@@ -941,6 +1041,7 @@ static const char PAGE_CSS[] PROGMEM =
   "button{width:100%;padding:12px;border:0;border-radius:6px;background:#00E5FF;"
   "color:#05070E;font:600 15px/1 inherit;letter-spacing:.04em;cursor:pointer}"
   "a.reset{display:block;text-align:center;margin-top:14px;color:#FF4D6D;font-size:13px}"
+  "p.hint{margin:-4px 0 12px;font-size:12px;line-height:1.45;color:#5C6B82}"
   "</style>";
 
 static String field(const char *label, const char *name, const char *value,
@@ -977,6 +1078,27 @@ static void handle_root() {
   p += F("</datalist></label>");
   p += field("Password", "pass", cfg.wifi_pass, "password");
   p += F("</fieldset>");
+
+  p += F("<fieldset><legend>HOW TO REACH THE HOST</legend>"
+         "<label><span>Transport</span><select name=tport>"
+         "<option value=0");
+  if (cfg.transport == TRANSPORT_DIRECT) p += F(" selected");
+  p += F(">Direct - WireGuard tunnel or LAN</option><option value=1");
+  if (cfg.transport == TRANSPORT_RELAY) p += F(" selected");
+  p += F(">Cloudflare relay - host pushes, no port forward</option></select></label>"
+         "<p class=hint>Direct needs the host reachable from outside: a port "
+         "forward, or a tunnel ending on it. Pick the relay if the host is "
+         "behind CGNAT or on a network you do not administer.</p></fieldset>");
+
+  p += F("<fieldset><legend>CLOUDFLARE RELAY</legend>");
+  p += field("Worker URL", "rurl", cfg.relay_url);
+  p += field("Read token", "rtok", cfg.relay_token);
+  p += F("<label class=chk><input type=checkbox name=tlsv value=1 ");
+  if (cfg.tls_verify) p += F("checked");
+  p += F("><span>Verify TLS certificate</span></label>"
+         "<p class=hint>Leave verification on. Turn it off only if Cloudflare "
+         "rotates to a CA that is not pinned in ca_certs.h - it makes the "
+         "connection interceptable.</p></fieldset>");
 
   p += F("<fieldset><legend>WIREGUARD TUNNEL</legend><label class=chk>"
          "<input type=checkbox name=wgen value=1 ");
@@ -1022,7 +1144,12 @@ static void handle_save() {
   copy_arg("wghost", cfg.wg_host,     sizeof cfg.wg_host);
   copy_arg("host",   cfg.host,        sizeof cfg.host);
   copy_arg("path",   cfg.path,        sizeof cfg.path);
+  copy_arg("rurl",   cfg.relay_url,   sizeof cfg.relay_url);
+  copy_arg("rtok",   cfg.relay_token, sizeof cfg.relay_token);
 
+  if (server.hasArg("tport")) cfg.transport = server.arg("tport").toInt() ? TRANSPORT_RELAY
+                                                                         : TRANSPORT_DIRECT;
+  cfg.tls_verify = server.hasArg("tlsv");
   cfg.wg_enabled = server.hasArg("wgen");     // an unchecked box sends nothing
   if (server.hasArg("wgport")) cfg.wg_port = server.arg("wgport").toInt();
   if (server.hasArg("port"))   cfg.port    = server.arg("port").toInt();
@@ -1149,8 +1276,11 @@ void setup() {
   backlight_set(level);
 
   // Core 0: everything that can block. Core 1: everything that must not.
+  // 16 KB rather than 10: an mbedTLS handshake for the relay transport is
+  // stack-hungry, and overflowing it shows up as a boot loop rather than an
+  // error message.
   xTaskCreatePinnedToCore(g_setup_mode ? setupTask : netTask,
-                          "net", 10240, NULL, 1, NULL, 0);
+                          "net", 16384, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(uiTask, "ui", 8192, NULL, 2, NULL, 1);
 }
 

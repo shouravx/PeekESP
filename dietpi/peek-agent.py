@@ -163,8 +163,83 @@ class Handler(BaseHTTPRequestHandler):
         pass          # a poll every 5 seconds would otherwise flood the journal
 
 
-if __name__ == "__main__":
+# --------------------------------------------------------------------------
+#  Push mode - for when the ESP32 cannot reach this machine at all.
+#
+#  Serving works only if something can open a connection TO this box: a port
+#  forward, or a WireGuard tunnel terminating here. Behind CGNAT, or on a
+#  network you do not administer, neither is possible. Pushing inverts that:
+#  this side dials out to a Cloudflare Worker, the ESP32 dials out to the same
+#  Worker, and nothing needs an inbound port.
+# --------------------------------------------------------------------------
+def push_loop(url, token, interval):
+    import urllib.error
+    import urllib.request
+
+    fails = 0
+    while True:
+        body = json.dumps(snapshot()).encode()
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + token,
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+            if fails:
+                print("push recovered after %d failure(s)" % fails, flush=True)
+            fails = 0
+        except urllib.error.HTTPError as e:
+            # 401 will never fix itself, so say plainly what is wrong rather
+            # than burying it in a retry count.
+            print("push rejected: HTTP %s %s" % (e.code, e.reason), flush=True)
+            fails += 1
+        except Exception as e:
+            fails += 1
+            if fails <= 3 or fails % 20 == 0:
+                print("push failed (%d): %s" % (fails, e), flush=True)
+        time.sleep(interval)
+
+
+def main():
+    import argparse
+
+    ap = argparse.ArgumentParser(description="PeekESP telemetry agent")
+    ap.add_argument("--push", metavar="URL",
+                    help="POST telemetry to this Cloudflare Worker /ingest URL")
+    ap.add_argument("--token", default=os.environ.get("PEEK_PUSH_TOKEN", ""),
+                    help="bearer token for --push (or set PEEK_PUSH_TOKEN)")
+    ap.add_argument("--interval", type=float, default=5.0,
+                    help="seconds between pushes (default: 5)")
+    ap.add_argument("--no-serve", action="store_true",
+                    help="do not listen on :%d, push only" % PORT)
+    args = ap.parse_args()
+
+    if args.push and not args.token:
+        ap.error("--push needs --token (or the PEEK_PUSH_TOKEN environment variable)")
+
     threading.Thread(target=_sampler, daemon=True).start()
     time.sleep(SAMPLE_SECONDS)           # let the first CPU/net delta land
-    print("peek-agent on http://%s:%d%s" % (BIND, PORT, PATH))
+
+    if args.push:
+        print("pushing to %s every %gs" % (args.push, args.interval), flush=True)
+        if args.no_serve:
+            push_loop(args.push, args.token, args.interval)
+            return
+        threading.Thread(target=push_loop,
+                         args=(args.push, args.token, args.interval),
+                         daemon=True).start()
+    elif args.no_serve:
+        ap.error("--no-serve with no --push would do nothing")
+
+    print("peek-agent on http://%s:%d%s" % (BIND, PORT, PATH), flush=True)
     ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

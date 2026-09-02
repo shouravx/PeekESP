@@ -13,10 +13,15 @@
 
 </div>
 
-An ESP32 (LilyGO TTGO T-Display) reaches a remote DietPi box over an encrypted
-WireGuard tunnel, polls it every 5 seconds, and sweeps the readings into place
-with 500 ms eased animations instead of snapping. Two pinned FreeRTOS tasks keep
-the network off the render thread, so a slow tunnel never costs a frame.
+An ESP32 (LilyGO TTGO T-Display) monitors a remote Linux box, polling every few
+seconds and sweeping the readings into place with 500 ms eased animations rather
+than snapping. Two pinned FreeRTOS tasks keep the network off the render thread,
+so a slow link never costs a frame.
+
+It reaches the host either **directly** over a WireGuard tunnel, or through a
+**Cloudflare Worker** the host pushes to — the second option needs no port
+forward at either end, which is what makes it work behind CGNAT. Both are
+switchable from the device's own setup screen.
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -42,7 +47,8 @@ the network off the render thread, so a slow tunnel never costs a frame.
 | [lv_conf.h](lv_conf.h) | LVGL config for this board. |
 | [platformio.ini](platformio.ini) + [main.cpp](main.cpp) | PlatformIO build of the exact same sketch. |
 | [dietpi-wireguard-setup.sh](dietpi-wireguard-setup.sh) | Run on the DietPi: creates the tunnel, prints the keys. |
-| [dietpi/peek-agent.py](dietpi/peek-agent.py) | Run on the DietPi: serves the JSON the ESP32 reads. |
+| [dietpi/peek-agent.py](dietpi/peek-agent.py) | Run on the DietPi: serves the JSON, and/or pushes it to the relay. |
+| [cloudflare/](cloudflare/) | Worker relay for when the host has no reachable port. `npm test` covers it. |
 
 ## Architecture
 
@@ -58,6 +64,26 @@ Two pinned FreeRTOS tasks that share nothing but a mutex-guarded struct:
 Values animate through `lv_anim_t` with `lv_anim_path_ease_out` over 500 ms. The
 gauges run on a 0–1000 range rather than 0–100 so a 3 % change still resolves
 into ~30 distinct steps and reads as a sweep, not a staircase.
+
+## Choosing a transport
+
+The hard part of this project isn't the display — it's that **something has to
+accept an inbound connection**, and the ESP32 can only dial out. Two ways to
+solve that, both supported and switchable from the setup portal:
+
+| | **Direct** | **Cloudflare relay** |
+|---|---|---|
+| How | ESP32 → WireGuard tunnel (or LAN) → host | Host pushes → Worker → ESP32 polls |
+| Needs an inbound port | **Yes**, on the host | **No** — both ends dial out |
+| Works behind CGNAT | No | **Yes** |
+| Works on a network you don't administer | No | **Yes** |
+| Data path | End-to-end encrypted, never leaves your kit | Sits on Cloudflare, TLS + bearer tokens |
+| Setup | Port forward + WireGuard keys | `wrangler deploy`, two secrets |
+
+If you can port-forward the host, **Direct** is the better answer — nothing
+leaves your infrastructure. If the host is behind CGNAT or on someone else's
+network, that option simply doesn't exist, and the relay is how you get around
+it. See [cloudflare/](cloudflare/) and the deploy steps below.
 
 ## The Tailscale part, honestly
 
@@ -167,23 +193,73 @@ Check it: `curl http://localhost:8080/telemetry`
 Finally, forward UDP 51820 to the DietPi on your router, unless the box already
 has a directly reachable public IP.
 
+### 1b. Cloudflare relay (skip if you're using Direct)
+
+```bash
+cd cloudflare
+npm install -g wrangler && wrangler login
+```
+
+Generate two independent tokens and set them as secrets — never put them in
+`wrangler.toml`, it's committed:
+
+```bash
+openssl rand -hex 24
+```
+
+```bash
+npx wrangler secret put PUSH_TOKEN
+npx wrangler secret put READ_TOKEN
+npx wrangler deploy
+```
+
+Two tokens rather than one because the ESP32 sits on a desk with its token in
+flash. If it's ever pulled apart, only the *reader* leaks — that token can't
+push fabricated telemetry.
+
+Point the agent at it instead of (or as well as) serving:
+
+```bash
+python3 peek-agent.py --push https://peek-relay.<you>.workers.dev/ingest --token <PUSH_TOKEN>
+```
+
+Check it end to end:
+
+```bash
+curl -H "Authorization: Bearer <READ_TOKEN>" https://peek-relay.<you>.workers.dev/telemetry
+```
+
+Then in the setup portal choose **Cloudflare relay**, paste the `/telemetry`
+URL and the **READ** token. Run `npm test` in `cloudflare/` to exercise the
+auth and routing logic locally — 12 checks, no account needed.
+
+> Free-tier note: this uses a **Durable Object**, not Workers KV. KV's free tier
+> allows 1,000 writes/day and a 5-second push interval is 17,280 — it would fail
+> partway through day one. Worker requests themselves are ~35k/day against a
+> 100k/day free allowance.
+
 ### 2. On the ESP32 — Arduino IDE
 
 1. **Boards Manager** → *esp32* by Espressif → install **2.0.17**.
    Core 3.x sits on ESP-IDF 5, which removed the `tcpip_adapter` API that
    WireGuard-ESP32 still calls; it will not compile there.
    Board: *LilyGo T-Display* (*ESP32 Dev Module* also works — both verified).
-2. **Library Manager** → `TFT_eSPI`, `lvgl`, `ArduinoJson`.
+2. **Library Manager** → `lvgl` and `ArduinoJson`.
    Library Manager offers **lvgl 9.x** first — pick **8.3.9**. This sketch uses
    the v8 API and will not build against v9.
-3. **Sketch → Include Library → Add .ZIP Library** →
+3. **TFT_eSPI — use LilyGO's copy.** They ship one already configured for this
+   exact board: copy the `TFT_eSPI` folder out of
+   [Xinyuan-LilyGO/TTGO-T-Display](https://github.com/Xinyuan-LilyGO/TTGO-T-Display)
+   into `<Arduino>/libraries/`. Its `User_Setup_Select.h` already points at
+   `Setup25_TTGO_T_Display.h`, so there's nothing to edit and no way to end up
+   with the image offset by 40 px.
+   *Alternative:* Library Manager's TFT_eSPI **2.5.43** also works — both are
+   verified — but then you must edit `User_Setup_Select.h` yourself: comment out
+   `#include <User_Setup.h>`, uncomment the `Setup25_TTGO_T_Display.h` line.
+4. Only if you're using the **Direct** transport: **Sketch → Include Library →
+   Add .ZIP Library** →
    [WireGuard-ESP32-Arduino](https://github.com/ciniml/WireGuard-ESP32-Arduino)
    (Code → Download ZIP).
-4. Edit `<Arduino>/libraries/TFT_eSPI/User_Setup_Select.h`: comment out
-   `#include <User_Setup.h>` and uncomment
-   `#include <User_Setups/Setup25_TTGO_T_Display.h>`. That header carries the
-   MOSI=19 SCLK=18 CS=5 DC=16 RST=23 BL=4 pinout **and** the CGRAM offset the
-   135×240 panel needs — without it the image sits 40 px off.
 5. Copy this repo's `lv_conf.h` to `<Arduino>/libraries/lv_conf.h` — *next to*
    the `lvgl` folder, not inside it. `LV_USE_SPINNER` and `LV_USE_QRCODE` both
    default to **0** upstream, so a stock config link-errors on two widgets this
@@ -192,23 +268,31 @@ has a directly reachable public IP.
    upload. **No credentials needed at compile time** — you configure the device
    from its own screen. `secrets.h` is optional and only seeds factory defaults.
 
-**Verified build** — ESP32 core 2.0.17, TFT_eSPI 2.5.43, lvgl 8.3.9,
-ArduinoJson 7.4.3, WireGuard-ESP32 0.1.5. Compiles clean with no warnings on
-both `lilygo_t_display` and `esp32` (Dev Module):
+**Verified build** — ESP32 core 2.0.17, lvgl 8.3.9, ArduinoJson 7.4.3,
+WireGuard-ESP32 0.1.5, against **both** TFT_eSPI builds:
+
+| TFT_eSPI | Flash | Result |
+|---|---|---|
+| LilyGO 2.2.20 (preconfigured) | 1,234,601 B | clean, no warnings |
+| Library Manager 2.5.43 | 1,238,797 B | clean, no warnings |
+
+The sketch only uses `init` / `setRotation` / `fillScreen` / `startWrite` /
+`setAddrWindow` / `pushColors` / `endWrite`, all stable across that version gap.
 
 ```
-Sketch uses 1111097 bytes (35%) of program storage space.
-Global variables use 118648 bytes (36%) of dynamic memory.
+Sketch uses 1234601 bytes (39%) of program storage space.
+Global variables use 119748 bytes (36%) of dynamic memory.
 ```
 
-That 35 % is with **Huge APP**. On the default 1.2 MB partition the same image
-is 84 % — it fits, but with little room to grow, so set
-*Tools → Partition Scheme → Huge APP (3MB No OTA/1MB SPIFFS)*.
+That 39 % is with **Huge APP**. On the default 1.2 MB partition it's **94 %** —
+it still fits, but there's nothing left, so set *Tools → Partition Scheme →
+Huge APP (3MB No OTA/1MB SPIFFS)*.
 
 ### 2b. On the ESP32 — PlatformIO
 
-Steps 4 and 5 are unnecessary; `platformio.ini` supplies the TFT_eSPI pinout and
-the LVGL config path as build flags. Still do step 6, then:
+Steps 3 and 5 are unnecessary; `platformio.ini` supplies the TFT_eSPI pinout and
+the LVGL config path as build flags, which is why PlatformIO never had the
+`User_Setup_Select.h` problem in the first place. Then:
 
 ```bash
 pio run -t upload -t monitor
