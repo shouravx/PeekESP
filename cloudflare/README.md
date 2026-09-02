@@ -77,4 +77,26 @@ npm test
 12 checks over routing and auth — that each token is rejected on the other's
 endpoint, that a malformed body is refused, that `age_s` is attached, that
 missing secrets fail closed. Runs against a stubbed Durable Object, so it needs
-no Cloudflare account.
+no Cloudflare account and no `npm install`.
+
+## CI
+
+[`.github/workflows/cloudflare-worker.yml`](../.github/workflows/cloudflare-worker.yml)
+tests every change to `cloudflare/**`, deploys on merge to `main`, and pings
+`/health` weekly. Path-filtered, so firmware commits don't redeploy the Worker.
+
+One-time repo configuration under
+**Settings → Secrets and variables → Actions**:
+
+| Name | Kind | Required | What |
+|---|---|---|---|
+| `CLOUDFLARE_API_TOKEN` | secret | **yes** | [Create one](https://dash.cloudflare.com/profile/api-tokens) with the *Edit Cloudflare Workers* template |
+| `CLOUDFLARE_ACCOUNT_ID` | secret | if your token spans several accounts | From the Workers dashboard sidebar |
+| `WORKER_URL` | variable | no | e.g. `https://peek-relay.you.workers.dev` — enables the health check; skipped silently when unset |
+
+`PUSH_TOKEN` and `READ_TOKEN` deliberately **do not** go into GitHub. They're
+Worker secrets held by Cloudflare, `wrangler deploy` leaves them untouched, and
+keeping them out of CI means they never sit in a second system's secret store.
+
+The deploy job targets a `production` environment, so you can attach required
+reviewers to it in repo settings if you'd rather approve deploys by hand.

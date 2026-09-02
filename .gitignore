@@ -11,6 +11,11 @@ secrets.h
 __pycache__/
 *.pyc
 
+# Cloudflare Worker
+node_modules/
+.wrangler/
+.dev.vars
+
 # Prerequisites
 *.d
 

@@ -1,0 +1,118 @@
+name: Cloudflare Worker
+
+# Only fires when the Worker itself changes. Firmware commits are the majority
+# of traffic in this repo and have nothing to do with the relay, so without
+# these path filters every push would redeploy a Worker that did not change.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cloudflare/**'
+      - '.github/workflows/cloudflare-worker.yml'
+  pull_request:
+    paths:
+      - 'cloudflare/**'
+      - '.github/workflows/cloudflare-worker.yml'
+  schedule:
+    # Weekly liveness check. The relay can sit untouched for months, and a
+    # dashboard that quietly stopped updating is worse than one that is
+    # obviously broken.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never let two deploys race. Not cancel-in-progress: interrupting a deploy
+# halfway is worse than waiting for it.
+concurrency:
+  group: cloudflare-worker
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # No `npm ci` on purpose: the Worker has zero runtime dependencies and
+      # no lockfile. The tests stub the Durable Object runtime, so they need
+      # neither wrangler nor a Cloudflare account.
+      - name: Run Worker tests
+        working-directory: cloudflare
+        run: npm test
+
+  deploy:
+    name: Deploy
+    needs: test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # Attach branch protection / required reviewers to this environment in
+    # repo settings if you want a human gate before anything reaches prod.
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail early if the API token is missing
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::CLOUDFLARE_API_TOKEN is not set."
+            echo "Create a token with the 'Edit Cloudflare Workers' template at"
+            echo "https://dash.cloudflare.com/profile/api-tokens then add it under"
+            echo "Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: cloudflare
+
+      # PUSH_TOKEN and READ_TOKEN are Worker secrets held by Cloudflare, not
+      # part of the upload. `wrangler deploy` leaves them intact, so they are
+      # set once by hand and never travel through CI.
+      - name: Note on secrets
+        run: echo "Worker secrets are untouched by deploy - set them with 'wrangler secret put'."
+
+  health:
+    name: Health check
+    # Runs after a deploy, and on its own each week. Skips silently when the
+    # WORKER_URL variable is unset, so a fresh fork does not fail on day one.
+    needs: [deploy]
+    if: always() && needs.deploy.result != 'failure' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: GET /health
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+        run: |
+          if [ -z "$WORKER_URL" ]; then
+            echo "WORKER_URL repository variable is not set - skipping."
+            echo "Set it to e.g. https://peek-relay.you.workers.dev under"
+            echo "Settings -> Secrets and variables -> Actions -> Variables."
+            exit 0
+          fi
+          echo "Checking ${WORKER_URL%/}/health"
+          # /health is unauthenticated by design, so this needs no token and
+          # reveals nothing about whether telemetry exists.
+          for attempt in 1 2 3; do
+            if curl -fsS --max-time 15 "${WORKER_URL%/}/health"; then
+              echo
+              echo "Worker is up."
+              exit 0
+            fi
+            echo "attempt $attempt failed, retrying..."
+            sleep 10
+          done
+          echo "::error::Worker did not answer /health after 3 attempts."
+          exit 1

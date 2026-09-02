@@ -49,6 +49,7 @@ switchable from the device's own setup screen.
 | [dietpi-wireguard-setup.sh](dietpi-wireguard-setup.sh) | Run on the DietPi: creates the tunnel, prints the keys. |
 | [dietpi/peek-agent.py](dietpi/peek-agent.py) | Run on the DietPi: serves the JSON, and/or pushes it to the relay. |
 | [cloudflare/](cloudflare/) | Worker relay for when the host has no reachable port. `npm test` covers it. |
+| [.github/workflows/](.github/workflows/) | CI: tests the Worker, deploys it on merge, pings it weekly. |
 
 ## Architecture
 
@@ -232,6 +233,12 @@ curl -H "Authorization: Bearer <READ_TOKEN>" https://peek-relay.<you>.workers.de
 Then in the setup portal choose **Cloudflare relay**, paste the `/telemetry`
 URL and the **READ** token. Run `npm test` in `cloudflare/` to exercise the
 auth and routing logic locally — 12 checks, no account needed.
+
+Deploys can also run themselves: add a `CLOUDFLARE_API_TOKEN` secret and the
+[workflow](.github/workflows/cloudflare-worker.yml) tests every change to
+`cloudflare/**`, deploys on merge to `main`, and health-checks weekly. See
+[cloudflare/README.md](cloudflare/README.md#ci) for the two secrets and one
+variable it wants.
 
 > Free-tier note: this uses a **Durable Object**, not Workers KV. KV's free tier
 > allows 1,000 writes/day and a 5-second push interval is 17,280 — it would fail
