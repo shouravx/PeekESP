@@ -94,3 +94,7 @@ Testing/
 
 # arduino-cli fetched by tools/setup_arduino.py
 tools/.arduino-cli/
+
+tools/.venv/
+firmware/*.elf
+firmware/*.map

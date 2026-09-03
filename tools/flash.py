@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-flash.py - put the firmware on the board. No Arduino IDE, no board menus.
+flash.py - put the firmware on the board. No Arduino IDE, no toolchain.
 
     python tools/flash.py
 
-Finds the device, compiles, uploads, and then shows the serial output so you
-can watch it boot and read the pairing code without opening anything else.
+Flashes the prebuilt image committed at firmware/PeekESP-merged.bin, then shows
+the serial output so you can watch it boot and read the pairing code. Nothing
+is compiled, so this needs neither the ESP32 core nor any library - only
+esptool, which is ~3 MB and installed into tools/.venv on first use.
 
+    --build       compile from source instead (needs tools/setup_arduino.py)
     --port COM5   skip detection
     --list        show detected serial ports and exit
-    --no-monitor  upload and stop
     --erase       wipe saved settings first, so the device pairs from scratch
+    --no-monitor  flash and stop
 
-Runs tools/setup_arduino.py automatically if the core or libraries are missing.
+Rebuild the committed image after changing the sketch:
+
+    python tools/export_firmware.py
 """
 
 import argparse
@@ -24,42 +29,72 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SKETCH = REPO / "PeekESP"
+MERGED = REPO / "firmware" / "PeekESP-merged.bin"
+VENV = REPO / "tools" / ".venv"
 FQBN = "esp32:esp32:lilygo_t_display:PartitionScheme=huge_app"
-BAUD = "115200"
+BAUD = 115200
 
 sys.path.insert(0, str(REPO / "tools"))
 import setup_arduino as setup           # noqa: E402  (same folder, by design)
 
 
-def cli():
-    p = setup.cli_path()
-    if not p:
-        print("arduino-cli not found - running setup first\n")
-        subprocess.check_call([sys.executable, str(REPO / "tools" / "setup_arduino.py"),
-                               "--no-build"])
-        p = setup.cli_path()
-    return p
+def venv_python():
+    py = VENV / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    if not py.exists():
+        print("creating tools/.venv ...")
+        subprocess.check_call([sys.executable, "-m", "venv", str(VENV)])
+    return py
 
 
-def ports(c):
-    """(port, description) for everything that looks like a real serial device."""
-    r = subprocess.run([str(c), "board", "list"], capture_output=True, text=True)
+def esptool_cmd():
+    """
+    Prefer the esptool that ships inside the ESP32 core, if the core happens to
+    be installed - it is already there and costs nothing. Otherwise put one in
+    a local venv rather than on the system Python.
+    """
+    core = Path.home() / "AppData/Local/Arduino15/packages/esp32" if sys.platform == "win32" \
+        else Path.home() / ".arduino15/packages/esp32"
+    if core.exists():
+        for name in ("esptool.exe", "esptool", "esptool.py"):
+            hit = next(core.rglob(name), None)
+            if hit:
+                return [str(hit)]
+
+    py = venv_python()
+    r = subprocess.run([str(py), "-c", "import esptool"], capture_output=True)
+    if r.returncode != 0:
+        print("installing esptool (~3 MB) into tools/.venv ...")
+        subprocess.check_call([str(py), "-m", "pip", "install", "--quiet",
+                               "--disable-pip-version-check", "esptool"])
+    return [str(py), "-m", "esptool"]
+
+
+def ports():
+    """Serial ports, via pyserial in the local venv, so this needs no core."""
+    py = venv_python()
+    if subprocess.run([str(py), "-c", "import serial.tools.list_ports"],
+                      capture_output=True).returncode != 0:
+        print("installing pyserial into tools/.venv ...")
+        subprocess.check_call([str(py), "-m", "pip", "install", "--quiet",
+                               "--disable-pip-version-check", "pyserial"])
+    r = subprocess.run(
+        [str(py), "-c",
+         "import serial.tools.list_ports as p;"
+         "print('\\n'.join(f'{x.device}\\t{x.description}' for x in p.comports()))"],
+        capture_output=True, text=True)
     out = []
-    for line in r.stdout.splitlines()[1:]:
-        if not line.strip() or line.startswith(("Port", "No boards")):
-            continue
-        parts = line.split()
-        port = parts[0]
-        if not re.match(r"^(COM\d+|/dev/tty)", port):
-            continue
-        out.append((port, " ".join(parts[1:])[:60]))
+    for line in r.stdout.splitlines():
+        if "\t" in line:
+            dev, desc = line.split("\t", 1)
+            if re.match(r"^(COM\d+|/dev/tty)", dev):
+                out.append((dev, desc[:60]))
     return out
 
 
-def pick_port(c, wanted):
+def pick_port(wanted):
     if wanted:
         return wanted
-    found = ports(c)
+    found = ports()
     if not found:
         sys.exit(
             "No serial port found.\n"
@@ -76,67 +111,85 @@ def pick_port(c, wanted):
     return found[0][0]
 
 
-def monitor(c, port):
-    """Stream serial until interrupted. The pairing code is printed here as
-    well as shown on screen, which matters when the display is the thing you
-    are debugging."""
+def monitor(port):
+    py = venv_python()
     print(f"\n--- serial {port} @ {BAUD} - Ctrl+C to stop ---\n", flush=True)
+    code = (
+        "import serial,sys;"
+        f"s=serial.Serial('{port}',{BAUD},timeout=1)\n"
+        "while True:\n"
+        "    d=s.readline()\n"
+        "    if d: sys.stdout.write(d.decode('utf-8','replace')); sys.stdout.flush()\n"
+    )
     try:
-        subprocess.call([str(c), "monitor", "-p", port, "-c", f"baudrate={BAUD}"])
+        subprocess.call([str(py), "-c", code])
     except KeyboardInterrupt:
         pass
 
 
-def main():
-    ap = argparse.ArgumentParser(description="compile and flash PeekESP")
-    ap.add_argument("--port")
-    ap.add_argument("--list", action="store_true")
-    ap.add_argument("--no-monitor", action="store_true")
-    ap.add_argument("--erase", action="store_true",
-                    help="erase flash first: forgets WiFi and the pairing code")
-    a = ap.parse_args()
-
-    c = cli()
-
-    if a.list:
-        found = ports(c)
-        print("\n".join(f"{p}  {d}" for p, d in found) or "no serial ports found")
-        return
-
-    port = pick_port(c, a.port)
-
-    print("\ncompiling ...")
-    r = subprocess.run([str(c), "compile", "--fqbn", FQBN, str(SKETCH)],
+def build_from_source():
+    cli = setup.cli_path()
+    if not cli:
+        sys.exit("--build needs the toolchain:  python tools/setup_arduino.py")
+    print("compiling ...")
+    r = subprocess.run([str(cli), "compile", "--fqbn", FQBN, str(SKETCH)],
                        capture_output=True, text=True)
     if r.returncode != 0:
-        tail = (r.stderr or r.stdout).strip().splitlines()[-25:]
-        print("\n".join(tail))
-        sys.exit("\ncompile failed - if this mentions a missing library, run:\n"
-                 "  python tools/setup_arduino.py")
+        print("\n".join((r.stderr or r.stdout).strip().splitlines()[-25:]))
+        sys.exit("\ncompile failed")
     for line in r.stdout.splitlines():
         if "Sketch uses" in line or "Global variables" in line:
             print("  " + line.strip())
+    return cli
 
-    if a.erase:
-        # A device that has already paired keeps its code, so a re-flash alone
-        # will not produce a new one. This is how you get back to a fresh code.
-        print("\nerasing saved settings ...")
-        subprocess.call([str(c), "burn-bootloader", "-p", port, "--fqbn", FQBN],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    print(f"\nuploading to {port} ...")
-    r = subprocess.run([str(c), "upload", "-p", port, "--fqbn", FQBN, str(SKETCH)],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        print((r.stderr or r.stdout).strip()[-800:])
-        sys.exit("\nupload failed. If it says 'Failed to connect', hold the LEFT\n"
-                 "button (BOOT) while it retries - some boards need that.")
+def main():
+    ap = argparse.ArgumentParser(description="flash PeekESP")
+    ap.add_argument("--port")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--build", action="store_true", help="compile instead of using firmware/")
+    ap.add_argument("--erase", action="store_true",
+                    help="erase flash first: forgets WiFi and the pairing code")
+    ap.add_argument("--no-monitor", action="store_true")
+    a = ap.parse_args()
 
-    print("uploaded.")
+    if a.list:
+        found = ports()
+        print("\n".join(f"{p}  {d}" for p, d in found) or "no serial ports found")
+        return
+
+    if a.build:
+        cli = build_from_source()
+        port = pick_port(a.port)
+        print(f"\nuploading to {port} ...")
+        r = subprocess.run([str(cli), "upload", "-p", port, "--fqbn", FQBN, str(SKETCH)],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print((r.stderr or r.stdout).strip()[-800:])
+            sys.exit("\nupload failed. Hold the LEFT button (BOOT) and try again.")
+    else:
+        if not MERGED.exists():
+            sys.exit(f"{MERGED} is missing - run: python tools/export_firmware.py")
+        esp = esptool_cmd()
+        port = pick_port(a.port)
+        size_mb = MERGED.stat().st_size / (1024 * 1024)
+        print(f"\nflashing {MERGED.name} ({size_mb:.1f} MB) to {port} ...")
+
+        if a.erase:
+            print("erasing flash first ...")
+            subprocess.call(esp + ["--chip", "esp32", "--port", port, "erase_flash"])
+
+        r = subprocess.call(esp + ["--chip", "esp32", "--port", port, "--baud", "921600",
+                                   "write_flash", "-z", "0x0", str(MERGED)])
+        if r != 0:
+            sys.exit("\nflash failed. If it says 'Failed to connect', hold the LEFT\n"
+                     "button (BOOT) while it retries - some boards need that.")
+
+    print("\ndone. The device should show a pairing code in a few seconds.")
     if a.no_monitor:
         return
-    time.sleep(1.0)
-    monitor(c, port)
+    time.sleep(1.5)
+    monitor(port)
 
 
 if __name__ == "__main__":

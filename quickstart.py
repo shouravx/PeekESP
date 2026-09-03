@@ -4,14 +4,18 @@ quickstart.py - set up PeekESP from a fresh clone, in one command.
 
     python quickstart.py
 
-Runs the three steps in order and stops at the first real failure:
+Runs the steps in order and stops at the first real failure:
 
-    1. install the ESP32 core and every library, pinned and patched
-    2. build the Windows app  (Windows only)
-    3. flash the board        (if one is plugged in)
+    1. build the Windows app  (Windows only)
+    2. flash the board        (if one is plugged in)
+
+The firmware is committed already built, so flashing needs no ESP32 core, no
+libraries and no 250 MB toolchain - only esptool, which is ~3 MB. Pass --dev if
+you intend to CHANGE the firmware; that installs the full Arduino toolchain
+first and compiles from source instead.
 
 Each step is a script you can run on its own afterwards - this only saves you
-knowing the order. Skip any of them with --no-libs / --no-app / --no-flash.
+knowing the order. Skip any with --no-app / --no-flash.
 
 Nothing here needs a Cloudflare account, a token, or a port forward. The device
 shows a pairing code when it boots and the app asks for that code; everything
@@ -38,7 +42,8 @@ def step(script, *args, cwd=None):
 
 def main():
     ap = argparse.ArgumentParser(description="one-command PeekESP setup")
-    ap.add_argument("--no-libs", action="store_true", help="skip the Arduino install")
+    ap.add_argument("--dev", action="store_true",
+                    help="install the Arduino toolchain and build from source")
     ap.add_argument("--no-app", action="store_true", help="skip building the Windows app")
     ap.add_argument("--no-flash", action="store_true", help="skip flashing the board")
     ap.add_argument("--port", help="serial port, if detection picks the wrong one")
@@ -49,7 +54,7 @@ def main():
 
     windows = os.name == "nt"
     todo = []
-    if not a.no_libs:
+    if a.dev:
         todo.append("libs")
     if not a.no_app and windows:
         todo.append("app")
@@ -79,6 +84,8 @@ def main():
         n += 1
         rule(n, total, "flashing the board")
         args = ["--no-monitor"] + (["--port", a.port] if a.port else [])
+        if a.dev:
+            args.append("--build")
         if step(REPO / "tools" / "flash.py", *args) != 0:
             print("\n! Not flashed - see above. Plug the board in and run:")
             print("    python tools/flash.py")
@@ -92,8 +99,9 @@ def main():
   2. Run windows/dist/PeekESP.exe  ->  tray icon  ->  Settings
   3. Type the code into "Pair a device", press Pair, then Save
 
-  Watch it boot:   python tools/flash.py --no-monitor  (drop the flag)
+  Watch it boot:   python tools/flash.py
   Fresh code:      python tools/flash.py --erase
+  Change firmware: python quickstart.py --dev
 """)
 
 

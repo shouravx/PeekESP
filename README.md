@@ -23,8 +23,9 @@ animations rather than snapping.
 python quickstart.py
 ```
 
-Installs the ESP32 core and every library, builds the Windows app, and flashes
-the board. Then:
+Builds the Windows app and flashes the board with the firmware committed in
+[firmware/](firmware/). **No Arduino IDE, no ESP32 core, no libraries, no
+toolchain** — the only download is esptool, about 3 MB. Then:
 
 1. The device shows a pairing code, like **`K7M2-P4QX-9R`**
 2. Run `windows/dist/PeekESP.exe` → tray icon → **Settings**
@@ -33,6 +34,9 @@ the board. Then:
 That is the whole setup. **No account, no token, no port forward, no VPN** — the
 device and the app derive everything else from the code, and the relay never
 sees it.
+
+Only planning to *change* the firmware? `python quickstart.py --dev` installs the
+Arduino toolchain and builds from source instead.
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -65,7 +69,9 @@ sees it.
 | [tools/make_icon.py](tools/make_icon.py) | Builds the multi-resolution Windows `.ico` from the logo. |
 | [quickstart.py](quickstart.py) | Install, build and flash in one command. |
 | [tools/setup_arduino.py](tools/setup_arduino.py) | Installs the core and every library, patched and pinned. |
-| [tools/flash.py](tools/flash.py) | Compiles, uploads and opens the serial monitor. No IDE. |
+| [firmware/](firmware/) | The compiled firmware, ready to flash. No toolchain needed. |
+| [tools/flash.py](tools/flash.py) | Flashes it and opens the serial monitor. No IDE. |
+| [tools/export_firmware.py](tools/export_firmware.py) | Rebuilds that image after a firmware change. |
 
 ## Architecture
 
@@ -115,19 +121,26 @@ The relay has three modes, all on one deployment:
 | **Arduino IDE** | [arduino.cc/en/software](https://www.arduino.cc/en/software) |
 | **Python 3** | [python.org/downloads](https://www.python.org/downloads/) — needed only for the setup scripts and the agent |
 
-**You do not need to download any libraries, or the Arduino IDE.**
-`python quickstart.py` does everything. The individual steps, if you want them
-separately:
+**Nothing else to download.** The compiled firmware is committed at
+`firmware/PeekESP-merged.bin` (1.25 MB), so flashing needs no core, no libraries
+and no toolchain — `tools/flash.py` fetches only esptool, ~3 MB.
 
 ```bash
-python tools/setup_arduino.py     # core + libraries, pinned and patched
-python tools/flash.py             # compile, upload, watch it boot
+python tools/flash.py              # flash the committed image, then watch serial
+python tools/flash.py --erase      # also wipe settings, for a fresh pairing code
+```
+
+To modify the firmware you do need the toolchain, and one command installs all
+of it at the pinned versions, patched:
+
+```bash
+python tools/setup_arduino.py      # ~250 MB, once
+python tools/export_firmware.py    # rebuild the committed image after a change
 ```
 
 `setup_arduino.py --check` reports what is installed without changing anything.
-It pulls ~250 MB of core and toolchain the first time, and everything lands in
-the normal Arduino folders, so the Arduino IDE sees it all afterwards if you
-prefer to work there.
+Everything lands in the normal Arduino folders, so the Arduino IDE sees it too
+if you prefer to work there.
 
 <details>
 <summary>If you would rather install them by hand</summary>
@@ -244,9 +257,12 @@ thing with no service to install.
 python tools/flash.py
 ```
 
-Finds the board, compiles, uploads, and opens the serial monitor so you can read
-the pairing code as it boots. `--erase` wipes saved settings, which is how you
-get a *new* pairing code — re-flashing alone keeps the old one.
+Finds the board, writes `firmware/PeekESP-merged.bin`, and opens the serial
+monitor so you can read the pairing code as it boots. `--erase` wipes saved
+settings, which is how you get a *new* pairing code — re-flashing alone keeps
+the old one, because it lives in NVS and survives a firmware update.
+
+`--build` compiles from source instead, if you have the toolchain.
 
 Prefer the Arduino IDE? Everything is already installed and patched: open
 `PeekESP/PeekESP.ino`, set **Board: LilyGo T-Display** and **Tools → Partition
