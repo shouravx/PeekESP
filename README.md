@@ -13,14 +13,26 @@
 
 </div>
 
-An ESP32 (LilyGO TTGO T-Display) monitors a remote Linux box, polling every few
-seconds and sweeping the readings into place with 500 ms eased animations rather
-than snapping. Two pinned FreeRTOS tasks keep the network off the render thread,
-so a slow link never costs a frame.
+An ESP32 (LilyGO TTGO T-Display) monitors a remote Linux or Windows machine,
+polling every few seconds and sweeping the readings into place with 500 ms eased
+animations rather than snapping.
 
-It reaches the host through a **Cloudflare Worker** the host pushes to. Both
-ends only ever dial out, so there is no port to forward anywhere and it works
-behind CGNAT. Setup is one code shown on the device's screen.
+## Quick start
+
+```bash
+python quickstart.py
+```
+
+Installs the ESP32 core and every library, builds the Windows app, and flashes
+the board. Then:
+
+1. The device shows a pairing code, like **`K7M2-P4QX-9R`**
+2. Run `windows/dist/PeekESP.exe` → tray icon → **Settings**
+3. Type the code into **Pair a device** → **Pair** → **Save**
+
+That is the whole setup. **No account, no token, no port forward, no VPN** — the
+device and the app derive everything else from the code, and the relay never
+sees it.
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -51,7 +63,9 @@ behind CGNAT. Setup is one code shown on the device's screen.
 | [.github/workflows/](.github/workflows/) | CI: tests the Worker, deploys it on merge, pings it weekly. |
 | [tools/png_to_lvgl.py](tools/png_to_lvgl.py) | Turns a PNG into the compiled-in boot logo. |
 | [tools/make_icon.py](tools/make_icon.py) | Builds the multi-resolution Windows `.ico` from the logo. |
-| [tools/setup_arduino.py](tools/setup_arduino.py) | Installs the core and every library, patched and pinned, in one command. |
+| [quickstart.py](quickstart.py) | Install, build and flash in one command. |
+| [tools/setup_arduino.py](tools/setup_arduino.py) | Installs the core and every library, patched and pinned. |
+| [tools/flash.py](tools/flash.py) | Compiles, uploads and opens the serial monitor. No IDE. |
 
 ## Architecture
 
@@ -101,18 +115,19 @@ The relay has three modes, all on one deployment:
 | **Arduino IDE** | [arduino.cc/en/software](https://www.arduino.cc/en/software) |
 | **Python 3** | [python.org/downloads](https://www.python.org/downloads/) — needed only for the setup scripts and the agent |
 
-**You do not need to download any libraries.** One command installs the ESP32
-core and all three libraries at the exact versions this is verified against,
-patches TFT_eSPI for the T-Display pinout, puts `lv_conf.h` where LVGL looks for
-it, and compiles the sketch to prove it worked:
+**You do not need to download any libraries, or the Arduino IDE.**
+`python quickstart.py` does everything. The individual steps, if you want them
+separately:
 
 ```bash
-python tools/setup_arduino.py
+python tools/setup_arduino.py     # core + libraries, pinned and patched
+python tools/flash.py             # compile, upload, watch it boot
 ```
 
-`--check` reports what is installed without changing anything. It pulls ~250 MB
-of core and toolchain the first time, and everything lands in the normal Arduino
-folders, so the IDE sees it all afterwards.
+`setup_arduino.py --check` reports what is installed without changing anything.
+It pulls ~250 MB of core and toolchain the first time, and everything lands in
+the normal Arduino folders, so the Arduino IDE sees it all afterwards if you
+prefer to work there.
 
 <details>
 <summary>If you would rather install them by hand</summary>
@@ -223,13 +238,19 @@ sudo systemctl daemon-reload && sudo systemctl enable --now peek-agent
 On Windows the tray app's **Start automatically when I sign in** does the same
 thing with no service to install.
 
-### 4. Flashing the ESP32 — Arduino IDE
+### 4. Flashing the ESP32
 
-If you ran `python tools/setup_arduino.py`, everything is already installed and
-patched. Open `PeekESP/PeekESP.ino`, set **Board: LilyGo T-Display** and
-**Tools → Partition Scheme → Huge APP (3MB No OTA/1MB SPIFFS)**, and upload.
+```bash
+python tools/flash.py
+```
 
-*ESP32 Dev Module* also works; both are verified.
+Finds the board, compiles, uploads, and opens the serial monitor so you can read
+the pairing code as it boots. `--erase` wipes saved settings, which is how you
+get a *new* pairing code — re-flashing alone keeps the old one.
+
+Prefer the Arduino IDE? Everything is already installed and patched: open
+`PeekESP/PeekESP.ino`, set **Board: LilyGo T-Display** and **Tools → Partition
+Scheme → Huge APP**, upload. *ESP32 Dev Module* also works; both are verified.
 
 **Verified build** — ESP32 core 2.0.17, lvgl 8.3.9, ArduinoJson 7.4.3,
 against **both** TFT_eSPI builds:
