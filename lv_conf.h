@@ -42,6 +42,7 @@
 #define LV_USE_LABEL   1
 #define LV_USE_SPINNER 1   /* the in-flight request ring in the top-right corner */
 #define LV_USE_QRCODE  1   /* setup screen: scan to join the config access point */
+#define LV_USE_IMG     1   /* boot splash */
 #define LV_USE_ANIMIMG 0
 /* Both of the above default to 0 in LVGL's own lv_conf_internal.h — without
  * these lines the sketch fails to link, not to compile, which is a slower

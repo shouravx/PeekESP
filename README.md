@@ -52,6 +52,7 @@ host to accept an inbound connection.
 | [windows/](windows/) | The same agent for a Windows PC, plus a one-file `.exe` build. |
 | [cloudflare/](cloudflare/) | Worker relay for when the host has no reachable port. `npm test` covers it. |
 | [.github/workflows/](.github/workflows/) | CI: tests the Worker, deploys it on merge, pings it weekly. |
+| [tools/png_to_lvgl.py](tools/png_to_lvgl.py) | Turns a PNG into the compiled-in boot logo. |
 
 ## Architecture
 
@@ -405,6 +406,29 @@ the form returns the device to factory defaults.
 > trust, and the alternative is entering a 44-character base64 key with two
 > buttons. The AP is only up while you are configuring it, and its password is
 > derived per-device from the MAC.
+
+## Changing the boot logo
+
+The device shows the logo for about a second at boot, then fades it out while
+the network is already connecting underneath — the splash costs no boot time,
+it just covers the moment the dashboard would otherwise show a screen of zeroes.
+
+`PeekESP/logo_splash.h` is generated, not hand-written. To use different
+artwork:
+
+```bash
+python tools/png_to_lvgl.py img/logo.png PeekESP/logo_splash.h --name logo_splash --size 96 --bg 05070E
+```
+
+It composites transparency onto the theme background (`--bg`), scales to fit
+`--size`, and emits RGB565 in the byte order the firmware's `LV_COLOR_16_SWAP`
+setting expects. At 96×96 that is 18 KB of **flash** — the image is `const`, so
+it costs no RAM at all.
+
+Alpha is flattened rather than kept: `LV_IMG_CF_TRUE_COLOR_ALPHA` would be 3
+bytes per pixel and blend every frame, and the splash only ever sits on one
+colour. Pass `--swap` if you ever set `LV_COLOR_16_SWAP` to 1 — the symptom of
+getting it wrong is swapped red and blue, not an error.
 
 ## Buttons
 

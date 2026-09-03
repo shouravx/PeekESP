@@ -66,6 +66,7 @@
 #include <mbedtls/sha256.h>
 
 #include "ca_certs.h"
+#include "logo_splash.h"
 
 #include <TFT_eSPI.h>
 #include <lvgl.h>
@@ -811,6 +812,61 @@ static void build_pair_overlay(lv_obj_t *scr) {
              "hold left button to change settings");
 }
 
+// ---------------------------------------------------------------------------
+//  Boot splash
+//
+//  Sits above everything for a beat, then fades itself out and deletes. The
+//  fade is an LVGL animation rather than a delay() so the network task is
+//  already connecting underneath while it is on screen - the splash costs no
+//  time at all, it just covers the part of boot that would otherwise be a
+//  dashboard full of zeroes.
+// ---------------------------------------------------------------------------
+static void splash_opa_cb(void *obj, int32_t v) {
+  lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)v, 0);
+}
+
+static void splash_done_cb(lv_anim_t *a) {
+  lv_obj_del((lv_obj_t *)a->var);
+}
+
+static void build_splash(lv_obj_t *scr) {
+  lv_obj_t *sp = lv_obj_create(scr);
+  lv_obj_remove_style_all(sp);
+  lv_obj_set_size(sp, SCREEN_W, SCREEN_H);
+  lv_obj_set_pos(sp, 0, 0);
+  lv_obj_set_style_bg_color(sp, COL_BG, 0);
+  lv_obj_set_style_bg_opa(sp, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(sp, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *img = lv_img_create(sp);
+  lv_img_set_src(img, &logo_splash);
+  lv_obj_set_pos(img, 20, 20);
+
+  lv_obj_t *name = lv_label_create(sp);
+  lv_label_set_text(name, "PEEK");
+  lv_obj_set_style_text_font(name, F_BIG, 0);
+  lv_obj_set_style_text_color(name, COL_CYAN, 0);
+  lv_obj_set_style_text_letter_space(name, 3, 0);
+  lv_obj_set_pos(name, 134, 48);
+
+  lv_obj_t *sub = lv_label_create(sp);
+  lv_label_set_text(sub, "dashboard");
+  lv_obj_set_style_text_font(sub, F_SM, 0);
+  lv_obj_set_style_text_color(sub, COL_TEXT_DIM, 0);
+  lv_obj_set_pos(sub, 136, 74);
+
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, sp);
+  lv_anim_set_exec_cb(&a, splash_opa_cb);
+  lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
+  lv_anim_set_time(&a, 420);
+  lv_anim_set_delay(&a, 1100);
+  lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
+  lv_anim_set_ready_cb(&a, splash_done_cb);
+  lv_anim_start(&a);
+}
+
 static void pairing_done() {
   if (g_pair_panel && !lv_obj_has_flag(g_pair_panel, LV_OBJ_FLAG_HIDDEN)) {
     lv_obj_add_flag(g_pair_panel, LV_OBJ_FLAG_HIDDEN);
@@ -1435,6 +1491,7 @@ void setup() {
     // The overlay sits on top until the first reading arrives, so a freshly
     // flashed device shows its code rather than a dashboard full of zeroes.
     if (cfg.transport == TRANSPORT_PAIRED) build_pair_overlay(lv_scr_act());
+    build_splash(lv_scr_act());        // last, so it covers everything above
     lv_timer_create(ui_sync_cb, 120, NULL);
   }
 
