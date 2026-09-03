@@ -11,7 +11,7 @@ Two executables, because the two jobs want opposite things:
 | For | Your desktop | A server, service or scheduled task |
 | UI | Tray icon + settings window | None, console only |
 | Config | The settings window, or the JSON file | CLI flags, or `--config` |
-| Size | ~13 MB | ~8.5 MB |
+| Size | ~17.6 MB | ~8.5 MB |
 | Dependencies | pystray + Pillow, bundled | **standard library only** |
 
 ## The tray app
@@ -33,6 +33,34 @@ secrets not set". That is the fastest way to tell a wrong token from a wrong URL
 **Start automatically when I sign in** registers a Task Scheduler entry — no
 admin prompt, no service install, and unticking it removes the task.
 
+### "On the device, after flashing"
+
+The panel at the bottom shows exactly what to type into the ESP32's setup
+portal once it is flashed — because the device and this agent use *different*
+halves of the pair:
+
+| | This agent | The ESP32 |
+|---|---|---|
+| URL | `…/ingest/alice` | `…/telemetry/alice` |
+| Token | push | **read** |
+
+The device URL is **derived from the ingest URL as you type it**, so the two
+cannot drift apart. Pushing to `/ingest/alice` while the device polls
+`/telemetry/bob` gives you a device stuck on `NO LINK` against a perfectly
+healthy relay, and that is a genuinely annoying afternoon.
+
+**New** mints a fresh 48-hex read token — 192 bits, and inside the firmware's
+65-byte buffer. Use it in **private** mode: the value it generates is what you
+set as `READ_TOKEN` in Cloudflare *and* what you type into the device. In
+**shared** mode you do not generate anything here — paste the read token that
+`npm run mint` printed for your stream.
+
+**Copy** puts the URL and token on the clipboard together, so you can paste
+them into the portal from another machine.
+
+The read token is stored in `config.json` but **never sent** by this agent. It
+is kept only so the value is in one place instead of on a sticky note.
+
 ## Or just edit the file
 
 Everything the window writes lives in
@@ -45,6 +73,7 @@ without restarting.
   "mode": "push",
   "relay_url": "https://peek-relay.you.workers.dev/ingest/alice",
   "token": "…",
+  "device_token": "…",
   "interval": 5.0,
   "serve_port": 8080,
   "autostart": false

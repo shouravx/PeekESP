@@ -327,6 +327,67 @@ def open_settings(runner):
     label(right, "Serve port", DIM, 8).pack(anchor="w")
     entry(right, v_port, width=10).pack(anchor="w", ipady=3)
 
+    # ---- what to type into the ESP32 ----
+    # The device needs the READ token and the /telemetry URL; this agent uses
+    # the PUSH token and /ingest. Keeping the pair visible in one place is the
+    # difference between a two-minute setup and hunting for a value you wrote
+    # down somewhere during the Cloudflare step.
+    label(body, "ON THE DEVICE, AFTER FLASHING", DIM, 8).pack(anchor="w", pady=(16, 4))
+
+    dev = card(body)
+    dev.pack(fill="x")
+    inner = tk.Frame(dev, bg=CARD)
+    inner.pack(fill="x", padx=12, pady=10)
+
+    label(inner, "Worker URL", DIM, 8).pack(anchor="w")
+    v_devurl = tk.StringVar(value=cfgmod.device_url(cfg["relay_url"]))
+    dev_url_lbl = tk.Label(inner, textvariable=v_devurl, bg=CARD, fg=CYAN,
+                           font=("Consolas", 8), anchor="w", justify="left",
+                           wraplength=380)
+    dev_url_lbl.pack(anchor="w", fill="x", pady=(1, 8))
+
+    label(inner, "Read token", DIM, 8).pack(anchor="w")
+    v_devtok = tk.StringVar(value=cfg.get("device_token", ""))
+    devrow = tk.Frame(inner, bg=CARD)
+    devrow.pack(anchor="w", fill="x", pady=(1, 0))
+    dev_tok = tk.Entry(devrow, textvariable=v_devtok, bg=BG, fg=MAGENTA,
+                       insertbackground=CYAN, relief="flat",
+                       highlightbackground=EDGE, highlightcolor=CYAN,
+                       highlightthickness=1, font=("Consolas", 8))
+    dev_tok.pack(side="left", fill="x", expand=True, ipady=3)
+
+    def gen_device_token():
+        v_devtok.set(cfgmod.new_token())
+        set_status(AMBER, "generated - set it as READ_TOKEN in Cloudflare too")
+
+    def copy_device():
+        url, tok = v_devurl.get(), v_devtok.get()
+        if not url or not tok:
+            set_status(AMBER, "nothing to copy yet")
+            return
+        root.clipboard_clear()
+        root.clipboard_append(f"Worker URL: {url}\nRead token: {tok}")
+        root.update()
+        set_status(GREEN, "device settings copied to clipboard")
+
+    tk.Button(devrow, text="New", command=gen_device_token, bg=EDGE, fg=TEXT,
+              activebackground=CYAN, activeforeground=BG, relief="flat", bd=0,
+              font=("Segoe UI", 8), padx=8, pady=3,
+              cursor="hand2").pack(side="left", padx=(6, 0))
+    tk.Button(devrow, text="Copy", command=copy_device, bg=EDGE, fg=TEXT,
+              activebackground=CYAN, activeforeground=BG, relief="flat", bd=0,
+              font=("Segoe UI", 8), padx=8, pady=3,
+              cursor="hand2").pack(side="left", padx=(4, 0))
+
+    label(inner, "Enter these in the device's setup portal (192.168.4.1).",
+          DIM, 8).pack(anchor="w", pady=(8, 0))
+
+    # Keep the device URL in step with the ingest URL as it is typed.
+    def sync_device_url(*_):
+        v_devurl.set(cfgmod.device_url(v_url.get()) or "—")
+    v_url.trace_add("write", sync_device_url)
+    sync_device_url()
+
     tk.Checkbutton(body, text="Start automatically when I sign in",
                    variable=v_auto, bg=BG, fg=TEXT, selectcolor=CARD,
                    activebackground=BG, activeforeground=CYAN,
@@ -349,7 +410,9 @@ def open_settings(runner):
     def collect():
         c = dict(runner.cfg)
         c.update({"mode": v_mode.get(), "relay_url": v_url.get().strip(),
-                  "token": v_token.get().strip(), "interval": v_interval.get(),
+                  "token": v_token.get().strip(),
+                  "device_token": v_devtok.get().strip(),
+                  "interval": v_interval.get(),
                   "serve_port": v_port.get(), "autostart": v_auto.get()})
         return cfgmod.validate(c)
 

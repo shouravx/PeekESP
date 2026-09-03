@@ -71,6 +71,30 @@ def ensure_pyinstaller(py):
                            "--disable-pip-version-check", "pyinstaller"])
 
 
+def check_not_running():
+    """
+    PyInstaller cannot overwrite a running exe: Windows locks it and the build
+    dies with a bare PermissionError several screens into the log, long after
+    the part anyone reads. Worse, the previous binary survives, so the next
+    test appears to pass while actually exercising stale code. Say so up front.
+    """
+    stuck = []
+    for exe in (DIST / "peek-agent.exe", DIST / "PeekESP.exe"):
+        if not exe.exists():
+            continue
+        try:
+            with open(exe, "ab"):
+                pass
+        except PermissionError:
+            stuck.append(exe.name)
+    if stuck:
+        names = " and ".join(stuck)
+        sys.exit(
+            f"{names} is running, so it cannot be replaced.\n"
+            f"  Quit it from the tray icon, or:  taskkill /F /IM {stuck[0]}\n"
+            "  (Closing the settings window is not enough - the tray keeps it alive.)")
+
+
 def main():
     args = sys.argv[1:]
 
@@ -80,6 +104,8 @@ def main():
 
     if not SCRIPT.exists():
         sys.exit(f"missing {SCRIPT.name}")
+
+    check_not_running()
 
     py = venv_python()
     ensure_pyinstaller(py)

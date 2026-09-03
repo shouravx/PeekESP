@@ -27,10 +27,38 @@ DEFAULTS = {
     "mode": "push",
     "relay_url": "",
     "token": "",
+    # The device's read token. This agent never sends it - it is kept only so
+    # the settings window can show you what to type into the ESP32 after
+    # flashing it, which is otherwise a value you have to keep on a sticky note.
+    "device_token": "",
     "interval": 5.0,
     "serve_port": 8080,
     "autostart": False,
 }
+
+
+def device_url(relay_url: str) -> str:
+    """
+    The URL the ESP32 should poll, derived from the one this agent pushes to.
+
+    They differ only in the verb, and getting them out of step - pushing to
+    /ingest/alice while the device reads /telemetry/bob - produces a device
+    that sits at NO LINK against a perfectly healthy relay. Deriving it
+    removes that whole class of mistake.
+    """
+    u = (relay_url or "").strip()
+    if not u:
+        return ""
+    i = u.rfind("/ingest")
+    if i == -1:
+        return u
+    return u[:i] + "/telemetry" + u[i + len("/ingest"):]
+
+
+def new_token() -> str:
+    """48 hex chars: 192 bits, and inside the firmware's 65-byte buffer."""
+    import secrets
+    return secrets.token_hex(24)
 
 
 def config_dir() -> Path:
@@ -76,6 +104,7 @@ def validate(cfg: dict) -> dict:
         cfg["serve_port"] = DEFAULTS["serve_port"]
     cfg["relay_url"] = str(cfg.get("relay_url", "") or "").strip()
     cfg["token"] = str(cfg.get("token", "") or "").strip()
+    cfg["device_token"] = str(cfg.get("device_token", "") or "").strip()
     cfg["autostart"] = bool(cfg.get("autostart", False))
     return cfg
 
@@ -107,4 +136,6 @@ def problems(cfg: dict):
             out.append("Relay URL should end in /ingest or /ingest/<stream>")
         if not cfg["token"]:
             out.append("Push token is empty")
+        if cfg["device_token"] and cfg["device_token"] == cfg["token"]:
+            out.append("Push and device tokens must differ")
     return out
