@@ -16,6 +16,12 @@ node_modules/
 .wrangler/
 .dev.vars
 
+# Windows agent build output
+windows/.venv/
+windows/dist/
+windows/build/
+*.spec
+
 # Prerequisites
 *.d
 

@@ -33,8 +33,9 @@
  * 48 hex characters, not the full 64, because the firmware stores the read
  * token in a 65-byte buffer. 192 bits of an HMAC is ample.
  *
- * Legacy single-tenant mode: /ingest and /telemetry with no stream still work
- * against PUSH_TOKEN / READ_TOKEN, so an existing deployment keeps running.
+ * PRIVATE mode: /ingest and /telemetry with no stream run against PUSH_TOKEN /
+ * READ_TOKEN. Not a deprecated path - it is the right choice when the relay is
+ * only ever yours. Both modes can be active on one deployment.
  */
 
 const CORS = {
@@ -134,8 +135,8 @@ export default {
       return new Response(null, { status: 204, headers: CORS });
     }
 
-    const legacyReady = Boolean(env.PUSH_TOKEN && env.READ_TOKEN);
-    const streamsReady = Boolean(env.MASTER_SECRET);
+    const privateReady = Boolean(env.PUSH_TOKEN && env.READ_TOKEN);   // just you
+    const streamsReady  = Boolean(env.MASTER_SECRET);                 // shared
 
     // /health answers BEFORE any secret gate on purpose. It exists to confirm
     // a deploy landed, and "deployed but not yet configured" is a different
@@ -146,11 +147,11 @@ export default {
     if (url.pathname === "/health") {
       return json({
         ok: true,
-        configured: legacyReady,
+        configured: privateReady,
         streams: streamsReady,
-        ...(legacyReady || streamsReady ? {} : {
-          hint: "set MASTER_SECRET (multi-tenant) or PUSH_TOKEN + READ_TOKEN " +
-                "(single tenant) with: wrangler secret put",
+        ...(privateReady || streamsReady ? {} : {
+          hint: "set PUSH_TOKEN + READ_TOKEN (private) or MASTER_SECRET " +
+                "(shared, multi-stream) with: wrangler secret put",
         }),
       });
     }
@@ -174,20 +175,20 @@ export default {
     let doName;
 
     if (stream === undefined) {
-      // ---- legacy single-tenant ----
-      if (!legacyReady) {
+      // ---- private: one host, one device ----
+      if (!privateReady) {
         return json({
           error: "PUSH_TOKEN and READ_TOKEN secrets are not set",
           hint: "These are Cloudflare Worker secrets, not GitHub Actions secrets. " +
                 "Set them with 'wrangler secret put PUSH_TOKEN' (and READ_TOKEN), or use " +
-                "the multi-tenant form: set MASTER_SECRET and call /ingest/<stream>.",
+                "the shared form: set MASTER_SECRET and call /ingest/<stream>.",
         }, 500);
       }
       const expected = wantsWrite ? env.PUSH_TOKEN : env.READ_TOKEN;
       if (!tokenMatches(token, expected)) return json({ error: "unauthorized" }, 401);
       doName = "singleton";
     } else {
-      // ---- multi-tenant ----
+      // ---- shared: one stream per tenant ----
       if (!streamsReady) {
         return json({
           error: "MASTER_SECRET is not set, so per-stream URLs are disabled",

@@ -11,7 +11,7 @@ put in the wrong one.
 | GitHub → Actions secrets | The CI workflow | Only while deploying |
 | Cloudflare → Worker secrets | The Worker itself | Every request, at runtime |
 | ESP32 setup portal | The firmware | Every poll |
-| DietPi command line | The agent | Every push |
+| Host command line | The agent (Linux or Windows) | Every push |
 
 > **The single most common mistake:** setting `MASTER_SECRET` (or `PUSH_TOKEN` /
 > `READ_TOKEN`) as a *GitHub* secret. Those are **Cloudflare Worker** secrets.
@@ -49,7 +49,7 @@ put in the wrong one.
 Add with **Type: Secret** (not Text). Plain text variables would work but stay
 readable in the dashboard forever.
 
-### Multi-tenant — one secret, any number of users
+### Shared — one secret, any number of users
 
 | Name | Value |
 |---|---|
@@ -83,7 +83,7 @@ so you can't revoke one in place. Move them to a new stream name — `alice` →
 `alice-v2` — which changes both their tokens and leaves everyone else alone.
 Rotating `MASTER_SECRET` invalidates every stream at once.
 
-### Single-tenant — the simpler option if it's only you
+### Private — the simpler option when it's only you
 
 | Name | Value |
 |---|---|
@@ -100,8 +100,9 @@ is the entire point: the ESP32 sits on a desk carrying the read token in flash,
 so if the device is taken apart, that token still cannot push fabricated
 telemetry.
 
-These use the un-suffixed URLs, `/ingest` and `/telemetry`. Both modes can be
-active on the same deployment.
+These use the un-suffixed URLs, `/ingest` and `/telemetry`. **Private is not a
+deprecated path** — it is the right choice when the relay is only ever yours.
+Both modes can be active on the same deployment at once.
 
 Secrets take effect immediately — no redeploy. `wrangler deploy` deliberately
 never touches them, which is why you set them once and they survive every
@@ -119,7 +120,7 @@ browse to `192.168.4.1`.
 | Network (SSID) | Your WiFi — pick from the dropdown |
 | Password | Your WiFi passphrase |
 | Transport | **Cloudflare relay** |
-| Worker URL | `…/telemetry` (single-tenant) or `…/telemetry/<stream>` (multi-tenant) |
+| Worker URL | `…/telemetry` (private) or `…/telemetry/<stream>` (shared) |
 | Read token | The **read** token — never the push one |
 | Verify TLS certificate | **Checked** |
 | Poll seconds | `5` |
@@ -128,13 +129,18 @@ The WireGuard fields are ignored entirely when Transport is set to relay.
 
 ---
 
-## 4. DietPi — the agent command
+## 4. The host — the agent command
+
+**Windows** uses `windows/peek-agent-win.py` (or the compiled
+`peek-agent.exe`); flags and JSON are identical to the Linux agent. It reports
+`cpu_temp_c: -1`, which the display renders as `--`, because Windows exposes no
+temperature without a vendor driver.
 
 ```bash
 python3 peek-agent.py --push https://peek-relay.peekesp.workers.dev/ingest --token PUSH_TOKEN_HERE
 ```
 
-Multi-tenant — note the stream name on the end:
+Shared mode — note the stream name on the end:
 
 ```bash
 python3 peek-agent.py --push https://peek-relay.peekesp.workers.dev/ingest/alice --token ALICE_PUSH_TOKEN
@@ -159,7 +165,7 @@ This trips people up, because all three look like "the Worker URL":
 |---|---|
 | GitHub `WORKER_URL` variable | `https://peek-relay.peekesp.workers.dev` |
 | ESP32 setup portal | `…`**`/telemetry`** or `…`**`/telemetry/<stream>`** |
-| DietPi agent `--push` | `…`**`/ingest`** or `…`**`/ingest/<stream>`** |
+| Host agent `--push` | `…`**`/ingest`** or `…`**`/ingest/<stream>`** |
 
 A stream's two URLs must use the **same** stream name, or the device reads a
 slot nothing is writing to and sits at `NO LINK`.

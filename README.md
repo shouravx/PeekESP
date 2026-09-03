@@ -48,7 +48,8 @@ host to accept an inbound connection.
 | [lv_conf.h](lv_conf.h) | LVGL config for this board. |
 | [platformio.ini](platformio.ini) + [main.cpp](main.cpp) | PlatformIO build of the exact same sketch. |
 | [dietpi-wireguard-setup.sh](dietpi-wireguard-setup.sh) | **Direct transport only.** Creates the tunnel on the host, prints the keys. |
-| [dietpi/peek-agent.py](dietpi/peek-agent.py) | Run on the DietPi: serves the JSON, and/or pushes it to the relay. |
+| [dietpi/peek-agent.py](dietpi/peek-agent.py) | Run on the Linux host: serves the JSON, and/or pushes it to the relay. |
+| [windows/](windows/) | The same agent for a Windows PC, plus a one-file `.exe` build. |
 | [cloudflare/](cloudflare/) | Worker relay for when the host has no reachable port. `npm test` covers it. |
 | [.github/workflows/](.github/workflows/) | CI: tests the Worker, deploys it on merge, pings it weekly. |
 
@@ -86,6 +87,16 @@ If you can port-forward the host, **Direct** is the better answer — nothing
 leaves your infrastructure. If the host is behind CGNAT or on someone else's
 network, that option simply doesn't exist, and the relay is how you get around
 it. See [cloudflare/](cloudflare/) and the deploy steps below.
+
+The relay itself comes in two flavours, and both can be live on one deployment:
+
+| | **Private** | **Shared** |
+|---|---|---|
+| For | Just your own host and device | You and other people |
+| URLs | `/ingest`, `/telemetry` | `/ingest/<stream>`, `/telemetry/<stream>` |
+| Secrets | `PUSH_TOKEN` + `READ_TOKEN` | one `MASTER_SECRET` |
+| Adding someone | n/a | `npm run mint -- alice`, entirely offline |
+| Isolation | n/a | separate Durable Object per stream |
 
 ## Tailscale and the Direct transport
 
@@ -166,8 +177,17 @@ Step 1 is common to both transports. Then do **either** 2a or 2b, not both.
 
 ### 1. On the host — the telemetry agent
 
+**Linux:**
+
 ```bash
 sudo install -m 755 dietpi/peek-agent.py /usr/local/bin/peek-agent
+```
+
+**Windows** — same JSON, same flags, standard library only. See
+[windows/](windows/):
+
+```bash
+python windows\peek-agent-win.py --once
 ```
 
 Check it reads your machine correctly before wiring anything up — run it in the

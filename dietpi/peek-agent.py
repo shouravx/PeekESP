@@ -35,6 +35,9 @@ SAMPLE_SECONDS = 2.0      # how often the background sampler takes a reading
 # --------------------------------------------------------------------------
 _state = {"cpu_percent": 0.0, "net_rx_kbps": 0.0, "net_tx_kbps": 0.0}
 _lock = threading.Lock()
+# Set once the sampler has produced its first real delta. Without it, the
+# first snapshot races the sampler and reports cpu/net as a flat 0.
+_primed = threading.Event()
 
 
 def _cpu_totals():
@@ -84,6 +87,7 @@ def _sampler():
             _state["net_rx_kbps"] = max(0.0, rx_kbps)
             _state["net_tx_kbps"] = max(0.0, tx_kbps)
 
+        _primed.set()
         prev_cpu, prev_net, prev_t = cur_cpu, cur_net, now
 
 
@@ -224,7 +228,8 @@ def main():
         ap.error("--push needs --token (or the PEEK_PUSH_TOKEN environment variable)")
 
     threading.Thread(target=_sampler, daemon=True).start()
-    time.sleep(SAMPLE_SECONDS)           # let the first CPU/net delta land
+    if not _primed.wait(SAMPLE_SECONDS * 3):   # wait for a real delta, not a guess
+        print("warning: first sample did not arrive; rates may read 0", flush=True)
 
     if args.push:
         print("pushing to %s every %gs" % (args.push, args.interval), flush=True)
