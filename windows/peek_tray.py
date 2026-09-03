@@ -317,7 +317,11 @@ def open_settings(runner):
         except ValueError as e:
             set_status(RED, str(e))
             return
-        u = pair.urls(cfg.get("relay_base", cfgmod.DEFAULT_RELAY_BASE), d["stream"])
+        base = v_base.get().strip().rstrip("/")
+        if not base.lower().startswith(("http://", "https://")):
+            set_status(RED, "relay must start with https://")
+            return
+        u = pair.urls(base, d["stream"])
         v_url.set(u["ingest"])
         v_token.set(d["push"])
         v_devtok.set(d["read"])
@@ -330,7 +334,29 @@ def open_settings(runner):
               font=("Segoe UI", 9, "bold"), padx=14, pady=5,
               cursor="hand2").pack(side="left", padx=(8, 0))
 
-    label(pin, "Everything below is filled in from this code.",
+    # The relay the code is resolved against. Baked in so nobody has to type
+    # it, but visible and editable here - otherwise anyone running their own
+    # Worker would have to hand-edit config.json to point at it, and everyone
+    # else would be looking at an empty URL field with no idea what it will use.
+    label(pin, "Relay", DIM, 8).pack(anchor="w", pady=(9, 0))
+    brow = tk.Frame(pin, bg=CARD)
+    brow.pack(anchor="w", fill="x", pady=(2, 0))
+    v_base = tk.StringVar(value=cfg.get("relay_base", cfgmod.DEFAULT_RELAY_BASE))
+    tk.Entry(brow, textvariable=v_base, bg=BG, fg=TEXT, insertbackground=CYAN,
+             relief="flat", highlightbackground=EDGE, highlightcolor=CYAN,
+             highlightthickness=1, font=("Consolas", 8)
+             ).pack(side="left", fill="x", expand=True, ipady=3)
+
+    def reset_base():
+        v_base.set(cfgmod.DEFAULT_RELAY_BASE)
+        set_status(AMBER, "relay reset to the default - press Pair again")
+
+    tk.Button(brow, text="Default", command=reset_base, bg=EDGE, fg=TEXT,
+              activebackground=CYAN, activeforeground=BG, relief="flat", bd=0,
+              font=("Segoe UI", 8), padx=8, pady=3,
+              cursor="hand2").pack(side="left", padx=(6, 0))
+
+    label(pin, "Everything below is filled in from the code and this relay.",
           DIM, 8).pack(anchor="w", pady=(7, 0))
 
     # ---- mode ----
@@ -456,6 +482,7 @@ def open_settings(runner):
         c = dict(runner.cfg)
         c.update({"mode": v_mode.get(),
                   "pair_code": pair.normalise(v_code.get()),
+                  "relay_base": v_base.get().strip().rstrip("/"),
                   "relay_url": v_url.get().strip(),
                   "token": v_token.get().strip(),
                   "device_token": v_devtok.get().strip(),

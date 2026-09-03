@@ -20,9 +20,16 @@ Two executables, because the two jobs want opposite things:
 2. Open `PeekESP.exe`, right-click the tray icon, **Settings**.
 3. Type the code into **Pair a device** and press **Pair**, then **Save**.
 
-That is it. The relay URL, both tokens and the stream are derived from the code
-on both sides; nothing else is typed and no account or secret is involved.
-Dashes and case are ignored, so `k7m2-p4qx-9r` works.
+That is it. Both tokens and the stream are derived from the code on both sides;
+nothing else is typed and no account or secret is involved. Dashes and case are
+ignored, so `k7m2-p4qx-9r` works.
+
+The **Relay** box in the same card is the Worker the code is resolved against.
+It is pre-filled with the default, so you can ignore it — it is there so anyone
+running their own Worker can point at it without hand-editing `config.json`, and
+so it is never a mystery which relay the app is about to use. **Default** puts
+the built-in one back. Changing it means re-pressing **Pair**, since the URLs
+are built from the relay and the code together.
 
 The device shows its code until the first reading arrives, then switches to the
 dashboard by itself.
