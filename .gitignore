@@ -91,3 +91,6 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# arduino-cli fetched by tools/setup_arduino.py
+tools/.arduino-cli/

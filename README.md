@@ -51,6 +51,7 @@ behind CGNAT. Setup is one code shown on the device's screen.
 | [.github/workflows/](.github/workflows/) | CI: tests the Worker, deploys it on merge, pings it weekly. |
 | [tools/png_to_lvgl.py](tools/png_to_lvgl.py) | Turns a PNG into the compiled-in boot logo. |
 | [tools/make_icon.py](tools/make_icon.py) | Builds the multi-resolution Windows `.ico` from the logo. |
+| [tools/setup_arduino.py](tools/setup_arduino.py) | Installs the core and every library, patched and pinned, in one command. |
 
 ## Architecture
 
@@ -90,6 +91,51 @@ The relay has three modes, all on one deployment:
 | Setup | type the device's code | two Worker secrets | one `MASTER_SECRET` |
 | Worker config | **none** | `PUSH_TOKEN` + `READ_TOKEN` | mint per stream |
 | For | just working | only you | you and other people |
+
+## Get it
+
+| | |
+|---|---|
+| **This repository** | [Download ZIP](https://github.com/shouravx/PeekESP/archive/refs/heads/main.zip) &middot; `git clone https://github.com/shouravx/PeekESP.git` |
+| **Windows app** | build it: `cd windows && python build.py` &rarr; `dist/PeekESP.exe` |
+| **Arduino IDE** | [arduino.cc/en/software](https://www.arduino.cc/en/software) |
+| **Python 3** | [python.org/downloads](https://www.python.org/downloads/) — needed only for the setup scripts and the agent |
+
+**You do not need to download any libraries.** One command installs the ESP32
+core and all three libraries at the exact versions this is verified against,
+patches TFT_eSPI for the T-Display pinout, puts `lv_conf.h` where LVGL looks for
+it, and compiles the sketch to prove it worked:
+
+```bash
+python tools/setup_arduino.py
+```
+
+`--check` reports what is installed without changing anything. It pulls ~250 MB
+of core and toolchain the first time, and everything lands in the normal Arduino
+folders, so the IDE sees it all afterwards.
+
+<details>
+<summary>If you would rather install them by hand</summary>
+
+| | Version | Where |
+|---|---|---|
+| ESP32 core | **2.0.17** | Boards Manager, or [package_esp32_index.json](https://espressif.github.io/arduino-esp32/package_esp32_index.json) |
+| lvgl | **8.3.9** — not 9.x | [github.com/lvgl/lvgl](https://github.com/lvgl/lvgl/releases/tag/v8.3.9) |
+| TFT_eSPI | 2.5.43 | [github.com/Bodmer/TFT_eSPI](https://github.com/Bodmer/TFT_eSPI) |
+| ArduinoJson | 7.4.3 | [arduinojson.org](https://arduinojson.org/) |
+
+Then two edits the script would have done for you: in
+`<Arduino>/libraries/TFT_eSPI/User_Setup_Select.h` comment out
+`#include <User_Setup.h>` and uncomment the `Setup25_TTGO_T_Display.h` line, and
+copy this repo's `lv_conf.h` to `<Arduino>/libraries/lv_conf.h` — *beside* the
+`lvgl` folder, not inside it.
+
+The libraries are not committed to this repository because LVGL alone is 97 MB
+across 1160 files and TFT_eSPI another 34 MB; and LVGL finds `lv_conf.h` by
+looking one directory *above* its own folder, which cannot work from inside a
+sketch without build flags the Arduino IDE has no way to set.
+
+</details>
 
 ## Setup
 
@@ -179,28 +225,11 @@ thing with no service to install.
 
 ### 4. Flashing the ESP32 — Arduino IDE
 
-1. **Boards Manager** → *esp32* by Espressif → install **2.0.17**.
-   Later cores are untested here; 2.0.17 is what this is verified against.
-   Board: *LilyGo T-Display* (*ESP32 Dev Module* also works — both verified).
-2. **Library Manager** → `lvgl` and `ArduinoJson`.
-   Library Manager offers **lvgl 9.x** first — pick **8.3.9**. This sketch uses
-   the v8 API and will not build against v9.
-3. **TFT_eSPI — use LilyGO's copy.** They ship one already configured for this
-   exact board: copy the `TFT_eSPI` folder out of
-   [Xinyuan-LilyGO/TTGO-T-Display](https://github.com/Xinyuan-LilyGO/TTGO-T-Display)
-   into `<Arduino>/libraries/`. Its `User_Setup_Select.h` already points at
-   `Setup25_TTGO_T_Display.h`, so there's nothing to edit and no way to end up
-   with the image offset by 40 px.
-   *Alternative:* Library Manager's TFT_eSPI **2.5.43** also works — both are
-   verified — but then you must edit `User_Setup_Select.h` yourself: comment out
-   `#include <User_Setup.h>`, uncomment the `Setup25_TTGO_T_Display.h` line.
-4. Copy this repo's `lv_conf.h` to `<Arduino>/libraries/lv_conf.h` — *next to*
-   the `lvgl` folder, not inside it. `LV_USE_SPINNER` and `LV_USE_QRCODE` both
-   default to **0** upstream, so a stock config link-errors on two widgets this
-   sketch uses.
-5. Open `PeekESP/PeekESP.ino`, set *Tools → Partition Scheme → Huge APP*,
-   upload. **No credentials needed at compile time** — you configure the device
-   from its own screen. `secrets.h` is optional and only seeds factory defaults.
+If you ran `python tools/setup_arduino.py`, everything is already installed and
+patched. Open `PeekESP/PeekESP.ino`, set **Board: LilyGo T-Display** and
+**Tools → Partition Scheme → Huge APP (3MB No OTA/1MB SPIFFS)**, and upload.
+
+*ESP32 Dev Module* also works; both are verified.
 
 **Verified build** — ESP32 core 2.0.17, lvgl 8.3.9, ArduinoJson 7.4.3,
 against **both** TFT_eSPI builds:
