@@ -135,6 +135,19 @@ PyInstaller, pystray and Pillow go into a local `.venv`, not your system Python
 — nothing outside this folder changes. Output is `dist/`. `--clean` removes the
 artefacts; `--console` builds the tray app with a console window for debugging.
 
+Both exes get `img/logo.ico`. That icon is generated, not hand-drawn:
+
+```bash
+python tools/make_icon.py img/logo.png img/logo.ico
+```
+
+A `.ico` is a container and Windows picks the size it needs from inside — 16 for
+the tray, 32 for the taskbar, 48 for medium Explorer icons, 256 for extra-large
+and the Alt-Tab card. An icon holding **only** 32×32 isn't small, it's *missing*
+every other size, so Windows upscales that one bitmap and it looks visibly
+blocky. Each size is rendered from the full-resolution PNG rather than from the
+next size up.
+
 ## What it reports
 
 | Field | Source |

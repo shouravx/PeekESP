@@ -128,6 +128,10 @@ def main():
         # peek_config is imported inside main() for --config, which PyInstaller's
         # static scan can miss entirely.
         "--hidden-import", "peek_config",
+        # Both exes get the icon. Leaving it off the headless one ships
+        # PyInstaller's default, which looks like a different program's binary
+        # sitting next to the real app.
+        "--icon", str(ICON),
         str(SCRIPT),
     ]
     print("building peek-agent.exe (headless) ...")
