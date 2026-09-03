@@ -72,11 +72,6 @@ LVGL's heap is a static array competing with the draw buffer and the WiFi stack
 for ~160 KB. Lower `LV_MEM_SIZE` in `lv_conf.h` (48 KB here) or shrink the draw
 buffer.
 
-### `tcpip_adapter.h: No such file or directory`
-
-ESP32 core 3.x. WireGuard-ESP32 uses an API removed in ESP-IDF 5. Downgrade to
-**2.0.17**.
-
 ### Sketch too big
 
 Set *Tools → Partition Scheme → **Huge APP (3MB No OTA/1MB SPIFFS)***. The
@@ -113,22 +108,8 @@ something pulling GPIO 0 down.
 ### Never leaves `NTP SYNC`
 
 No route to the internet, or UDP 123 is blocked. This step cannot be skipped:
-TLS validates certificate dates and WireGuard stamps its handshake, so a device
-at epoch 0 fails both — silently, in WireGuard's case.
-
-### `NO LINK` forever on the direct transport
-
-```bash
-sudo wg show
-```
-
-`latest handshake: (none)` means the ESP32's packets never arrive. That is the
-UDP port forward, not the keys.
-
-### Relay works, tunnel does not
-
-Expected if the host has no reachable port — that is the entire reason the relay
-exists. Behind CGNAT the direct transport cannot work at all.
+TLS validates certificate dates, so a device stuck at epoch 0 fails the
+handshake without saying why.
 
 ### TLS handshake fails
 

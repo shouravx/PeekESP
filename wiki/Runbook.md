@@ -8,8 +8,6 @@ Values referenced here are defined in
 
 ---
 
-## Relay path
-
 ### 1. Worker deployed
 
 ```bash
@@ -97,8 +95,7 @@ The bottom-right corner is the whole state machine.
 |---|---|
 | `BOOT` | Just powered on |
 | `WIFI...` | Associating |
-| `NTP SYNC` | Getting the clock. **Required** — TLS validates certificate dates, and WireGuard stamps its handshake |
-| `TUNNEL...` | WireGuard coming up (direct transport only) |
+| `NTP SYNC` | Getting the clock. **Required** — TLS validates certificate dates, so a device at epoch 0 cannot connect |
 | `LINK OK` | Fresh data |
 | `STALE` | Relay reachable, but the host stopped pushing more than 30 s ago |
 | `NO LINK` | Request failing |

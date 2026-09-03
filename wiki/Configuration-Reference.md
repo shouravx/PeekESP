@@ -119,13 +119,13 @@ browse to `192.168.4.1`.
 |---|---|
 | Network (SSID) | Your WiFi — pick from the dropdown |
 | Password | Your WiFi passphrase |
-| Transport | **Cloudflare relay** |
 | Worker URL | `…/telemetry` (private) or `…/telemetry/<stream>` (shared) |
 | Read token | The **read** token — never the push one |
 | Verify TLS certificate | **Checked** |
 | Poll seconds | `5` |
 
-The WireGuard fields are ignored entirely when Transport is set to relay.
+If you paired from the app these are already filled in and there is nothing to
+change here.
 
 ---
 
@@ -171,23 +171,3 @@ A stream's two URLs must use the **same** stream name, or the device reads a
 slot nothing is writing to and sits at `NO LINK`.
 
 ---
-
-## Direct (WireGuard) transport instead
-
-If you are not using the relay, the portal fields are these instead. Every value
-is printed by `dietpi-wireguard-setup.sh`.
-
-| Field | Value | From |
-|---|---|---|
-| Transport | **Direct** | |
-| This device's tunnel IP | `10.10.44.2` | fixed by the setup script |
-| Private key (this device) | 44-char base64 | `/etc/wireguard/ttgo-dashboard.key` |
-| Peer public key (DietPi) | 44-char base64 | `/etc/wireguard/dietpi_wg.pub` |
-| Endpoint host | your public IP or DDNS name | your router / DDNS provider |
-| Endpoint port | `51820` | fixed by the setup script |
-| Host | the DietPi's `100.x.x.x` | `tailscale ip -4` |
-| Port | `8080` | |
-| Path | `/telemetry` | |
-
-> Use a literal `100.x.x.x` address. **MagicDNS names will not resolve** on the
-> ESP32 — it has no route to Tailscale's resolver.

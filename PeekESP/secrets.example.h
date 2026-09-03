@@ -10,10 +10,9 @@
  * several devices and would rather they came up already configured.
  *
  * Copy it to `secrets.h` in the same folder as PeekESP.ino. `secrets.h` is
- * gitignored, so your WireGuard private key never lands in the repository.
+ * gitignored, so nothing you put there lands in the repository.
  *
- * Every value below is printed for you by dietpi-wireguard-setup.sh when you
- * run it on the DietPi.
+ * Nothing here is required. The device pairs from a code on its own screen.
  */
 #pragma once
 
@@ -21,17 +20,8 @@
 #define WIFI_SSID          ""   // leave empty -> device boots into setup mode
 #define WIFI_PASSWORD      ""
 
-// --- WireGuard --------------------------------------------------------------
-#define WG_LOCAL_IP        "10.10.44.2"                 // this ESP32 inside the tunnel
-#define WG_PRIVATE_KEY     ""   // /etc/wireguard/ttgo-dashboard.key
-#define WG_PEER_PUBLIC_KEY ""   // /etc/wireguard/dietpi_wg.pub
-#define WG_ENDPOINT_HOST   ""   // DietPi public IP or DDNS name
-#define WG_ENDPOINT_PORT   51820
-
 // --- Where the telemetry lives ----------------------------------------------
-// The DietPi's Tailscale address: `tailscale ip -4` on the DietPi.
-// For a first bring-up on your LAN, point this at the DietPi's plain
-// 192.168.x.x address and untick the tunnel checkbox in the setup portal.
-#define DIETPI_HOST        "100.64.12.3"
-#define DIETPI_PORT        8080
-#define DIETPI_PATH        "/telemetry"
+// Normally you do not set these: pairing fills them in from the code on the
+// device's screen. They are here for flashing a batch of devices that should
+// come up already pointed at a named or private stream.
+// #define RELAY_BASE_URL  "https://peek-relay.you.workers.dev"

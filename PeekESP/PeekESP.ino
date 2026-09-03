@@ -1,10 +1,10 @@
 /**
  * ============================================================================
  *  PeekESP - a physical dashboard for a remote DietPi box
- *  LilyGO TTGO T-Display (ESP32) - ST7789V 135x240 - LVGL 8.x - WireGuard
+ *  LilyGO TTGO T-Display (ESP32) - ST7789V 135x240 - LVGL 8.x
  * ============================================================================
  *
- *  Core 0 : WiFi -> NTP -> WireGuard tunnel -> blocking HTTP GET -> JSON.
+ *  Core 0 : WiFi -> NTP -> blocking HTTPS GET -> JSON.
  *  Core 1 : LVGL and nothing else. It reads a mutex-protected snapshot of the
  *           telemetry and drives 500 ms eased animations. Network latency on
  *           core 0 can never stall a frame on core 1.
@@ -19,8 +19,7 @@
  *  ARDUINO IDE SETUP (do these once, or nothing will compile / display)
  *  ----------------------------------------------------------------------
  *  1. Boards Manager -> "esp32" by Espressif, install 2.0.17.
- *       Core 3.x is built on ESP-IDF 5, which removed the tcpip_adapter API
- *       that WireGuard-ESP32 still uses. Stay on 2.0.x.
+ *       Later cores are untested here; 2.0.17 is what this is verified on.
  *     Board: "LilyGo T-Display" (or "ESP32 Dev Module" - both verified)
  *     Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)"
  *
@@ -38,16 +37,12 @@
  *     then you must edit User_Setup_Select.h by hand: comment out
  *     "#include <User_Setup.h>" and uncomment the Setup25 line.)
  *
- *  4. WireGuard-ESP32, only if you use the DIRECT transport: Sketch ->
- *     Include Library -> Add .ZIP Library, using
- *       https://github.com/ciniml/WireGuard-ESP32-Arduino  (Code -> Download ZIP)
- *
- *  5. LVGL config. Copy this repo's lv_conf.h to
+ *  4. LVGL config. Copy this repo's lv_conf.h to
  *       <Arduino>/libraries/lv_conf.h     (next to the lvgl folder, NOT inside it)
  *     LV_USE_SPINNER and LV_USE_QRCODE both default to 0 upstream, so the
  *     stock config link-errors on two widgets this sketch uses.
  *
- *  6. secrets.h is now OPTIONAL - it only seeds the factory defaults. Real
+ *  5. secrets.h is now OPTIONAL - it only seeds the factory defaults. Real
  *     configuration happens on-device through the setup portal. Copy
  *     secrets.example.h to secrets.h if you would rather bake yours in.
  * ============================================================================
@@ -71,7 +66,6 @@
 #include <TFT_eSPI.h>
 #include <lvgl.h>
 #include <ArduinoJson.h>
-#include <WireGuard-ESP32.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -92,30 +86,6 @@
 #ifndef WIFI_PASSWORD
   #define WIFI_PASSWORD          ""
 #endif
-#ifndef WG_LOCAL_IP
-  #define WG_LOCAL_IP            "10.10.44.2"
-#endif
-#ifndef WG_PRIVATE_KEY
-  #define WG_PRIVATE_KEY         ""
-#endif
-#ifndef WG_PEER_PUBLIC_KEY
-  #define WG_PEER_PUBLIC_KEY     ""
-#endif
-#ifndef WG_ENDPOINT_HOST
-  #define WG_ENDPOINT_HOST       ""
-#endif
-#ifndef WG_ENDPOINT_PORT
-  #define WG_ENDPOINT_PORT       51820
-#endif
-#ifndef DIETPI_HOST
-  #define DIETPI_HOST            "100.64.12.3"
-#endif
-#ifndef DIETPI_PORT
-  #define DIETPI_PORT            8080
-#endif
-#ifndef DIETPI_PATH
-  #define DIETPI_PATH            "/telemetry"
-#endif
 
 #define ANIM_MS                  500   // the sweep duration the arcs/bar use
 #define HTTP_TIMEOUT_MS          8000  // TLS handshakes need more than plain HTTP
@@ -123,14 +93,10 @@
 #define SETUP_HOLD_MS            1500  // left-button hold that forces setup mode
 #define STALE_AFTER_S            30    // relay data older than this reads as stale
 
-// How the device reaches its telemetry.
-//   DIRECT - straight HTTP to the host, over a WireGuard tunnel or the LAN.
-//            Needs the host to accept an inbound connection: a port forward,
-//            or a tunnel terminating on it.
-//   RELAY  - HTTPS to a Cloudflare Worker that the host pushes to. Both ends
-//            only dial OUT, so it works behind CGNAT and on networks you do
-//            not administer. See cloudflare/ in this repo.
-#define TRANSPORT_DIRECT 0
+// How the device reaches its telemetry. Both go through a Cloudflare Worker
+// the host pushes to, so the device only ever dials OUT and needs no inbound
+// port anywhere. See cloudflare/ in this repo.
+//   RELAY  - a URL and read token entered by hand (a named or private stream).
 #define TRANSPORT_RELAY  1
 //   PAIRED - the default. The device invents a one-time code, shows it, and
 //            derives its stream and read token from it. Typing that code into
@@ -214,7 +180,7 @@ struct Gauge {
 };
 
 // Everything the setup portal can change. Sizes are the protocol maxima:
-// an SSID is 32 bytes, a WPA2 passphrase 63, a WireGuard key 44 base64 chars.
+// an SSID is 32 bytes and a WPA2 passphrase 63.
 struct Config {
   char     wifi_ssid[33]   = WIFI_SSID;
   char     wifi_pass[64]   = WIFI_PASSWORD;
@@ -226,15 +192,6 @@ struct Config {
   char     pair_code[12]   = "";      // one-time code shown on screen
   bool     tls_verify      = true;    // pin the roots in ca_certs.h
 
-  bool     wg_enabled      = true;
-  char     wg_local_ip[16] = WG_LOCAL_IP;
-  char     wg_priv[48]     = WG_PRIVATE_KEY;
-  char     wg_peer_pub[48] = WG_PEER_PUBLIC_KEY;
-  char     wg_host[64]     = WG_ENDPOINT_HOST;
-  uint16_t wg_port         = WG_ENDPOINT_PORT;
-  char     host[64]        = DIETPI_HOST;
-  uint16_t port            = DIETPI_PORT;
-  char     path[48]        = DIETPI_PATH;
   uint16_t poll_s          = 5;
   uint8_t  bl_idx          = 0;
 };
@@ -258,8 +215,6 @@ static volatile uint32_t g_reboot_at = 0;          // 0 = not scheduled
 static bool     g_setup_mode = false;
 static char     g_ap_ssid[24];
 static char     g_ap_pass[16];
-
-static WireGuard wg;
 static WebServer server(80);
 static DNSServer dns;
 
@@ -321,21 +276,12 @@ static void config_load() {
   prefs.begin("peek", true);            // read-only
   prefs.getString("ssid",   cfg.wifi_ssid,   sizeof cfg.wifi_ssid);
   prefs.getString("pass",   cfg.wifi_pass,   sizeof cfg.wifi_pass);
-  prefs.getString("wgip",   cfg.wg_local_ip, sizeof cfg.wg_local_ip);
-  prefs.getString("wgpriv", cfg.wg_priv,     sizeof cfg.wg_priv);
-  prefs.getString("wgpub",  cfg.wg_peer_pub, sizeof cfg.wg_peer_pub);
-  prefs.getString("wghost", cfg.wg_host,     sizeof cfg.wg_host);
-  prefs.getString("host",   cfg.host,        sizeof cfg.host);
-  prefs.getString("path",   cfg.path,        sizeof cfg.path);
   prefs.getString("rurl",   cfg.relay_url,   sizeof cfg.relay_url);
   prefs.getString("rtok",   cfg.relay_token, sizeof cfg.relay_token);
   prefs.getString("rbase",  cfg.relay_base,  sizeof cfg.relay_base);
   prefs.getString("pcode",  cfg.pair_code,   sizeof cfg.pair_code);
   cfg.transport  = prefs.getUChar("tport", cfg.transport);
   cfg.tls_verify = prefs.getBool("tlsv",   cfg.tls_verify);
-  cfg.wg_enabled = prefs.getBool("wgen",   cfg.wg_enabled);
-  cfg.wg_port    = prefs.getUShort("wgport", cfg.wg_port);
-  cfg.port       = prefs.getUShort("port",   cfg.port);
   cfg.poll_s     = prefs.getUShort("poll",   cfg.poll_s);
   cfg.bl_idx     = prefs.getUChar("bl",      cfg.bl_idx);
   prefs.end();
@@ -349,21 +295,12 @@ static void config_save() {
   prefs.begin("peek", false);
   prefs.putString("ssid",   cfg.wifi_ssid);
   prefs.putString("pass",   cfg.wifi_pass);
-  prefs.putString("wgip",   cfg.wg_local_ip);
-  prefs.putString("wgpriv", cfg.wg_priv);
-  prefs.putString("wgpub",  cfg.wg_peer_pub);
-  prefs.putString("wghost", cfg.wg_host);
-  prefs.putString("host",   cfg.host);
-  prefs.putString("path",   cfg.path);
   prefs.putString("rurl",   cfg.relay_url);
   prefs.putString("rtok",   cfg.relay_token);
   prefs.putString("rbase",  cfg.relay_base);
   prefs.putString("pcode",  cfg.pair_code);
   prefs.putUChar ("tport",  cfg.transport);
   prefs.putBool  ("tlsv",   cfg.tls_verify);
-  prefs.putBool  ("wgen",   cfg.wg_enabled);
-  prefs.putUShort("wgport", cfg.wg_port);
-  prefs.putUShort("port",   cfg.port);
   prefs.putUShort("poll",   cfg.poll_s);
   prefs.putUChar ("bl",     cfg.bl_idx);
   prefs.end();
@@ -991,7 +928,7 @@ static void uiTask(void *arg) {
 }
 
 // ============================================================================
-//  Core 0 - WiFi, NTP, WireGuard, HTTP. Never touches an LVGL object.
+//  Core 0 - WiFi, NTP, HTTPS. Never touches an LVGL object.
 // ============================================================================
 static bool wifi_connect(uint32_t timeout_ms) {
   if (WiFi.status() == WL_CONNECTED) return true;
@@ -1012,9 +949,9 @@ static bool wifi_connect(uint32_t timeout_ms) {
 }
 
 static bool time_sync(uint32_t timeout_ms) {
-  // WireGuard stamps each handshake with a monotonic timestamp for replay
-  // protection. The ESP32 boots at epoch 0 with no battery-backed RTC, so
-  // without a real clock first, the peer discards the handshake in silence.
+  // The ESP32 boots at epoch 0 with no battery-backed RTC, and TLS checks
+  // certificate validity dates, so a device with no clock cannot complete a
+  // handshake - and fails it without saying why.
   g_state = NET_TIME;
   configTime(0, 0, "pool.ntp.org", "time.google.com");
 
@@ -1024,28 +961,6 @@ static bool time_sync(uint32_t timeout_ms) {
     vTaskDelay(pdMS_TO_TICKS(250));
   }
   return true;
-}
-
-static bool tunnel_up() {
-  if (!cfg.wg_enabled) return true;
-  if (cfg.wg_priv[0] == '\0' || cfg.wg_peer_pub[0] == '\0' || cfg.wg_host[0] == '\0') {
-    Serial.println("[wg] tunnel enabled but keys/endpoint are blank - skipping");
-    return false;
-  }
-
-  g_state = NET_TUNNEL;
-  IPAddress local;
-  if (!local.fromString(cfg.wg_local_ip)) {
-    Serial.println("[wg] local IP is not a valid address");
-    return false;
-  }
-  const bool ok = wg.begin(local, cfg.wg_priv, cfg.wg_host,
-                           cfg.wg_peer_pub, cfg.wg_port);
-  // begin() only builds the interface; the handshake happens asynchronously
-  // and the library retries it on its own, so the first GET or two below can
-  // legitimately time out before traffic starts flowing.
-  Serial.printf("[wg] begin -> %s\n", ok ? "interface up" : "FAILED");
-  return ok;
 }
 
 static bool parse_payload(const String &payload, Telemetry &out) {
@@ -1071,34 +986,6 @@ static bool parse_payload(const String &payload, Telemetry &out) {
   out.age_s           = doc["age_s"]           | 0u;   // relay only
   strlcpy(out.host, doc["host"] | "dietpi", sizeof out.host);
   return true;
-}
-
-// --- DIRECT: plain HTTP straight at the host, over the tunnel or the LAN ----
-static bool fetch_direct(Telemetry &out, uint32_t &latency_ms) {
-  char url[160];
-  snprintf(url, sizeof url, "http://%s:%u%s",
-           cfg.host, (unsigned)cfg.port, cfg.path);
-
-  WiFiClient client;
-  HTTPClient http;
-  http.setReuse(false);
-  http.setConnectTimeout(HTTP_TIMEOUT_MS);
-  http.setTimeout(HTTP_TIMEOUT_MS);
-
-  const uint32_t t0 = millis();
-  if (!http.begin(client, url)) return false;
-
-  const int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    Serial.printf("[http] GET %s -> %d\n", url, code);
-    http.end();
-    return false;
-  }
-
-  const String payload = http.getString();
-  latency_ms = millis() - t0;
-  http.end();
-  return parse_payload(payload, out);
 }
 
 // --- RELAY: HTTPS to the Cloudflare Worker the host pushes into -------------
@@ -1152,8 +1039,7 @@ static bool fetch_relay(Telemetry &out, uint32_t &latency_ms) {
 }
 
 static bool fetch(Telemetry &out, uint32_t &latency_ms) {
-  return cfg.transport == TRANSPORT_DIRECT ? fetch_direct(out, latency_ms)
-                                           : fetch_relay(out, latency_ms);
+  return fetch_relay(out, latency_ms);
 }
 
 static void netTask(void *arg) {
@@ -1163,14 +1049,10 @@ static void netTask(void *arg) {
     g_state = NET_ERROR;
     vTaskDelay(pdMS_TO_TICKS(2000));
   }
-  // Both transports want a real clock: WireGuard for its handshake timestamp,
-  // TLS for certificate validity dates. A device stuck at epoch 0 fails either
-  // way, and in both cases it fails silently.
-  if (!time_sync(20000)) Serial.println("[net] NTP timed out - handshake/TLS may fail");
+  // TLS validates certificate dates, so the clock has to be real before the
+  // first request. A device stuck at epoch 0 fails the handshake, silently.
+  if (!time_sync(20000)) Serial.println("[net] NTP timed out - TLS will likely fail");
 
-  // The relay talks to the public internet, so the tunnel stays down: bringing
-  // it up would make it the default route and send the HTTPS request into it.
-  if (cfg.transport == TRANSPORT_DIRECT) tunnel_up();
 
   uint8_t failures = 0;
 
@@ -1199,8 +1081,7 @@ static void netTask(void *arg) {
       // A reachable relay holding old data is a different fault from an
       // unreachable one: the network is fine, the host stopped reporting.
       // Showing LINK OK over frozen numbers would be the worst outcome.
-      g_state  = (cfg.transport != TRANSPORT_DIRECT && fresh.age_s > STALE_AFTER_S)
-                   ? NET_STALE : NET_ONLINE;
+      g_state  = (fresh.age_s > STALE_AFTER_S) ? NET_STALE : NET_ONLINE;
       failures = 0;
     } else {
       g_state = NET_ERROR;
@@ -1209,7 +1090,7 @@ static void netTask(void *arg) {
 
     // If the whole stack has been wedged for a minute, a clean reboot beats
     // sitting there showing stale numbers. Rebooting also re-runs NTP, which
-    // is what a rejected-handshake tunnel usually needs anyway.
+    // is what a clock-related TLS failure needs anyway.
     if (failures >= MAX_CONSECUTIVE_FAILURES) {
       Serial.println("[net] too many consecutive failures - restarting");
       vTaskDelay(pdMS_TO_TICKS(200));
@@ -1229,10 +1110,10 @@ static void netTask(void *arg) {
 // ============================================================================
 //  Setup portal - a captive access point serving the configuration form.
 //
-//  Everything typed here (WiFi passphrase, WireGuard private key) crosses a
+//  Everything typed here (the WiFi passphrase, a read token) crosses a
 //  local WPA2 link in plain HTTP. That is a deliberate trade: TLS would need
 //  a certificate no phone would trust, and the alternative - typing a 44
-//  character base64 key with two buttons - is not a real alternative. The AP
+//  character token with two buttons - is not a real alternative. The AP
 //  is up only while you are configuring, and its password is per-device.
 // ============================================================================
 static const char PAGE_CSS[] PROGMEM =
@@ -1297,50 +1178,23 @@ static void handle_root() {
   p += field("Password", "pass", cfg.wifi_pass, "password");
   p += F("</fieldset>");
 
-  p += F("<fieldset><legend>HOW TO REACH THE HOST</legend>"
-         "<label><span>Transport</span><select name=tport>"
-         "<option value=0");
-  if (cfg.transport == TRANSPORT_DIRECT) p += F(" selected");
-  p += F(">Direct - WireGuard tunnel or LAN</option><option value=1");
-  if (cfg.transport == TRANSPORT_RELAY) p += F(" selected");
-  p += F(">Cloudflare relay - host pushes, no port forward</option></select></label>"
-         "<p class=hint>Direct needs the host reachable from outside: a port "
-         "forward, or a tunnel ending on it. Pick the relay if the host is "
-         "behind CGNAT or on a network you do not administer.</p></fieldset>");
-
-  p += F("<fieldset><legend>CLOUDFLARE RELAY</legend>");
+  // Pairing is the normal route and needs nothing here - the code on the
+  // device's own screen fills the fields below in. They exist for a named or
+  // private stream, where you were given a URL and token directly.
+  p += F("<fieldset><legend>RELAY</legend>"
+         "<p class=hint>If you paired this device from the PeekESP app, these "
+         "are already set and there is nothing to do here.</p>");
   p += field("Worker URL", "rurl", cfg.relay_url);
   p += field("Read token", "rtok", cfg.relay_token);
+  p += F("<label><span>Poll seconds</span><input type=number name=poll min=1 max=600 value=");
+  p += cfg.poll_s;
+  p += F("></label>");
   p += F("<label class=chk><input type=checkbox name=tlsv value=1 ");
   if (cfg.tls_verify) p += F("checked");
   p += F("><span>Verify TLS certificate</span></label>"
          "<p class=hint>Leave verification on. Turn it off only if Cloudflare "
          "rotates to a CA that is not pinned in ca_certs.h - it makes the "
          "connection interceptable.</p></fieldset>");
-
-  p += F("<fieldset><legend>WIREGUARD TUNNEL</legend><label class=chk>"
-         "<input type=checkbox name=wgen value=1 ");
-  if (cfg.wg_enabled) p += F("checked");
-  p += F("><span>Route telemetry through the tunnel</span></label>");
-  p += field("This device's tunnel IP", "wgip", cfg.wg_local_ip);
-  p += field("Private key (this device)", "wgpriv", cfg.wg_priv);
-  p += field("Peer public key (DietPi)", "wgpub", cfg.wg_peer_pub);
-  p += F("<div class=row>");
-  p += field("Endpoint host", "wghost", cfg.wg_host);
-  p += F("</div>");
-  p += F("<label><span>Endpoint port</span><input type=number name=wgport value=");
-  p += cfg.wg_port;
-  p += F("></label></fieldset>");
-
-  p += F("<fieldset><legend>TELEMETRY</legend>");
-  p += field("Host (DietPi Tailscale IP)", "host", cfg.host);
-  p += F("<div class=row><label><span>Port</span><input type=number name=port value=");
-  p += cfg.port;
-  p += F("></label><label><span>Poll seconds</span><input type=number name=poll min=1 max=600 value=");
-  p += cfg.poll_s;
-  p += F("></label></div>");
-  p += field("Path", "path", cfg.path);
-  p += F("</fieldset>");
 
   p += F("<button type=submit>SAVE &amp; REBOOT</button></form>"
          "<a class=reset href=/reset>erase all settings</a></main>");
@@ -1356,21 +1210,12 @@ static void copy_arg(const char *name, char *dst, size_t n) {
 static void handle_save() {
   copy_arg("ssid",   cfg.wifi_ssid,   sizeof cfg.wifi_ssid);
   copy_arg("pass",   cfg.wifi_pass,   sizeof cfg.wifi_pass);
-  copy_arg("wgip",   cfg.wg_local_ip, sizeof cfg.wg_local_ip);
-  copy_arg("wgpriv", cfg.wg_priv,     sizeof cfg.wg_priv);
-  copy_arg("wgpub",  cfg.wg_peer_pub, sizeof cfg.wg_peer_pub);
-  copy_arg("wghost", cfg.wg_host,     sizeof cfg.wg_host);
-  copy_arg("host",   cfg.host,        sizeof cfg.host);
-  copy_arg("path",   cfg.path,        sizeof cfg.path);
   copy_arg("rurl",   cfg.relay_url,   sizeof cfg.relay_url);
   copy_arg("rtok",   cfg.relay_token, sizeof cfg.relay_token);
 
-  if (server.hasArg("tport")) cfg.transport = server.arg("tport").toInt() ? TRANSPORT_RELAY
-                                                                         : TRANSPORT_DIRECT;
   cfg.tls_verify = server.hasArg("tlsv");
-  cfg.wg_enabled = server.hasArg("wgen");     // an unchecked box sends nothing
-  if (server.hasArg("wgport")) cfg.wg_port = server.arg("wgport").toInt();
-  if (server.hasArg("port"))   cfg.port    = server.arg("port").toInt();
+  // A URL typed in here means a named or private stream, not a paired one.
+  if (server.hasArg("rurl") && cfg.relay_url[0]) cfg.transport = TRANSPORT_RELAY;
   if (server.hasArg("poll"))   cfg.poll_s  = server.arg("poll").toInt();
   if (cfg.poll_s < 1)   cfg.poll_s = 1;
   if (cfg.poll_s > 600) cfg.poll_s = 600;
@@ -1559,19 +1404,15 @@ void loop() {
 }
 
 /* ============================================================================
- *  A note on "connecting the ESP32 to Tailscale"
+ *  Why a relay rather than a VPN
  * ----------------------------------------------------------------------------
- *  An ESP32 cannot join a tailnet directly. Tailscale is WireGuard plus a
- *  control plane - node registration, rotating keys, NAT traversal and DERP
- *  relays - and none of that has an embedded client. tailscaled is Go, the
- *  keys are issued and rotated by the coordination server, and the relay
- *  fallback is a second transport on top.
+ *  An ESP32 cannot join a Tailscale network: Tailscale is WireGuard plus a
+ *  control plane - node registration, rotating keys, NAT traversal, DERP
+ *  relays - and none of that has an embedded client.
  *
- *  What this project does instead: the DietPi runs a plain WireGuard listener
- *  (wg0) next to its existing tailscale0 interface, and the ESP32 dials that.
- *  Because the address the ESP32 asks for (the DietPi's own 100.x.x.x) lives
- *  on that same machine, the kernel answers regardless of which interface the
- *  packet arrived on - no forwarding or NAT rules needed. Run
- *  dietpi-wireguard-setup.sh on the DietPi and it sets all of this up and
- *  prints the keys to paste into the setup portal.
+ *  A plain WireGuard tunnel was possible, and this firmware used to do it, but
+ *  it needs the monitored host to accept an inbound connection. Behind CGNAT,
+ *  or on a network you do not administer, that option simply does not exist.
+ *  Pushing through a Cloudflare Worker instead means both ends only ever dial
+ *  out, which works everywhere the tunnel did and everywhere it did not.
  * ==========================================================================*/

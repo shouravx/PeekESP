@@ -18,11 +18,9 @@ seconds and sweeping the readings into place with 500 ms eased animations rather
 than snapping. Two pinned FreeRTOS tasks keep the network off the render thread,
 so a slow link never costs a frame.
 
-It reaches the host one of two ways, switchable from the device's own setup
-screen. Through a **Cloudflare Worker** the host pushes to — both ends only dial
-out, so it needs no port forward anywhere and works behind CGNAT. Or
-**directly** over a WireGuard tunnel, which is more private but requires the
-host to accept an inbound connection.
+It reaches the host through a **Cloudflare Worker** the host pushes to. Both
+ends only ever dial out, so there is no port to forward anywhere and it works
+behind CGNAT. Setup is one code shown on the device's screen.
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -47,7 +45,6 @@ host to accept an inbound connection.
 | [PeekESP/secrets.example.h](PeekESP/secrets.example.h) | Optional factory defaults. Real config happens on-device. |
 | [lv_conf.h](lv_conf.h) | LVGL config for this board. |
 | [platformio.ini](platformio.ini) + [main.cpp](main.cpp) | PlatformIO build of the exact same sketch. |
-| [dietpi-wireguard-setup.sh](dietpi-wireguard-setup.sh) | **Direct transport only.** Creates the tunnel on the host, prints the keys. |
 | [dietpi/peek-agent.py](dietpi/peek-agent.py) | Run on the Linux host: serves the JSON, and/or pushes it to the relay. |
 | [windows/](windows/) | The same agent for a Windows PC, plus a one-file `.exe` build. |
 | [cloudflare/](cloudflare/) | Worker relay for when the host has no reachable port. `npm test` covers it. |
@@ -59,10 +56,10 @@ host to accept an inbound connection.
 
 Two pinned FreeRTOS tasks that share nothing but a mutex-guarded struct:
 
-- **Core 0** — WiFi → NTP → (WireGuard handshake, Direct only) → a blocking
-  `HTTP GET` → JSON parse. Everything here is allowed to stall for seconds.
+- **Core 0** — WiFi → NTP → a blocking `HTTPS GET` → JSON parse. Everything
+  here is allowed to stall for seconds at a time.
 - **Core 1** — `lv_timer_handler()` and nothing else. It never opens a socket, so
-  a slow tunnel cannot drop a frame. It picks up new data by watching a sequence
+  a slow link cannot drop a frame. It picks up new data by watching a sequence
   counter and takes the mutex with a zero timeout, so even a contended lock just
   defers the update to the next 120 ms tick rather than blocking the UI.
 
@@ -70,112 +67,31 @@ Values animate through `lv_anim_t` with `lv_anim_path_ease_out` over 500 ms. The
 gauges run on a 0–1000 range rather than 0–100 so a 3 % change still resolves
 into ~30 distinct steps and reads as a sweep, not a staircase.
 
-## Choosing a transport
+## Why a relay
 
 The hard part of this project isn't the display — it's that **something has to
-accept an inbound connection**, and the ESP32 can only dial out. Two ways to
-solve that, both supported and switchable from the setup portal:
+accept an inbound connection**, and the ESP32 can only dial out.
 
-| | **Direct** | **Cloudflare relay** |
-|---|---|---|
-| How | ESP32 → WireGuard tunnel (or LAN) → host | Host pushes → Worker → ESP32 polls |
-| Needs an inbound port | **Yes**, on the host | **No** — both ends dial out |
-| Works behind CGNAT | No | **Yes** |
-| Works on a network you don't administer | No | **Yes** |
-| Data path | End-to-end encrypted, never leaves your kit | Sits on Cloudflare, TLS + bearer tokens |
-| Setup | Port forward + WireGuard keys | `wrangler deploy`, two secrets |
+A plain WireGuard tunnel solves that, and this project used to do it, but the
+tunnel has to terminate on the monitored host. Behind CGNAT, or on a network you
+don't administer, that option doesn't exist. Pushing through a Cloudflare Worker
+instead means **both ends only ever dial out**, which works everywhere the
+tunnel did and everywhere it didn't.
 
-If you can port-forward the host, **Direct** is the better answer — nothing
-leaves your infrastructure. If the host is behind CGNAT or on someone else's
-network, that option simply doesn't exist, and the relay is how you get around
-it. See [cloudflare/](cloudflare/) and the deploy steps below.
+An ESP32 also can't join a Tailscale network, which is the other thing people
+reach for: Tailscale is WireGuard plus a control plane — node registration,
+rotating keys, NAT traversal, DERP relays — and none of that has an embedded
+client.
 
-The relay itself comes in two flavours, and both can be live on one deployment:
+The relay has three modes, all on one deployment:
 
-| | **Private** | **Shared** |
-|---|---|---|
-| For | Just your own host and device | You and other people |
-| URLs | `/ingest`, `/telemetry` | `/ingest/<stream>`, `/telemetry/<stream>` |
-| Secrets | `PUSH_TOKEN` + `READ_TOKEN` | one `MASTER_SECRET` |
-| Adding someone | n/a | `npm run mint -- alice`, entirely offline |
-| Isolation | n/a | separate Durable Object per stream |
-
-## Tailscale and the Direct transport
-
-> **Only relevant to the Direct transport (2b).** With the Cloudflare relay
-> there is no VPN at all — the host and the device both just make outbound HTTPS
-> requests, and nothing below applies.
-
-**An ESP32 cannot join a tailnet directly** — this is not a preference, and the
-gap is not small:
-
-| What Tailscale needs | Why the ESP32 can't |
-|---|---|
-| A control-plane client | `tailscaled` is Go. No implementation in C/C++, no Go runtime for Xtensa. |
-| Node registration + key rotation | Keys are issued and **rotated** by the coordination server over an authenticated Noise channel. A static config pulled out of a tailnet goes stale on its own. |
-| DERP relay fallback | When direct UDP fails, traffic falls back to HTTPS relays — a second full transport. |
-| Disco / NAT traversal | Continuous peer discovery and endpoint negotiation. |
-
-Tailscale *is* WireGuard for the data plane; everything above is the control
-plane, and that's the part with no embedded client. Headscale doesn't help —
-it reimplements the *server*, so you'd still need a client speaking the protocol.
-
-What this project does instead: the DietPi runs a **plain WireGuard listener
-(`wg0`) alongside its existing `tailscale0` interface**, and the ESP32 dials that.
-Because the address the ESP32 asks for — the DietPi's own `100.x.x.x` — lives on
-that same machine, the kernel answers it regardless of which interface the packet
-arrived on. No forwarding rules, no NAT, no route advertisement needed.
-
-`dietpi-wireguard-setup.sh` sets all of this up and prints the keys to paste into
-the device's setup portal.
-
-### How the ESP32 actually reaches the tailnet
-
-```
-ESP32 ──WiFi──▶ your router ──Internet──▶ DietPi  :51820/udp
-                                             │
-                                        wg0  10.10.44.1
-                                             │
-                                      ── DietPi kernel ──
-                                             │
-                                 tailscale0  100.x.x.x
-                                             │
-                                        the tailnet
-```
-
-The ESP32's WireGuard client makes the tunnel its **default route**, so every
-packet it sends — including the telemetry request — goes down `wg0`. From there:
-
-**Reaching the DietPi itself** (the default, and all this dashboard needs):
-nothing extra. `100.x.x.x` is a local address on that machine, so the kernel
-answers it no matter which interface the packet arrived on.
-
-**Reaching other tailnet peers**: the DietPi has to forward. The `PostUp` rules
-in `wg0.conf` do this by masquerading `wg0` traffic out of `tailscale0`, so other
-peers see it as coming from the DietPi. Nothing needs approving in the admin
-console. The trade is that it's one-way — other peers can't open connections
-*to* the ESP32. If you want that, drop the `MASQUERADE` line and advertise the
-subnet instead:
-
-```bash
-sudo tailscale up --advertise-routes=10.10.44.0/24
-```
-
-then approve the route at `login.tailscale.com/admin/machines`.
-
-> **MagicDNS names will not resolve on the ESP32** — it has no route to
-> Tailscale's resolver. Always give the setup portal a literal `100.x.x.x`
-> address.
-
-Two ordering constraints worth knowing, both already handled in the sketch:
-NTP has to complete *before* the tunnel comes up (WireGuard's handshake carries
-a replay-protection timestamp, and the ESP32 boots at epoch 0), and because the
-tunnel becomes the default route, anything that must not go through it has to
-happen first.
+| | **Paired** | **Private** | **Shared** |
+|---|---|---|---|
+| Setup | type the device's code | two Worker secrets | one `MASTER_SECRET` |
+| Worker config | **none** | `PUSH_TOKEN` + `READ_TOKEN` | mint per stream |
+| For | just working | only you | you and other people |
 
 ## Setup
-
-Step 1 is common to both transports. Then do **either** 2a or 2b, not both.
 
 ### 1. On the host — the telemetry agent
 
@@ -189,7 +105,7 @@ sudo install -m 755 dietpi/peek-agent.py /usr/local/bin/peek-agent
 [windows/](windows/):
 
 ```bash
-python windows\peek-agent-win.py --once
+python windows\peek_agent_win.py --once
 ```
 
 Check it reads your machine correctly before wiring anything up — run it in the
@@ -199,61 +115,45 @@ foreground and, from another shell:
 curl http://localhost:8080/telemetry
 ```
 
-You should get real numbers. The systemd unit comes later, once you know which
-transport you're using, because the command line differs.
+You should get real numbers. The systemd unit comes after pairing, because the
+push URL contains the stream the code produced.
 
-### 2a. Cloudflare relay — no port forward, no VPN
+### 2. Deploy the relay
 
 ```bash
 cd cloudflare
 npm install -g wrangler && wrangler login
-```
-
-Generate two independent tokens and set them as secrets — never put them in
-`wrangler.toml`, it's committed:
-
-```bash
-openssl rand -hex 24
-```
-
-```bash
-npx wrangler secret put PUSH_TOKEN
-npx wrangler secret put READ_TOKEN
 npx wrangler deploy
 ```
 
-Two tokens rather than one because the ESP32 sits on a desk with its token in
-flash. If it's ever pulled apart, only the *reader* leaks — that token can't
-push fabricated telemetry.
+That is the whole deployment. **Pairing needs no secrets on the Worker at all** —
+the device and the app derive their stream and tokens from the pairing code
+locally, and the Worker never sees it. `/health` reporting
+`"configured": false` is the expected state.
 
-Point the agent at it instead of (or as well as) serving:
+`PUSH_TOKEN` / `READ_TOKEN` (private) and `MASTER_SECRET` (named streams) are
+only for the other two modes — see [cloudflare/](cloudflare/).
 
-```bash
-python3 peek-agent.py --push https://peek-relay.<you>.workers.dev/ingest --token <PUSH_TOKEN>
-```
-
-Check it end to end:
-
-```bash
-curl -H "Authorization: Bearer <READ_TOKEN>" https://peek-relay.<you>.workers.dev/telemetry
-```
-
-Then in the setup portal choose **Cloudflare relay**, paste the `/telemetry`
-URL and the **READ** token. Run `npm test` in `cloudflare/` to exercise the
-auth and routing logic locally — 12 checks, no account needed.
-
-Deploys can also run themselves: add a `CLOUDFLARE_API_TOKEN` secret and the
+Deploys can run themselves: add a `CLOUDFLARE_API_TOKEN` secret and the
 [workflow](.github/workflows/cloudflare-worker.yml) tests every change to
-`cloudflare/**`, deploys on merge to `main`, and health-checks weekly. See
-[cloudflare/README.md](cloudflare/README.md#ci) for the two secrets and one
-variable it wants.
+`cloudflare/**`, deploys on merge to `main`, and health-checks weekly.
 
 > Free-tier note: this uses a **Durable Object**, not Workers KV. KV's free tier
 > allows 1,000 writes/day and a 5-second push interval is 17,280 — it would fail
-> partway through day one. Worker requests themselves are ~35k/day against a
-> 100k/day free allowance.
+> partway through day one. A paired set costs ~35k requests/day against a
+> 100k/day allowance, so **one deployment covers two devices**.
 
-Make it permanent:
+### 3. Pair the device
+
+Flash the sketch, and the ESP32 shows a code like **`K7M2-P4QX-9R`**. Open the
+Windows app, right-click the tray icon → **Settings**, type the code into
+**Pair a device**, press **Pair** then **Save**.
+
+That is the entire configuration. The relay URL, the stream and both tokens are
+derived from the code on both sides; dashes and case are ignored. The device
+stops showing the code as soon as the first reading arrives.
+
+Make the agent permanent afterwards:
 
 ```bash
 sudo tee /etc/systemd/system/peek-agent.service >/dev/null <<'EOF'
@@ -264,7 +164,7 @@ Wants=network-online.target
 
 [Service]
 Environment=PEEK_PUSH_TOKEN=YOUR_PUSH_TOKEN
-ExecStart=/usr/bin/python3 /usr/local/bin/peek-agent --push https://peek-relay.YOU.workers.dev/ingest
+ExecStart=/usr/bin/python3 /usr/local/bin/peek-agent --push https://peek-relay.YOU.workers.dev/ingest/STREAM
 Restart=always
 RestartSec=5
 
@@ -274,50 +174,13 @@ EOF
 sudo systemctl daemon-reload && sudo systemctl enable --now peek-agent
 ```
 
-**Tailscale plays no part in this path.** The host reaches Cloudflare over the
-ordinary internet and the ESP32 does the same. WireGuard stays down — bringing
-it up would make it the device's default route and swallow the HTTPS request.
+On Windows the tray app's **Start automatically when I sign in** does the same
+thing with no service to install.
 
-### 2b. Direct — WireGuard tunnel *(alternative to 2a)*
-
-Only workable if the host can accept an inbound connection: you control its
-router and have a real public IP, not CGNAT. If that's not true, use 2a.
-
-```bash
-sudo bash dietpi-wireguard-setup.sh
-```
-
-It generates both keypairs, writes `/etc/wireguard/wg0.conf`, starts the tunnel,
-and prints the values you paste into the setup portal. Then forward **UDP 51820**
-to the host on your router.
-
-Run the agent in serve mode — no `--push`, no tokens:
-
-```bash
-sudo tee /etc/systemd/system/peek-agent.service >/dev/null <<'EOF'
-[Unit]
-Description=PeekESP telemetry endpoint
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/python3 /usr/local/bin/peek-agent
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-sudo systemctl daemon-reload && sudo systemctl enable --now peek-agent
-```
-
-This is the path where Tailscale matters — see
-[Tailscale and the Direct transport](#tailscale-and-the-direct-transport).
-
-### 3. On the ESP32 — Arduino IDE
+### 4. Flashing the ESP32 — Arduino IDE
 
 1. **Boards Manager** → *esp32* by Espressif → install **2.0.17**.
-   Core 3.x sits on ESP-IDF 5, which removed the `tcpip_adapter` API that
-   WireGuard-ESP32 still calls; it will not compile there.
+   Later cores are untested here; 2.0.17 is what this is verified against.
    Board: *LilyGo T-Display* (*ESP32 Dev Module* also works — both verified).
 2. **Library Manager** → `lvgl` and `ArduinoJson`.
    Library Manager offers **lvgl 9.x** first — pick **8.3.9**. This sketch uses
@@ -331,20 +194,16 @@ This is the path where Tailscale matters — see
    *Alternative:* Library Manager's TFT_eSPI **2.5.43** also works — both are
    verified — but then you must edit `User_Setup_Select.h` yourself: comment out
    `#include <User_Setup.h>`, uncomment the `Setup25_TTGO_T_Display.h` line.
-4. Only if you're using the **Direct** transport: **Sketch → Include Library →
-   Add .ZIP Library** →
-   [WireGuard-ESP32-Arduino](https://github.com/ciniml/WireGuard-ESP32-Arduino)
-   (Code → Download ZIP).
-5. Copy this repo's `lv_conf.h` to `<Arduino>/libraries/lv_conf.h` — *next to*
+4. Copy this repo's `lv_conf.h` to `<Arduino>/libraries/lv_conf.h` — *next to*
    the `lvgl` folder, not inside it. `LV_USE_SPINNER` and `LV_USE_QRCODE` both
    default to **0** upstream, so a stock config link-errors on two widgets this
    sketch uses.
-6. Open `PeekESP/PeekESP.ino`, set *Tools → Partition Scheme → Huge APP*,
+5. Open `PeekESP/PeekESP.ino`, set *Tools → Partition Scheme → Huge APP*,
    upload. **No credentials needed at compile time** — you configure the device
    from its own screen. `secrets.h` is optional and only seeds factory defaults.
 
 **Verified build** — ESP32 core 2.0.17, lvgl 8.3.9, ArduinoJson 7.4.3,
-WireGuard-ESP32 0.1.5, against **both** TFT_eSPI builds:
+against **both** TFT_eSPI builds:
 
 | TFT_eSPI | Flash | Result |
 |---|---|---|
@@ -363,7 +222,7 @@ That 39 % is with **Huge APP**. On the default 1.2 MB partition it's **94 %** �
 it still fits, but there's nothing left, so set *Tools → Partition Scheme →
 Huge APP (3MB No OTA/1MB SPIFFS)*.
 
-### 3b. On the ESP32 — PlatformIO
+### 4b. Flashing the ESP32 — PlatformIO
 
 Steps 3 and 5 are unnecessary; `platformio.ini` supplies the TFT_eSPI pinout and
 the LVGL config path as build flags, which is why PlatformIO never had the
@@ -372,16 +231,6 @@ the LVGL config path as build flags, which is why PlatformIO never had the
 ```bash
 pio run -t upload -t monitor
 ```
-
-## Bringing it up on the LAN first
-
-Worth doing once, whichever transport you end up on: it separates display and UI
-faults from network faults.
-
-In the setup portal pick **Direct**, untick *"Route telemetry through the
-tunnel"*, and point the telemetry host at the host's plain `192.168.x.x`
-address with the agent running in serve mode. If the gauges move, the display
-and firmware are fine and anything that breaks afterwards is transport.
 
 ## Configuration
 
@@ -393,8 +242,8 @@ point and the screen shows a QR code.
    phone joins the AP directly. No typing the generated password off a 1.14"
    panel.
 2. The captive portal opens the form (or browse to `192.168.4.1`).
-3. Fill in WiFi, the WireGuard keys, and the telemetry host. The SSID field is
-   a dropdown populated by a live scan.
+3. Fill in your WiFi. The SSID field is a dropdown populated by a live scan.
+   Everything else is already set if you paired from the app.
 4. **Save & Reboot** — settings go to NVS and survive reflashing the sketch.
 
 To change something later, hold the **left button for 1.5 s**; the device
@@ -402,9 +251,9 @@ reboots into setup mode. Holding it during power-on does the same, which is the
 way back in if you typo the WiFi password. "Erase all settings" at the bottom of
 the form returns the device to factory defaults.
 
-> The portal serves plain HTTP over its own WPA2 link — your WireGuard private
-> key crosses that link unencrypted. TLS would need a certificate no phone would
-> trust, and the alternative is entering a 44-character base64 key with two
+> The portal serves plain HTTP over its own WPA2 link — your WiFi passphrase
+> crosses that link unencrypted. TLS would need a certificate no phone would
+> trust, and the alternative is entering a 48-character token with two
 > buttons. The AP is only up while you are configuring it, and its password is
 > derived per-device from the MAC.
 
@@ -465,9 +314,8 @@ what hosts with no thermal zone report.
 
 | Symptom | Cause |
 |---|---|
-| Display works, `NO LINK` forever | Handshake rejected. `sudo wg show` on the DietPi — a `latest handshake` of *never* means the ESP32's packets are not arriving; check the UDP port forward. |
+| Display works, `NO LINK` forever | The agent isn't pushing, or the device is polling a different stream. Check `[pair] code X -> stream Y` on serial matches what the app shows. |
 | Image offset ~40 px, or garbled colours | Wrong TFT_eSPI setup selected. Step 4 above. |
-| Compile error on `tcpip_adapter.h` | ESP32 core 3.x. Downgrade to 2.0.17. |
 | Boots, then reboots every ~60 s | Twelve failed polls in a row triggers the deliberate `esp_restart()`. The underlying failure is on the network side — watch the serial log at 115200. |
 | Backlight on, screen black | LVGL found no `lv_conf.h`. Step 5 — it belongs *beside* the `lvgl` folder. |
 | Always boots to the QR setup screen | No SSID saved yet, or the left button is reading LOW at power-on (stuck button / something pulling GPIO 0 down). |

@@ -10,7 +10,7 @@
  * IDE's automatic prototype generation and compiles unchanged here.
  *
  * platformio.ini sets `src_dir = .` and filters the build down to this file.
- * Everything else — pins, LVGL config, WireGuard settings — is supplied via
+ * Everything else — pins and the LVGL config — is supplied via
  * build_flags and PeekESP/secrets.h.
  */
 #include "PeekESP/PeekESP.ino"
