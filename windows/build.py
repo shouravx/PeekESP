@@ -71,28 +71,21 @@ def ensure_pyinstaller(py):
                            "--disable-pip-version-check", "pyinstaller"])
 
 
-def check_not_running():
+def writable(exe):
     """
-    PyInstaller cannot overwrite a running exe: Windows locks it and the build
-    dies with a bare PermissionError several screens into the log, long after
-    the part anyone reads. Worse, the previous binary survives, so the next
-    test appears to pass while actually exercising stale code. Say so up front.
+    Windows locks a running exe, and PyInstaller then dies with a bare
+    PermissionError several screens into its output - long after the part
+    anyone reads - while the previous binary survives in dist/. Checked per
+    target and immediately before building it, rather than once at startup,
+    because the app can be launched while an earlier target is still compiling.
     """
-    stuck = []
-    for exe in (DIST / "peek-agent.exe", DIST / "PeekESP.exe"):
-        if not exe.exists():
-            continue
-        try:
-            with open(exe, "ab"):
-                pass
-        except PermissionError:
-            stuck.append(exe.name)
-    if stuck:
-        names = " and ".join(stuck)
-        sys.exit(
-            f"{names} is running, so it cannot be replaced.\n"
-            f"  Quit it from the tray icon, or:  taskkill /F /IM {stuck[0]}\n"
-            "  (Closing the settings window is not enough - the tray keeps it alive.)")
+    if not exe.exists():
+        return True
+    try:
+        with open(exe, "ab"):
+            return True
+    except OSError:
+        return False
 
 
 def main():
@@ -105,12 +98,41 @@ def main():
     if not SCRIPT.exists():
         sys.exit(f"missing {SCRIPT.name}")
 
-    check_not_running()
-
     py = venv_python()
     ensure_pyinstaller(py)
 
-    built = []
+    results = []
+
+    def run(label, exe_name, cmd):
+        """
+        Build one target. Deletes the old exe first, so a failure can never
+        leave yesterday's binary sitting in dist/ looking like a fresh build -
+        which is exactly how a broken build once passed a smoke test here.
+        """
+        exe = DIST / exe_name
+        print(f"\n=== building {exe_name} ({label}) ===")
+        if not writable(exe):
+            print(f"!! {exe_name} is running and cannot be replaced.")
+            print(f"   Quit it from the tray icon, or: taskkill /F /IM {exe_name}")
+            print("   (Closing the settings window is not enough - the tray keeps it alive.)")
+            results.append((exe_name, False, "locked, still running"))
+            return
+        try:
+            exe.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            results.append((exe_name, False, f"could not remove old exe: {e}"))
+            return
+        try:
+            subprocess.check_call(cmd)
+        except subprocess.CalledProcessError as e:
+            results.append((exe_name, False, f"PyInstaller exited {e.returncode}"))
+            return
+        if not exe.exists():
+            results.append((exe_name, False, "PyInstaller succeeded but wrote no exe"))
+            return
+        results.append((exe_name, True, f"{exe.stat().st_size / (1024 * 1024):.1f} MB"))
 
     # ---- headless agent: stdlib only, small, for services and servers ----
     cmd = [
@@ -134,9 +156,7 @@ def main():
         "--icon", str(ICON),
         str(SCRIPT),
     ]
-    print("building peek-agent.exe (headless) ...")
-    subprocess.check_call(cmd)
-    built.append(DIST / "peek-agent.exe")
+    run("headless", "peek-agent.exe", cmd)
 
     # ---- tray app: adds the icon, the settings window and pystray ----
     if TRAY.exists():
@@ -154,17 +174,22 @@ def main():
             "--add-data", f"{ICON}{os.pathsep}.",
             str(TRAY),
         ]
-        print("building PeekESP.exe (tray + settings) ...")
-        subprocess.check_call(cmd)
-        built.append(DIST / "PeekESP.exe")
+        run("tray + settings", "PeekESP.exe", cmd)
+    else:
+        results.append(("PeekESP.exe", False, f"{TRAY.name} not found"))
 
-    missing = [p for p in built if not p.exists()]
-    if missing:
-        sys.exit("build reported success but produced no exe: " + str(missing))
-
+    # A summary that answers "did it build?" without reading the PyInstaller
+    # wall of text above it. Silence about a failed target is how a stale
+    # binary gets shipped.
     print()
-    for p in built:
-        print(f"built {p}  ({p.stat().st_size / (1024 * 1024):.1f} MB)")
+    print("=" * 52)
+    ok = True
+    for name, good, detail in results:
+        print(f"  {'OK  ' if good else 'FAIL'}  {name:18} {detail}")
+        ok = ok and good
+    print("=" * 52)
+    if not ok:
+        sys.exit("build incomplete - see the FAIL lines above")
 
     print(f"""
 Tray app - double-click PeekESP.exe. Right-click the tray icon for Settings,
