@@ -1,63 +1,94 @@
 # PeekESP agent for Windows
 
-Sends the same telemetry a DietPi does, so a Windows PC can drive a PeekESP
-display. Same JSON contract, same flags as
-[`dietpi/peek-agent.py`](../dietpi/peek-agent.py) — the only difference is
-where the numbers come from.
+Sends the same telemetry a Linux host does, so a Windows PC can drive a PeekESP
+display. Same JSON contract as [`dietpi/peek-agent.py`](../dietpi/peek-agent.py)
+— only the plumbing underneath differs.
 
-**Standard library only.** Every reading is a Win32 call through `ctypes`, so
-there is nothing to `pip install` and the compiled exe is CPython plus one
-script.
+Two executables, because the two jobs want opposite things:
 
-## Run it
+| | **PeekESP.exe** | **peek-agent.exe** |
+|---|---|---|
+| For | Your desktop | A server, service or scheduled task |
+| UI | Tray icon + settings window | None, console only |
+| Config | The settings window, or the JSON file | CLI flags, or `--config` |
+| Size | ~13 MB | ~8.5 MB |
+| Dependencies | pystray + Pillow, bundled | **standard library only** |
 
-```bash
-python peek-agent-win.py --once
+## The tray app
+
+Double-click `PeekESP.exe`. It runs in the background with a tray icon;
+right-click it for **Settings**, **Reload config file**, **Start / stop** and
+**Quit**. The tray tooltip and the top of the menu show live status — `pushing`,
+`serving`, `error - HTTP 401 token rejected`, and so on.
+
+The settings window uses the Windows 11 **acrylic backdrop** where the OS
+provides it (DWM `SYSTEMBACKDROP_TYPE`, Windows 11 22H2 and later) and falls
+back to a flat dark theme where it does not, so it looks deliberate on Windows
+10 rather than half-broken. It tells you which you got, in the corner.
+
+**Test connection** does a real push and reports what came back, translated:
+`401` becomes "token rejected", `404` "wrong URL or stream", `500` "worker
+secrets not set". That is the fastest way to tell a wrong token from a wrong URL.
+
+**Start automatically when I sign in** registers a Task Scheduler entry — no
+admin prompt, no service install, and unticking it removes the task.
+
+## Or just edit the file
+
+Everything the window writes lives in
+`%APPDATA%\PeekESP\config.json`, and editing it by hand is a supported path,
+not a workaround. **Reload config file** in the tray menu picks up changes
+without restarting.
+
+```json
+{
+  "mode": "push",
+  "relay_url": "https://peek-relay.you.workers.dev/ingest/alice",
+  "token": "…",
+  "interval": 5.0,
+  "serve_port": 8080,
+  "autostart": false
+}
 ```
 
-That prints one reading and exits — the quickest way to confirm it can see your
-machine.
+`mode` is `push`, `serve` or `both`. A corrupt or missing file falls back to
+defaults rather than refusing to start — a background agent that dies over a
+stray comma is worse than one that starts and says so in the tray.
 
-Then either push to a relay:
-
-```bash
-python peek-agent-win.py --push https://peek-relay.YOU.workers.dev/ingest/STREAM --token TOKEN
-```
-
-or serve on the LAN for the Direct transport:
+## Headless, for a service
 
 ```bash
-python peek-agent-win.py
+peek-agent.exe --once
 ```
 
-`--no-serve` pushes without opening port 8080. `--interval` changes the push
-rate from the default 5 s. `PEEK_PUSH_TOKEN` works instead of `--token` if you
-would rather keep it out of your shell history.
+prints one reading and exits — the quickest check that it can see your machine.
 
-## Build an exe
+```bash
+peek-agent.exe --config
+```
+
+reads the same `config.json`, so **no token appears on the command line**, where
+any process listing would expose it. That is the recommended form for a service.
+
+Flags still work for one-off runs: `--push URL --token T`, `--interval N`,
+`--no-serve`, or `PEEK_PUSH_TOKEN` in the environment.
+
+Run at startup for all users, even with nobody logged in — this one does need an
+elevated prompt:
+
+```bash
+schtasks /create /tn PeekESP /sc onstart /ru SYSTEM /tr "\"C:\path\peek-agent.exe\" --config"
+```
+
+## Build
 
 ```bash
 python build.py
 ```
 
-PyInstaller goes into a local `.venv`, not your system Python — nothing outside
-this folder changes. Output lands in `dist/peek-agent.exe`.
-
-`--windowed` builds with no console window, which is what you want for
-autostart. `--clean` removes the build artefacts.
-
-## Run at login
-
-No admin required:
-
-```bash
-schtasks /create /tn PeekAgent /sc onlogon /tr "\"C:\path\to\peek-agent.exe\" --push URL --token TOKEN"
-```
-
-Remove it with `schtasks /delete /tn PeekAgent /f`.
-
-For a machine that should report even with nobody logged in, use `/sc onstart`
-and `/ru SYSTEM` — that one does need an elevated prompt.
+PyInstaller, pystray and Pillow go into a local `.venv`, not your system Python
+— nothing outside this folder changes. Output is `dist/`. `--clean` removes the
+artefacts; `--console` builds the tray app with a console window for debugging.
 
 ## What it reports
 
@@ -73,17 +104,19 @@ and `/ru SYSTEM` — that one does need an elevated prompt.
 **No temperature.** Windows exposes none without a vendor driver;
 `MSAcpi_ThermalZoneTemperature` needs admin and most desktops don't implement
 it. Reporting `-1` makes the display show `--` rather than a confident wrong
-number. If you want real temperatures, LibreHardwareMonitor can expose them and
-this agent could read from it — not wired up here.
+number.
 
 **Network counters need deduplicating.** `GetIfTable` lists every NDIS *filter*
 bound to an adapter as its own row: one Realtek NIC typically appears four times
 (the adapter plus "WFP Native MAC Layer", "QoS Packet Scheduler" and "WFP 802.3
 MAC Layer"), each reporting identical counters. Summing the table naively
-multiplies real throughput by however many filters happen to be installed —
-measured here as ~11 MB/s on a link actually doing ~3.4. The agent
-deduplicates by MAC address, which collapses those clones, and skips adapters
-that aren't operational so a disconnected NIC's stale totals don't count.
+multiplies real throughput by however many filters are installed — measured here
+as 11041 KB/s on a link actually doing 3442. The agent deduplicates by MAC
+address and skips adapters that aren't operational, so a disconnected NIC's
+stale totals don't count. Counters are 32-bit and wrap at 4 GB; a negative delta
+is treated as a wrap and that sample dropped.
 
-Counters from `GetIfTable` are 32-bit and wrap at 4 GB. A negative delta is
-treated as a wrap and that sample is dropped, rather than reporting a spike.
+**The user agent is set deliberately.** Cloudflare's edge bans the default
+`Python-urllib/3.x` user agent outright with error 1010, before the Worker ever
+runs — which surfaces as an opaque `403` that looks nothing like an auth
+problem. All three agents identify themselves properly instead.

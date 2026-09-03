@@ -914,6 +914,10 @@ static bool fetch_relay(Telemetry &out, uint32_t &latency_ms) {
     return false;
   }
   http.addHeader("Authorization", String("Bearer ") + cfg.relay_token);
+  // Cloudflare's edge rejects some generic client user agents outright with
+  // error 1010, before the Worker ever runs - which surfaces as an opaque 403
+  // that looks nothing like an auth problem. Identify ourselves properly.
+  http.setUserAgent("PeekESP-device/1.0");
 
   const int code = http.GET();
   if (code != HTTP_CODE_OK) {

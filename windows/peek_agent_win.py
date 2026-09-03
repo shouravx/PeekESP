@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-peek-agent-win.py - the Windows counterpart of dietpi/peek-agent.py.
+peek_agent_win.py - the Windows counterpart of dietpi/peek-agent.py.
 
 Serves and/or pushes exactly the same JSON, so a Windows PC can drive a
 PeekESP display just as a Linux box does:
@@ -13,8 +13,8 @@ Standard library only - every reading comes from a Win32 call through
 ctypes, so there is nothing to pip install and the compiled .exe stays
 small. See build.py to produce a single-file executable.
 
-    Push to a relay:  peek-agent-win.py --push https://.../ingest/me --token ...
-    Serve on the LAN: peek-agent-win.py
+    Push to a relay:  peek_agent_win.py --push https://.../ingest/me --token ...
+    Serve on the LAN: peek_agent_win.py
 """
 
 import ctypes
@@ -32,6 +32,12 @@ PORT = 8080
 PATH = "/telemetry"
 DISK = os.environ.get("SystemDrive", "C:") + "\\"
 SAMPLE_SECONDS = 2.0
+
+# Cloudflare's edge bans the default "Python-urllib/3.x" user agent outright
+# with error 1010, before the Worker ever runs - so a push would fail with an
+# opaque 403 that no amount of checking tokens would explain. Identify
+# ourselves properly instead.
+USER_AGENT = "PeekESP-agent/1.0 (+https://github.com/shouravx/PeekESP)"
 
 if os.name != "nt":
     sys.exit("This is the Windows agent. On Linux use dietpi/peek-agent.py.")
@@ -268,7 +274,8 @@ def push_loop(url, token, interval):
         req = urllib.request.Request(
             url, data=body, method="POST",
             headers={"Content-Type": "application/json",
-                     "Authorization": "Bearer " + token},
+                     "Authorization": "Bearer " + token,
+                     "User-Agent": USER_AGENT},
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -287,6 +294,7 @@ def push_loop(url, token, interval):
 
 
 def main():
+    global PORT
     import argparse
 
     ap = argparse.ArgumentParser(description="PeekESP telemetry agent for Windows")
@@ -300,7 +308,27 @@ def main():
                     help="do not listen on :%d, push only" % PORT)
     ap.add_argument("--once", action="store_true",
                     help="print one reading and exit (for checking it works)")
+    ap.add_argument("--config", action="store_true",
+                    help="take settings from %%APPDATA%%\\PeekESP\\config.json")
     args = ap.parse_args()
+
+    # --config lets a service or scheduled task run with no secrets on its
+    # command line, where they would otherwise be visible to every process
+    # listing on the machine. Explicit flags still win over the file.
+    if args.config:
+        import peek_config
+        cfg = peek_config.load()
+        if cfg.get("_error"):
+            print("config: " + cfg["_error"], flush=True)
+        if not args.push and cfg["mode"] in ("push", "both"):
+            args.push = cfg["relay_url"]
+        if not args.token:
+            args.token = cfg["token"]
+        if args.interval == 5.0:
+            args.interval = cfg["interval"]
+        if cfg["mode"] == "push":
+            args.no_serve = True
+        PORT = cfg["serve_port"]
 
     threading.Thread(target=_sampler, daemon=True).start()
     if not _primed.wait(SAMPLE_SECONDS * 3):   # wait for a real delta, not a guess

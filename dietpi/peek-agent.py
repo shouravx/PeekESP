@@ -28,6 +28,12 @@ PATH = "/telemetry"
 DISK_MOUNT = "/"
 SAMPLE_SECONDS = 2.0      # how often the background sampler takes a reading
 
+# Cloudflare's edge bans the default "Python-urllib/3.x" user agent outright
+# with error 1010, before the Worker ever runs - so a push would fail with an
+# opaque 403 that no amount of checking tokens would explain. Identify
+# ourselves properly instead.
+USER_AGENT = "PeekESP-agent/1.0 (+https://github.com/shouravx/PeekESP)"
+
 
 # --------------------------------------------------------------------------
 #  Rate-based readings need two samples, so a background thread keeps a
@@ -190,6 +196,7 @@ def push_loop(url, token, interval):
             headers={
                 "Content-Type": "application/json",
                 "Authorization": "Bearer " + token,
+                "User-Agent": USER_AGENT,
             },
         )
         try:
