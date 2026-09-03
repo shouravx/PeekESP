@@ -26,8 +26,8 @@ npx wrangler secret put MASTER_SECRET
 npx wrangler deploy
 ```
 
-That is the whole deployment. Per-tenant tokens are derived from
-`MASTER_SECRET`, so there is nothing else to set — see **Two modes** below.
+**For pairing, `npx wrangler deploy` alone is enough** — pairing needs no
+secrets at all. `MASTER_SECRET` is only for named streams; see the modes below.
 
 `MASTER_SECRET` is a **secret, not a var** — `wrangler.toml` is committed, so
 nothing sensitive belongs in it.
@@ -41,9 +41,37 @@ nothing sensitive belongs in it.
 > dashboard: **Workers & Pages → your worker → Settings → Variables and Secrets
 > → Add → type Secret**, which takes effect without a redeploy.
 
-## Two modes
+## Three modes
 
-### Multi-tenant (recommended)
+### Paired (the default, and no secrets at all)
+
+The device shows a one-time code. You type it into the PeekESP app. Both sides
+derive the same stream and token pair from that code locally:
+
+```
+stream = SHA-256("peek-stream:" + CODE)  first 16 hex
+push   = SHA-256("peek-push:"   + CODE)  first 48 hex
+read   = SHA-256("peek-read:"   + CODE)  first 48 hex
+```
+
+The code never reaches this Worker, so there is **nothing to configure here** -
+a bare deployment supports pairing immediately. Paired streams authenticate by
+**trust on first use**: the Durable Object records a hash of each role's token
+the first time it sees one, and requires a match afterwards. Only the hash is
+stored, so a dump of the object yields no working tokens.
+
+What stops a stranger claiming your stream is needing to know the stream id,
+which is 16 hex derived from a code with ~50 bits of entropy shown only on your
+device's screen. Paired streams are always 16 hex characters, which keeps them
+in a separate namespace from named streams like `alice` so the two auth paths
+never overlap.
+
+Re-pairing is just a new code: a new code is a new stream, and the old one is
+simply abandoned.
+
+## Two keyed modes
+
+### Shared (named streams)
 
 One deployment, any number of independent streams. Each gets its own Durable
 Object, so nobody sees anyone else's telemetry.
@@ -85,7 +113,7 @@ any stream, including read tokens for streams that are not theirs. It belongs in
 `wrangler secret put` and on whichever machine you mint from — nowhere else, and
 never in GitHub.
 
-### Single-tenant (legacy)
+### Private (just you)
 
 `/ingest` and `/telemetry` with no stream still work against `PUSH_TOKEN` and
 `READ_TOKEN`, so an existing deployment keeps running unchanged. Both modes can
@@ -95,8 +123,10 @@ be active at once.
 
 | Method | Path | Token | Purpose |
 |---|---|---|---|
-| `POST` | `/ingest/<stream>` | derived push | A tenant's host publishes |
-| `GET` | `/telemetry/<stream>` | derived read | A tenant's device reads |
+| `POST` | `/ingest/<16 hex>` | paired push | A paired PC publishes (claimed on first use) |
+| `GET` | `/telemetry/<16 hex>` | paired read | A paired device reads |
+| `POST` | `/ingest/<name>` | derived push | A named stream's host publishes |
+| `GET` | `/telemetry/<name>` | derived read | A named stream's device reads |
 | `POST` | `/ingest` | `PUSH_TOKEN` | Single-tenant publish |
 | `GET` | `/telemetry` | `READ_TOKEN` | Single-tenant read |
 | `GET` | `/health` | none | Confirm deploy — answers with no secrets set, reporting `configured` and `streams` |
@@ -138,14 +168,21 @@ that's the thing to check — the `new_sqlite_classes` migration in
 npm test
 ```
 
-33 checks over routing, auth and isolation: that each token is rejected on the
+48 checks over routing, auth and isolation: that each token is rejected on the
 other's endpoint, that one stream's token cannot open another's, that streams
 have genuinely separate storage, that a malformed body is refused, that `age_s`
-is attached, and that missing secrets fail closed.
+is attached, that missing secrets fail closed, and the full pairing flow with
+no secrets configured at all.
 
-It also asserts that `mint.mjs` (node:crypto) and the Worker (WebCrypto) derive
-**byte-identical** tokens — if those two ever drift, every minted token would be
-rejected by the deployment it was minted for.
+It also pins two cross-implementation agreements, both of which would otherwise
+fail silently and look like a wrong token:
+
+- `mint.mjs` (node:crypto) and the Worker (WebCrypto) derive **byte-identical**
+  minted tokens.
+- The pairing derivation matches fixed vectors produced independently by
+  `openssl` and by `windows/peek_pair.py`. If the JavaScript, the Python and
+  the firmware ever disagree, the PC and the device derive different streams
+  from the same code and simply never meet.
 
 Runs against a stubbed Durable Object, so it needs no Cloudflare account and no
 `npm install`.

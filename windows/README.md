@@ -14,6 +14,22 @@ Two executables, because the two jobs want opposite things:
 | Size | ~17.6 MB | ~8.5 MB |
 | Dependencies | pystray + Pillow, bundled | **standard library only** |
 
+## Pairing (the whole setup)
+
+1. Flash the ESP32 and power it on. It shows a code like **`K7M2-P4QX-9R`**.
+2. Open `PeekESP.exe`, right-click the tray icon, **Settings**.
+3. Type the code into **Pair a device** and press **Pair**, then **Save**.
+
+That is it. The relay URL, both tokens and the stream are derived from the code
+on both sides; nothing else is typed and no account or secret is involved.
+Dashes and case are ignored, so `k7m2-p4qx-9r` works.
+
+The device shows its code until the first reading arrives, then switches to the
+dashboard by itself.
+
+Everything below the pairing box is filled in automatically and only worth
+touching if you are running your own relay.
+
 ## The tray app
 
 Double-click `PeekESP.exe`. It runs in the background with a tray icon;

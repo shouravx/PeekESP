@@ -63,6 +63,7 @@
 #include <time.h>
 #include <math.h>
 #include <esp_system.h>
+#include <mbedtls/sha256.h>
 
 #include "ca_certs.h"
 
@@ -130,6 +131,22 @@
 //            not administer. See cloudflare/ in this repo.
 #define TRANSPORT_DIRECT 0
 #define TRANSPORT_RELAY  1
+//   PAIRED - the default. The device invents a one-time code, shows it, and
+//            derives its stream and read token from it. Typing that code into
+//            the PeekESP app makes the app derive the same values, and the two
+//            meet on the relay. No URLs, no tokens, nothing else to enter.
+#define TRANSPORT_PAIRED 2
+
+// Where a freshly flashed device looks unless told otherwise. Change this if
+// you deploy your own Worker - see cloudflare/ in the repository.
+#ifndef RELAY_BASE_URL
+  #define RELAY_BASE_URL "https://peek-relay.peekesp.workers.dev"
+#endif
+
+// 32 characters with I, O, 0 and 1 removed - the pairs people mistype reading
+// a code off a 1.14" screen. 10 characters is 2^50.
+#define PAIR_ALPHABET "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+#define PAIR_CODE_LEN 10
 
 // Expected JSON (see dietpi/peek-agent.py):
 //   { "host":"dietpi", "cpu_percent":12.5, "ram_percent":43.2,
@@ -201,9 +218,11 @@ struct Config {
   char     wifi_ssid[33]   = WIFI_SSID;
   char     wifi_pass[64]   = WIFI_PASSWORD;
 
-  uint8_t  transport       = TRANSPORT_DIRECT;
+  uint8_t  transport       = TRANSPORT_PAIRED;
   char     relay_url[128]  = "";      // https://<name>.workers.dev/telemetry
   char     relay_token[65] = "";      // READ_TOKEN from the Worker
+  char     relay_base[96]  = RELAY_BASE_URL;   // pairing builds its URL from this
+  char     pair_code[12]   = "";      // one-time code shown on screen
   bool     tls_verify      = true;    // pin the roots in ca_certs.h
 
   bool     wg_enabled      = true;
@@ -309,6 +328,8 @@ static void config_load() {
   prefs.getString("path",   cfg.path,        sizeof cfg.path);
   prefs.getString("rurl",   cfg.relay_url,   sizeof cfg.relay_url);
   prefs.getString("rtok",   cfg.relay_token, sizeof cfg.relay_token);
+  prefs.getString("rbase",  cfg.relay_base,  sizeof cfg.relay_base);
+  prefs.getString("pcode",  cfg.pair_code,   sizeof cfg.pair_code);
   cfg.transport  = prefs.getUChar("tport", cfg.transport);
   cfg.tls_verify = prefs.getBool("tlsv",   cfg.tls_verify);
   cfg.wg_enabled = prefs.getBool("wgen",   cfg.wg_enabled);
@@ -335,6 +356,8 @@ static void config_save() {
   prefs.putString("path",   cfg.path);
   prefs.putString("rurl",   cfg.relay_url);
   prefs.putString("rtok",   cfg.relay_token);
+  prefs.putString("rbase",  cfg.relay_base);
+  prefs.putString("pcode",  cfg.pair_code);
   prefs.putUChar ("tport",  cfg.transport);
   prefs.putBool  ("tlsv",   cfg.tls_verify);
   prefs.putBool  ("wgen",   cfg.wg_enabled);
@@ -355,6 +378,85 @@ static void config_erase() {
   prefs.begin("peek", false);
   prefs.clear();
   prefs.end();
+}
+
+// ============================================================================
+//  Pairing
+//
+//  The device invents a code, shows it, and derives everything else from it:
+//
+//    stream = SHA-256("peek-stream:" + CODE)  first 16 hex
+//    read   = SHA-256("peek-read:"   + CODE)  first 48 hex
+//
+//  The app you type the code into runs the identical derivation, so both ends
+//  arrive at the same stream and token without ever sending the code anywhere.
+//  The relay never learns it either - a paired stream authenticates by
+//  claiming its token on first use.
+//
+//  Keep this byte-identical to windows/peek_pair.py and derivePairing() in
+//  cloudflare/src/index.js. Vector, checked against openssl and pinned in the
+//  Worker's test suite:
+//
+//    K7M2P4QX9R -> stream 4b907ba136d0a7f2
+//                  read   ec3cb3699bd1284efb2fcfe056609e87edf4813b84e9ce84
+// ============================================================================
+static void sha256_prefixed_hex(const char *prefix, const char *code,
+                                char *out, size_t out_size) {
+  uint8_t digest[32];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts_ret(&ctx, 0);          // 0 = SHA-256, not SHA-224
+  mbedtls_sha256_update_ret(&ctx, (const unsigned char *)prefix, strlen(prefix));
+  mbedtls_sha256_update_ret(&ctx, (const unsigned char *)code, strlen(code));
+  mbedtls_sha256_finish_ret(&ctx, digest);
+  mbedtls_sha256_free(&ctx);
+
+  // Not named HEX: Arduino's Print.h defines that as the numeric constant 16,
+  // so a local array of that name expands to "static const char 16[]".
+  static const char HEXD[] = "0123456789abcdef";
+  size_t bytes = (out_size - 1) / 2;
+  if (bytes > sizeof digest) bytes = sizeof digest;
+  for (size_t i = 0; i < bytes; i++) {
+    out[i * 2]     = HEXD[digest[i] >> 4];
+    out[i * 2 + 1] = HEXD[digest[i] & 0x0F];
+  }
+  out[bytes * 2] = '\0';
+}
+
+static void pair_new_code(char *out, size_t out_size) {
+  static const char AB[] = PAIR_ALPHABET;
+  const size_t n = sizeof(AB) - 1;
+  size_t len = out_size - 1;
+  if (len > PAIR_CODE_LEN) len = PAIR_CODE_LEN;
+  for (size_t i = 0; i < len; i++) {
+    // esp_random() is the hardware RNG and is properly seeded once WiFi or
+    // Bluetooth is up; at this point in boot it is still good enough for a
+    // code that only has to be unguessable, not cryptographic.
+    out[i] = AB[esp_random() % n];
+  }
+  out[len] = '\0';
+}
+
+// "K7M2P4QX9R" -> "K7M2-P4QX-9R", which is far easier to read off the screen
+// and retype without transposing a pair.
+static void pair_format(const char *code, char *out, size_t out_size) {
+  size_t o = 0;
+  for (size_t i = 0; code[i] && o + 2 < out_size; i++) {
+    if (i && i % 4 == 0) out[o++] = '-';
+    out[o++] = code[i];
+  }
+  out[o] = '\0';
+}
+
+// Fills relay_url and relay_token from the code. Called after the code is
+// known, so the rest of the firmware just uses the relay path unchanged.
+static void pair_apply(Config &c) {
+  if (c.pair_code[0] == '\0') return;
+  char stream[17];
+  sha256_prefixed_hex("peek-stream:", c.pair_code, stream, sizeof stream);
+  sha256_prefixed_hex("peek-read:", c.pair_code, c.relay_token, 49);
+  snprintf(c.relay_url, sizeof c.relay_url, "%s/telemetry/%s", c.relay_base, stream);
+  Serial.printf("[pair] code %s -> stream %s\n", c.pair_code, stream);
 }
 
 // A device with no SSID has nothing to connect to, so it goes to setup.
@@ -395,6 +497,9 @@ static lv_obj_t *g_lbl_ping  = nullptr;
 static lv_obj_t *g_lbl_host  = nullptr;
 static lv_obj_t *g_lbl_foot  = nullptr;
 static lv_obj_t *g_lbl_state = nullptr;
+static lv_obj_t *g_pair_panel   = nullptr;
+static lv_obj_t *g_lbl_code     = nullptr;
+static lv_obj_t *g_lbl_pair_hint = nullptr;
 
 // ---------------------------------------------------------------------------
 //  Animation: every value sweeps to its new reading instead of snapping.
@@ -661,6 +766,58 @@ static void build_dashboard_ui() {
 }
 
 // ---------------------------------------------------------------------------
+//  Pairing overlay - covers the dashboard until the first reading arrives.
+//
+//  An overlay rather than a second screen so there is one object tree and one
+//  place data lands; pairing finishing is then just hiding a panel, with no
+//  screen swap to get wrong while an animation is mid-flight.
+// ---------------------------------------------------------------------------
+static void build_pair_overlay(lv_obj_t *scr) {
+  g_pair_panel = lv_obj_create(scr);
+  lv_obj_remove_style_all(g_pair_panel);
+  lv_obj_set_size(g_pair_panel, SCREEN_W, SCREEN_H);
+  lv_obj_set_pos(g_pair_panel, 0, 0);
+  lv_obj_set_style_bg_color(g_pair_panel, COL_BG, 0);
+  lv_obj_set_style_bg_opa(g_pair_panel, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(g_pair_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+  make_label(g_pair_panel, F_SM, COL_CYAN, 8, 6, "PEEK");
+  make_label(g_pair_panel, F_SM, COL_TEXT_DIM, 44, 6, "// PAIRING");
+
+  lv_obj_t *rule = lv_obj_create(g_pair_panel);
+  lv_obj_remove_style_all(rule);
+  lv_obj_set_size(rule, 224, 1);
+  lv_obj_set_pos(rule, 8, 22);
+  lv_obj_set_style_bg_color(rule, COL_CYAN, 0);
+  lv_obj_set_style_bg_opa(rule, LV_OPA_30, 0);
+
+  make_label(g_pair_panel, F_SM, COL_TEXT_DIM, 8, 32, "ENTER THIS CODE IN THE PEEKESP APP");
+
+  char shown[16];
+  pair_format(cfg.pair_code, shown, sizeof shown);
+  g_lbl_code = lv_label_create(g_pair_panel);
+  lv_label_set_text(g_lbl_code, shown);
+  lv_obj_set_style_text_font(g_lbl_code, F_BIG, 0);
+  lv_obj_set_style_text_color(g_lbl_code, COL_TEXT, 0);
+  lv_obj_set_style_text_letter_space(g_lbl_code, 2, 0);
+  lv_obj_align(g_lbl_code, LV_ALIGN_TOP_MID, 0, 54);
+
+  g_lbl_pair_hint = make_label(g_pair_panel, F_SM, COL_TEXT_DIM, 8, 92,
+                               "waiting for the app...");
+  lv_obj_set_width(g_lbl_pair_hint, 224);
+  lv_obj_set_style_text_align(g_lbl_pair_hint, LV_TEXT_ALIGN_CENTER, 0);
+
+  make_label(g_pair_panel, F_SM, COL_TEXT_DIM, 8, 116,
+             "hold left button to change settings");
+}
+
+static void pairing_done() {
+  if (g_pair_panel && !lv_obj_has_flag(g_pair_panel, LV_OBJ_FLAG_HIDDEN)) {
+    lv_obj_add_flag(g_pair_panel, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+// ---------------------------------------------------------------------------
 //  Setup screen. The QR encodes a WIFI: join string, so scanning it with a
 //  phone camera joins the access point directly - nobody has to read a
 //  generated password off a 1.14" panel and retype it.
@@ -735,6 +892,7 @@ static void ui_sync_cb(lv_timer_t *t) {
   xSemaphoreGive(g_lock);
   last_seq = seq;
 
+  pairing_done();          // first reading means the app found us
   gauge_set(&g_cpu, snap.cpu_percent);
   gauge_set(&g_ram, snap.ram_percent);
   bar_set(snap.storage_percent);
@@ -938,8 +1096,8 @@ static bool fetch_relay(Telemetry &out, uint32_t &latency_ms) {
 }
 
 static bool fetch(Telemetry &out, uint32_t &latency_ms) {
-  return cfg.transport == TRANSPORT_RELAY ? fetch_relay(out, latency_ms)
-                                          : fetch_direct(out, latency_ms);
+  return cfg.transport == TRANSPORT_DIRECT ? fetch_direct(out, latency_ms)
+                                           : fetch_relay(out, latency_ms);
 }
 
 static void netTask(void *arg) {
@@ -985,7 +1143,7 @@ static void netTask(void *arg) {
       // A reachable relay holding old data is a different fault from an
       // unreachable one: the network is fine, the host stopped reporting.
       // Showing LINK OK over frozen numbers would be the worst outcome.
-      g_state  = (cfg.transport == TRANSPORT_RELAY && fresh.age_s > STALE_AFTER_S)
+      g_state  = (cfg.transport != TRANSPORT_DIRECT && fresh.age_s > STALE_AFTER_S)
                    ? NET_STALE : NET_ONLINE;
       failures = 0;
     } else {
@@ -1262,7 +1420,21 @@ void setup() {
   if (g_setup_mode) {
     build_setup_ui();
   } else {
+    // A paired device with no code yet has just been flashed: invent one,
+    // keep it, and derive the URL and token from it. Nothing to type in.
+    if (cfg.transport == TRANSPORT_PAIRED) {
+      if (cfg.pair_code[0] == '\0') {
+        pair_new_code(cfg.pair_code, sizeof cfg.pair_code);
+        config_save();
+        Serial.printf("[pair] new code %s\n", cfg.pair_code);
+      }
+      pair_apply(cfg);
+    }
+
     build_dashboard_ui();
+    // The overlay sits on top until the first reading arrives, so a freshly
+    // flashed device shows its code rather than a dashboard full of zeroes.
+    if (cfg.transport == TRANSPORT_PAIRED) build_pair_overlay(lv_scr_act());
     lv_timer_create(ui_sync_cb, 120, NULL);
   }
 

@@ -47,6 +47,13 @@ const CORS = {
 // Lowercase only: allowing both cases would make "Alice" and "alice" separate
 // streams, which is a confusing way to lose your telemetry.
 const STREAM_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+
+// Paired streams are exactly 16 hex characters, derived from a pairing code.
+// Keeping them to their own shape means a paired stream can never collide with
+// a minted one like "alice", and the two auth paths never have to guess which
+// kind of stream they are looking at.
+const PAIR_RE = /^[0-9a-f]{16}$/;
+
 const TOKEN_HEX_LEN = 48;
 
 function json(body, status = 200, extra = {}) {
@@ -93,12 +100,75 @@ export async function deriveToken(masterSecret, stream, role) {
     .slice(0, TOKEN_HEX_LEN);
 }
 
+/**
+ * The pairing derivation, in one place.
+ *
+ * The device shows a code; the device and the PC each turn it into the same
+ * stream id and token pair locally. The code itself never leaves either
+ * machine and this Worker never sees it - which is why pairing needs no
+ * secrets configured here at all.
+ *
+ * This Worker does not use these values (paired streams authenticate by
+ * trust-on-first-use); it is exported so the test suite can prove the
+ * JavaScript and the Python agent agree byte for byte. A drift here would
+ * mean the PC and the device silently derive different streams and never
+ * meet, with every request looking perfectly valid.
+ */
+export async function derivePairing(code) {
+  const c = String(code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  return {
+    code: c,
+    stream: (await sha256hex("peek-stream:" + c)).slice(0, 16),
+    push: (await sha256hex("peek-push:" + c)).slice(0, TOKEN_HEX_LEN),
+    read: (await sha256hex("peek-read:" + c)).slice(0, TOKEN_HEX_LEN),
+  };
+}
+
+export async function sha256hex(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export class TelemetryStore {
   constructor(state) {
     this.state = state;
   }
 
+  /**
+   * Trust-on-first-use for paired streams.
+   *
+   * A pairing code never reaches this Worker - the device and the PC each
+   * derive the stream id and both tokens from it locally. So there is nothing
+   * here to check a token against until someone presents one, and the first
+   * presenter for each role claims it. Everyone afterwards must match.
+   *
+   * What stops a stranger claiming your stream is that they would have to know
+   * the stream id, and that is 16 hex characters derived from a code with ~50
+   * bits of entropy that is only ever shown on your device's screen. Only the
+   * hash is stored, so a dump of this object does not yield working tokens.
+   */
+  async claimOrVerify(role, token) {
+    const key = "auth_" + role;
+    const presented = await sha256hex(token);
+    const stored = await this.state.storage.get(key);
+    if (stored === undefined) {
+      await this.state.storage.put(key, presented);
+      return true;
+    }
+    // Both are our own SHA-256 hex, so length is fixed and a plain compare
+    // leaks nothing an attacker could not compute themselves.
+    return stored === presented;
+  }
+
   async fetch(request) {
+    const role = request.headers.get("X-Peek-Role");
+    if (role) {
+      const token = request.headers.get("X-Peek-Token") || "";
+      if (!(await this.claimOrVerify(role, token))) {
+        return json({ error: "unauthorized" }, 401);
+      }
+    }
+
     if (request.method === "POST") {
       const text = await request.text();
       let parsed;
@@ -187,12 +257,26 @@ export default {
       const expected = wantsWrite ? env.PUSH_TOKEN : env.READ_TOKEN;
       if (!tokenMatches(token, expected)) return json({ error: "unauthorized" }, 401);
       doName = "singleton";
+    } else if (PAIR_RE.test(stream)) {
+      // ---- paired: the device and the PC derived this from a pairing code ----
+      // No master secret involved: the Durable Object claims each role's token
+      // on first use. Checked before STREAM_RE because a 16-hex name would
+      // also satisfy it, and these two namespaces must not overlap.
+      if (!token) return json({ error: "unauthorized" }, 401);
+      const stub = env.TELEMETRY.get(env.TELEMETRY.idFromName(`pair:${stream}`));
+      const init = {
+        headers: { "X-Peek-Role": wantsWrite ? "push" : "read", "X-Peek-Token": token },
+      };
+      return wantsWrite
+        ? stub.fetch("https://do/", { ...init, method: "POST", body: await request.text() })
+        : stub.fetch("https://do/", init);
     } else {
-      // ---- shared: one stream per tenant ----
+      // ---- shared: one stream per tenant, tokens minted from MASTER_SECRET ----
       if (!streamsReady) {
         return json({
-          error: "MASTER_SECRET is not set, so per-stream URLs are disabled",
-          hint: "wrangler secret put MASTER_SECRET",
+          error: "MASTER_SECRET is not set, so named streams are disabled",
+          hint: "Either 'wrangler secret put MASTER_SECRET', or pair a device - "
+              + "pairing needs no secrets at all.",
         }, 500);
       }
       if (!STREAM_RE.test(stream)) {

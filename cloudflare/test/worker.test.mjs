@@ -1,4 +1,4 @@
-import worker, { TelemetryStore, deriveToken } from "../src/index.js";
+import worker, { TelemetryStore, deriveToken, derivePairing } from "../src/index.js";
 import { deriveTokenNode } from "../mint.mjs";
 
 // --- stub the Durable Object runtime ---------------------------------------
@@ -169,6 +169,67 @@ await check("GET on /ingest -> 405",
 
 await check("POST on /telemetry -> 405",
   await worker.fetch(req("/telemetry/alice", { method: "POST", token: aliceRead, body: SAMPLE }), env), 405);
+
+// ===========================================================================
+//  pairing derivation - cross-language vectors
+//
+//  These exact values were produced independently by openssl:
+//    printf 'peek-stream:K7M2P4QX9R' | openssl dgst -sha256
+//  and match windows/peek_pair.py. If this block ever fails, the PC and the
+//  device derive different streams from the same code and simply never meet,
+//  with every request still looking perfectly valid - so it is worth pinning.
+// ===========================================================================
+const VEC = {
+  code: "K7M2P4QX9R",
+  stream: "4b907ba136d0a7f2",
+  push: "30e67e9d1b1b5981686fa242d0ff835eb8aee945805b0ffa",
+  read: "ec3cb3699bd1284efb2fcfe056609e87edf4813b84e9ce84",
+};
+const d = await derivePairing(VEC.code);
+assert("pairing stream matches the openssl/python vector", d.stream === VEC.stream);
+assert("pairing push token matches the vector", d.push === VEC.push);
+assert("pairing read token matches the vector", d.read === VEC.read);
+
+const dashed = await derivePairing("k7m2-p4qx-9r");
+assert("dashes and lower case normalise to the same code", dashed.stream === VEC.stream);
+assert("pairing stream is 16 hex", /^[0-9a-f]{16}$/.test(d.stream));
+assert("pairing tokens fit the firmware buffer", d.read.length === 48);
+
+// ===========================================================================
+//  pairing over the wire - trust on first use, and NO secrets configured
+// ===========================================================================
+const bare = { TELEMETRY: env.TELEMETRY };     // no PUSH/READ/MASTER at all
+
+await check("paired read claims its token even with no worker secrets set",
+  await worker.fetch(req(`/telemetry/${d.stream}`, { token: d.read }), bare), 503);
+
+await check("paired push claims its token and stores data",
+  await worker.fetch(req(`/ingest/${d.stream}`, { method: "POST", token: d.push, body: SAMPLE }), bare), 200);
+
+await check("paired read now returns that data",
+  await worker.fetch(req(`/telemetry/${d.stream}`, { token: d.read }), bare), 200,
+  (j) => j && j.host === "dietpi" && typeof j.age_s === "number");
+
+await check("a different read token is refused once the role is claimed",
+  await worker.fetch(req(`/telemetry/${d.stream}`, { token: "f".repeat(48) }), bare), 401);
+
+await check("the push token cannot read the paired stream either",
+  await worker.fetch(req(`/telemetry/${d.stream}`, { token: d.push }), bare), 401);
+
+await check("no token at all on a paired stream -> 401",
+  await worker.fetch(req(`/telemetry/${d.stream}`), bare), 401);
+
+const other = await derivePairing("AAAABBBBCC");
+await check("a second pairing code gets its own empty stream",
+  await worker.fetch(req(`/telemetry/${other.stream}`, { token: other.read }), bare), 503);
+
+await check("one code's token is useless on another code's stream",
+  await worker.fetch(req(`/telemetry/${other.stream}`, { token: d.read }), bare), 401);
+
+// A 16-hex name must take the pairing path even when MASTER_SECRET is set,
+// or the two namespaces would overlap and a paired stream would be rejected.
+await check("paired streams still work when MASTER_SECRET is configured",
+  await worker.fetch(req(`/telemetry/${d.stream}`, { token: d.read }), env), 200);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

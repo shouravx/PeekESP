@@ -23,8 +23,15 @@ from pathlib import Path
 APP_NAME = "PeekESP"
 MODES = ("push", "serve", "both")
 
+# Where a device looks unless told otherwise. Must match RELAY_BASE_URL in the
+# firmware, or a paired device and this app would derive the same stream but
+# look for it on two different relays.
+DEFAULT_RELAY_BASE = "https://peek-relay.peekesp.workers.dev"
+
 DEFAULTS = {
     "mode": "push",
+    "pair_code": "",
+    "relay_base": DEFAULT_RELAY_BASE,
     "relay_url": "",
     "token": "",
     # The device's read token. This agent never sends it - it is kept only so
@@ -59,6 +66,13 @@ def new_token() -> str:
     """48 hex chars: 192 bits, and inside the firmware's 65-byte buffer."""
     import secrets
     return secrets.token_hex(24)
+
+
+def format_pair(code: str) -> str:
+    """Display form of a stored pairing code, or "" if there is none."""
+    import peek_pair
+    c = peek_pair.normalise(code)
+    return peek_pair.format_code(c) if c else ""
 
 
 def config_dir() -> Path:
@@ -102,6 +116,9 @@ def validate(cfg: dict) -> dict:
         cfg["serve_port"] = port if 1 <= port <= 65535 else DEFAULTS["serve_port"]
     except (TypeError, ValueError):
         cfg["serve_port"] = DEFAULTS["serve_port"]
+    cfg["relay_base"] = (str(cfg.get("relay_base", "") or "").strip().rstrip("/")
+                         or DEFAULT_RELAY_BASE)
+    cfg["pair_code"] = str(cfg.get("pair_code", "") or "").strip().upper()
     cfg["relay_url"] = str(cfg.get("relay_url", "") or "").strip()
     cfg["token"] = str(cfg.get("token", "") or "").strip()
     cfg["device_token"] = str(cfg.get("device_token", "") or "").strip()

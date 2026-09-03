@@ -26,6 +26,7 @@ from pathlib import Path
 
 import peek_agent_win as agent
 import peek_config as cfgmod
+import peek_pair as pair
 
 # Frozen, the icon is bundled beside the exe's temp root; from source it lives
 # in the repo's img/ folder. One file, no duplicated copy to drift.
@@ -285,11 +286,55 @@ def open_settings(runner):
     v_auto = tk.BooleanVar(value=autostart_enabled())
     v_show = tk.BooleanVar(value=False)
 
-    # ---- mode ----
     body = tk.Frame(root, bg=BG)
     body.pack(fill="x", **pad)
 
-    label(body, "HOW THIS PC REPORTS", DIM, 8).pack(anchor="w", pady=(8, 4))
+    # ---- pairing: the only thing most people ever touch --------------------
+    # Everything below this is derived from the code, so it is deliberately
+    # first and everything else is labelled as automatic.
+    label(body, "PAIR A DEVICE", DIM, 8).pack(anchor="w", pady=(8, 4))
+
+    pair_card = card(body)
+    pair_card.pack(fill="x")
+    pin = tk.Frame(pair_card, bg=CARD)
+    pin.pack(fill="x", padx=12, pady=10)
+
+    label(pin, "Code shown on the device's screen", DIM, 8).pack(anchor="w")
+    prow = tk.Frame(pin, bg=CARD)
+    prow.pack(anchor="w", fill="x", pady=(3, 0))
+    v_code = tk.StringVar(value=cfgmod.format_pair(cfg.get("pair_code", "")))
+    code_entry = tk.Entry(prow, textvariable=v_code, bg=BG, fg=CYAN,
+                          insertbackground=CYAN, relief="flat",
+                          highlightbackground=EDGE, highlightcolor=CYAN,
+                          highlightthickness=1, font=("Consolas", 13),
+                          justify="center")
+    code_entry.pack(side="left", fill="x", expand=True, ipady=5)
+
+    def do_pair():
+        raw = v_code.get()
+        try:
+            d = pair.derive(raw)
+        except ValueError as e:
+            set_status(RED, str(e))
+            return
+        u = pair.urls(cfg.get("relay_base", cfgmod.DEFAULT_RELAY_BASE), d["stream"])
+        v_url.set(u["ingest"])
+        v_token.set(d["push"])
+        v_devtok.set(d["read"])
+        v_mode.set("push")
+        v_code.set(pair.format_code(d["code"]))
+        set_status(GREEN, f"paired to stream {d['stream']} - press Save")
+
+    tk.Button(prow, text="Pair", command=do_pair, bg=CYAN, fg=BG,
+              activebackground=CYAN, activeforeground=BG, relief="flat", bd=0,
+              font=("Segoe UI", 9, "bold"), padx=14, pady=5,
+              cursor="hand2").pack(side="left", padx=(8, 0))
+
+    label(pin, "Everything below is filled in from this code.",
+          DIM, 8).pack(anchor="w", pady=(7, 0))
+
+    # ---- mode ----
+    label(body, "HOW THIS PC REPORTS", DIM, 8).pack(anchor="w", pady=(14, 4))
     modes = tk.Frame(body, bg=BG)
     modes.pack(anchor="w", fill="x")
     for val, txt in (("push", "Push to relay"),
@@ -300,7 +345,7 @@ def open_settings(runner):
                        activeforeground=CYAN, font=("Segoe UI", 9),
                        highlightthickness=0, bd=0).pack(side="left", padx=(0, 14))
 
-    label(body, "RELAY", DIM, 8).pack(anchor="w", pady=(12, 4))
+    label(body, "RELAY  (set by pairing - edit only if you know why)", DIM, 8).pack(anchor="w", pady=(12, 4))
     label(body, "Ingest URL", DIM, 8).pack(anchor="w")
     entry(body, v_url).pack(anchor="w", fill="x", pady=(2, 6), ipady=4)
 
@@ -409,7 +454,9 @@ def open_settings(runner):
 
     def collect():
         c = dict(runner.cfg)
-        c.update({"mode": v_mode.get(), "relay_url": v_url.get().strip(),
+        c.update({"mode": v_mode.get(),
+                  "pair_code": pair.normalise(v_code.get()),
+                  "relay_url": v_url.get().strip(),
                   "token": v_token.get().strip(),
                   "device_token": v_devtok.get().strip(),
                   "interval": v_interval.get(),
