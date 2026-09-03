@@ -1,4 +1,5 @@
-import worker, { TelemetryStore } from "../src/index.js";
+import worker, { TelemetryStore, deriveToken } from "../src/index.js";
+import { deriveTokenNode } from "../mint.mjs";
 
 // --- stub the Durable Object runtime ---------------------------------------
 class FakeStorage {
@@ -10,13 +11,23 @@ class FakeStorage {
   async get(k) { return this.map.get(k); }
 }
 
-const store = new TelemetryStore({ storage: new FakeStorage() });
+// One store per Durable Object name, so cross-stream isolation is actually
+// exercised rather than assumed.
+const stores = new Map();
+function storeFor(name) {
+  if (!stores.has(name)) stores.set(name, new TelemetryStore({ storage: new FakeStorage() }));
+  return stores.get(name);
+}
+
+const MASTER = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 const env = {
   PUSH_TOKEN: "push-secret-aaaaaaaaaaaaaaaa",
   READ_TOKEN: "read-secret-bbbbbbbbbbbbbbbb",
+  MASTER_SECRET: MASTER,
   TELEMETRY: {
-    idFromName: () => "singleton",
-    get: () => ({ fetch: (u, init) => store.fetch(new Request(u, init)) }),
+    idFromName: (n) => n,
+    get: (n) => ({ fetch: (u, init) => storeFor(n).fetch(new Request(u, init)) }),
   },
 };
 
@@ -36,19 +47,28 @@ async function check(name, res, expectStatus, bodyTest) {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}  -> ${status}${ok ? "" : "  got " + JSON.stringify(json)}`);
   ok ? pass++ : fail++;
 }
+function assert(name, cond) {
+  console.log(`${cond ? "PASS" : "FAIL"}  ${name}`);
+  cond ? pass++ : fail++;
+}
 
 const SAMPLE = JSON.stringify({ host: "dietpi", cpu_percent: 12.5, ram_percent: 43.2 });
 
+// ===========================================================================
+//  health
+// ===========================================================================
 await check("health needs no token",
   await worker.fetch(req("/health"), env), 200,
-  (j) => j && j.ok === true && j.configured === true);
+  (j) => j && j.ok === true && j.configured === true && j.streams === true);
 
-// /health must survive a missing-secrets deploy: it is the only way to tell
-// "deployed but unconfigured" from "not deployed", and CI pings it.
-await check("health still answers 200 with secrets unset, and says so",
-  await worker.fetch(req("/health"), { ...env, PUSH_TOKEN: "", READ_TOKEN: "" }), 200,
-  (j) => j && j.ok === true && j.configured === false && typeof j.hint === "string");
+await check("health still answers 200 with every secret unset, and says so",
+  await worker.fetch(req("/health"), { ...env, PUSH_TOKEN: "", READ_TOKEN: "", MASTER_SECRET: "" }), 200,
+  (j) => j && j.ok === true && j.configured === false && j.streams === false
+             && typeof j.hint === "string");
 
+// ===========================================================================
+//  legacy single-tenant
+// ===========================================================================
 await check("telemetry before any push -> 503",
   await worker.fetch(req("/telemetry", { token: env.READ_TOKEN }), env), 503);
 
@@ -80,8 +100,75 @@ await check("telemetry now returns the data plus age_s",
 await check("unknown path -> 404",
   await worker.fetch(req("/nope", { token: env.READ_TOKEN }), env), 404);
 
-await check("missing secrets -> 500",
+await check("missing legacy secrets -> 500",
   await worker.fetch(req("/telemetry"), { ...env, READ_TOKEN: "" }), 500);
+
+// ===========================================================================
+//  derivation: the Worker and the mint script must agree exactly, or a minted
+//  token would be rejected by the deployment it was minted for
+// ===========================================================================
+for (const [stream, role] of [["alice", "push"], ["alice", "read"], ["bob-2", "read"]]) {
+  const a = await deriveToken(MASTER, stream, role);
+  const b = deriveTokenNode(MASTER, stream, role);
+  assert(`mint.mjs and worker derive the same ${stream}:${role} token`, a === b && a.length === 48);
+}
+
+const alicePush = await deriveToken(MASTER, "alice", "push");
+const aliceRead = await deriveToken(MASTER, "alice", "read");
+const bobPush = await deriveToken(MASTER, "bob", "push");
+const bobRead = await deriveToken(MASTER, "bob", "read");
+
+assert("read token fits the firmware's 65-byte buffer", aliceRead.length <= 64);
+assert("push and read tokens differ", alicePush !== aliceRead);
+assert("different streams get different tokens", alicePush !== bobPush && aliceRead !== bobRead);
+
+// ===========================================================================
+//  multi-tenant
+// ===========================================================================
+await check("stream ingest with derived push token -> 200",
+  await worker.fetch(req("/ingest/alice", { method: "POST", token: alicePush, body: SAMPLE }), env), 200);
+
+await check("stream telemetry with derived read token -> 200",
+  await worker.fetch(req("/telemetry/alice", { token: aliceRead }), env), 200,
+  (j) => j && j.host === "dietpi" && typeof j.age_s === "number");
+
+await check("stream telemetry with NO token -> 401",
+  await worker.fetch(req("/telemetry/alice"), env), 401);
+
+await check("alice's read token is rejected on bob's stream",
+  await worker.fetch(req("/telemetry/bob", { token: aliceRead }), env), 401);
+
+await check("alice's push token cannot read alice's own stream",
+  await worker.fetch(req("/telemetry/alice", { token: alicePush }), env), 401);
+
+await check("legacy read token does not open a stream",
+  await worker.fetch(req("/telemetry/alice", { token: env.READ_TOKEN }), env), 401);
+
+await check("bob's stream is empty despite alice having pushed (isolated storage)",
+  await worker.fetch(req("/telemetry/bob", { token: bobRead }), env), 503);
+
+await check("bob pushes his own data",
+  await worker.fetch(req("/ingest/bob", { method: "POST", token: bobPush,
+    body: JSON.stringify({ host: "bob-box", cpu_percent: 99 }) }), env), 200);
+
+await check("alice still sees her own data, not bob's",
+  await worker.fetch(req("/telemetry/alice", { token: aliceRead }), env), 200,
+  (j) => j && j.host === "dietpi");
+
+await check("invalid stream name -> 400",
+  await worker.fetch(req("/telemetry/Alice", { token: aliceRead }), env), 400);
+
+await check("stream name with a slash is not treated as a stream -> 404",
+  await worker.fetch(req("/telemetry/a/b", { token: aliceRead }), env), 404);
+
+await check("streams disabled without MASTER_SECRET -> 500",
+  await worker.fetch(req("/telemetry/alice", { token: aliceRead }), { ...env, MASTER_SECRET: "" }), 500);
+
+await check("GET on /ingest -> 405",
+  await worker.fetch(req("/ingest/alice", { token: alicePush }), env), 405);
+
+await check("POST on /telemetry -> 405",
+  await worker.fetch(req("/telemetry/alice", { method: "POST", token: aliceRead, body: SAMPLE }), env), 405);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

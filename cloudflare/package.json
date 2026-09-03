@@ -6,6 +6,7 @@
   "description": "Cloudflare Worker relay so PeekESP works without an inbound port",
   "scripts": {
     "test": "node test/worker.test.mjs",
+    "mint": "node mint.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   }

@@ -13,10 +13,10 @@ put in the wrong one.
 | ESP32 setup portal | The firmware | Every poll |
 | DietPi command line | The agent | Every push |
 
-> **The single most common mistake:** setting `PUSH_TOKEN` / `READ_TOKEN` as
-> *GitHub* secrets. They are **Cloudflare Worker** secrets. A GitHub secret
-> never reaches the running Worker. If every endpoint returns
-> `{"error":"PUSH_TOKEN and READ_TOKEN secrets are not set"}`, this is why.
+> **The single most common mistake:** setting `MASTER_SECRET` (or `PUSH_TOKEN` /
+> `READ_TOKEN`) as a *GitHub* secret. Those are **Cloudflare Worker** secrets.
+> A GitHub secret never reaches the running Worker. If requests come back saying
+> a secret is not set, this is why.
 
 ---
 
@@ -46,29 +46,66 @@ put in the wrong one.
 
 ## 2. Cloudflare — Workers & Pages → `peek-relay` → Settings → Variables and Secrets
 
-Add each with **Type: Secret** (not Text). Plain text variables would work
-functionally but would be readable in the dashboard forever.
+Add with **Type: Secret** (not Text). Plain text variables would work but stay
+readable in the dashboard forever.
+
+### Multi-tenant — one secret, any number of users
+
+| Name | Value |
+|---|---|
+| `MASTER_SECRET` | `node cloudflare/mint.mjs --new-master` |
+
+That's all the Worker needs. Every tenant's tokens are **derived** from it:
+
+```
+push token = HMAC-SHA256(MASTER_SECRET, "<stream>:push")  first 48 hex chars
+read token = HMAC-SHA256(MASTER_SECRET, "<stream>:read")  first 48 hex chars
+```
+
+Nothing is stored, so onboarding is offline — the deployment is never touched:
+
+```bash
+MASTER_SECRET=... npm run mint -- alice --url https://peek-relay.peekesp.workers.dev
+```
+
+It prints that stream's two tokens plus the exact agent command and portal
+settings to hand over. Their URLs become
+`…/ingest/alice` and `…/telemetry/alice`, and their data lives in its own
+Durable Object — invisible to every other stream.
+
+> **`MASTER_SECRET` is the crown jewel.** Anyone holding it can mint tokens for
+> any stream, including read tokens for streams that aren't theirs. It belongs
+> in `wrangler secret put` and on whichever machine you mint from — nowhere
+> else, and never in GitHub.
+
+**Revoking one tenant:** tokens are a pure function of (master secret, stream),
+so you can't revoke one in place. Move them to a new stream name — `alice` →
+`alice-v2` — which changes both their tokens and leaves everyone else alone.
+Rotating `MASTER_SECRET` invalidates every stream at once.
+
+### Single-tenant — the simpler option if it's only you
 
 | Name | Value |
 |---|---|
 | `PUSH_TOKEN` | A fresh random string — `openssl rand -hex 24` |
 | `READ_TOKEN` | A **different** random string — run the command again |
 
+Use hex, not base64: the Worker accepts a `?token=` fallback and base64's
+`+ / =` would need URL-escaping there. Keep them ≤ 64 characters — the firmware
+stores the read token in a 65-byte buffer. `-hex 24` gives 48, with margin;
+`-hex 32` gives exactly 64 and leaves none.
+
 They must differ. The Worker rejects each token on the other's endpoint, which
-is the entire point: the ESP32 sits on a desk carrying `READ_TOKEN` in flash, so
-if the device is taken apart, that token still cannot push fabricated telemetry.
+is the entire point: the ESP32 sits on a desk carrying the read token in flash,
+so if the device is taken apart, that token still cannot push fabricated
+telemetry.
+
+These use the un-suffixed URLs, `/ingest` and `/telemetry`. Both modes can be
+active on the same deployment.
 
 Secrets take effect immediately — no redeploy. `wrangler deploy` deliberately
 never touches them, which is why you set them once and they survive every
 future deploy.
-
-Or from a terminal:
-
-```bash
-cd cloudflare
-npx wrangler secret put PUSH_TOKEN
-npx wrangler secret put READ_TOKEN
-```
 
 ---
 
@@ -82,8 +119,8 @@ browse to `192.168.4.1`.
 | Network (SSID) | Your WiFi — pick from the dropdown |
 | Password | Your WiFi passphrase |
 | Transport | **Cloudflare relay** |
-| Worker URL | `https://peek-relay.peekesp.workers.dev/telemetry` |
-| Read token | The **`READ_TOKEN`** value — never `PUSH_TOKEN` |
+| Worker URL | `…/telemetry` (single-tenant) or `…/telemetry/<stream>` (multi-tenant) |
+| Read token | The **read** token — never the push one |
 | Verify TLS certificate | **Checked** |
 | Poll seconds | `5` |
 
@@ -95,6 +132,12 @@ The WireGuard fields are ignored entirely when Transport is set to relay.
 
 ```bash
 python3 peek-agent.py --push https://peek-relay.peekesp.workers.dev/ingest --token PUSH_TOKEN_HERE
+```
+
+Multi-tenant — note the stream name on the end:
+
+```bash
+python3 peek-agent.py --push https://peek-relay.peekesp.workers.dev/ingest/alice --token ALICE_PUSH_TOKEN
 ```
 
 Or keep the token out of your shell history:
@@ -115,8 +158,11 @@ This trips people up, because all three look like "the Worker URL":
 | Used by | URL |
 |---|---|
 | GitHub `WORKER_URL` variable | `https://peek-relay.peekesp.workers.dev` |
-| ESP32 setup portal | `https://peek-relay.peekesp.workers.dev`**`/telemetry`** |
-| DietPi agent `--push` | `https://peek-relay.peekesp.workers.dev`**`/ingest`** |
+| ESP32 setup portal | `…`**`/telemetry`** or `…`**`/telemetry/<stream>`** |
+| DietPi agent `--push` | `…`**`/ingest`** or `…`**`/ingest/<stream>`** |
+
+A stream's two URLs must use the **same** stream name, or the device reads a
+slot nothing is writing to and sits at `NO LINK`.
 
 ---
 
