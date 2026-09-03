@@ -18,10 +18,11 @@ seconds and sweeping the readings into place with 500 ms eased animations rather
 than snapping. Two pinned FreeRTOS tasks keep the network off the render thread,
 so a slow link never costs a frame.
 
-It reaches the host either **directly** over a WireGuard tunnel, or through a
-**Cloudflare Worker** the host pushes to — the second option needs no port
-forward at either end, which is what makes it work behind CGNAT. Both are
-switchable from the device's own setup screen.
+It reaches the host one of two ways, switchable from the device's own setup
+screen. Through a **Cloudflare Worker** the host pushes to — both ends only dial
+out, so it needs no port forward anywhere and works behind CGNAT. Or
+**directly** over a WireGuard tunnel, which is more private but requires the
+host to accept an inbound connection.
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -46,7 +47,7 @@ switchable from the device's own setup screen.
 | [PeekESP/secrets.example.h](PeekESP/secrets.example.h) | Optional factory defaults. Real config happens on-device. |
 | [lv_conf.h](lv_conf.h) | LVGL config for this board. |
 | [platformio.ini](platformio.ini) + [main.cpp](main.cpp) | PlatformIO build of the exact same sketch. |
-| [dietpi-wireguard-setup.sh](dietpi-wireguard-setup.sh) | Run on the DietPi: creates the tunnel, prints the keys. |
+| [dietpi-wireguard-setup.sh](dietpi-wireguard-setup.sh) | **Direct transport only.** Creates the tunnel on the host, prints the keys. |
 | [dietpi/peek-agent.py](dietpi/peek-agent.py) | Run on the DietPi: serves the JSON, and/or pushes it to the relay. |
 | [cloudflare/](cloudflare/) | Worker relay for when the host has no reachable port. `npm test` covers it. |
 | [.github/workflows/](.github/workflows/) | CI: tests the Worker, deploys it on merge, pings it weekly. |
@@ -55,8 +56,8 @@ switchable from the device's own setup screen.
 
 Two pinned FreeRTOS tasks that share nothing but a mutex-guarded struct:
 
-- **Core 0** — WiFi → NTP → WireGuard handshake → blocking `HTTP GET` → JSON parse.
-  Everything here is allowed to stall for seconds at a time.
+- **Core 0** — WiFi → NTP → (WireGuard handshake, Direct only) → a blocking
+  `HTTP GET` → JSON parse. Everything here is allowed to stall for seconds.
 - **Core 1** — `lv_timer_handler()` and nothing else. It never opens a socket, so
   a slow tunnel cannot drop a frame. It picks up new data by watching a sequence
   counter and takes the mutex with a zero timeout, so even a contended lock just
@@ -86,7 +87,11 @@ leaves your infrastructure. If the host is behind CGNAT or on someone else's
 network, that option simply doesn't exist, and the relay is how you get around
 it. See [cloudflare/](cloudflare/) and the deploy steps below.
 
-## The Tailscale part, honestly
+## Tailscale and the Direct transport
+
+> **Only relevant to the Direct transport (2b).** With the Cloudflare relay
+> there is no VPN at all — the host and the device both just make outbound HTTPS
+> requests, and nothing below applies.
 
 **An ESP32 cannot join a tailnet directly** — this is not a preference, and the
 gap is not small:
@@ -157,44 +162,25 @@ happen first.
 
 ## Setup
 
-### 1. On the DietPi
+Step 1 is common to both transports. Then do **either** 2a or 2b, not both.
 
-```bash
-sudo bash dietpi-wireguard-setup.sh
-```
-
-It generates both keypairs, writes `/etc/wireguard/wg0.conf`, starts the tunnel,
-and prints the block of values you paste into the setup portal.
-
-Then start the telemetry endpoint:
+### 1. On the host — the telemetry agent
 
 ```bash
 sudo install -m 755 dietpi/peek-agent.py /usr/local/bin/peek-agent
 ```
 
+Check it reads your machine correctly before wiring anything up — run it in the
+foreground and, from another shell:
+
 ```bash
-sudo tee /etc/systemd/system/peek-agent.service >/dev/null <<'EOF'
-[Unit]
-Description=PeekESP telemetry endpoint
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/python3 /usr/local/bin/peek-agent
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-sudo systemctl enable --now peek-agent
+curl http://localhost:8080/telemetry
 ```
 
-Check it: `curl http://localhost:8080/telemetry`
+You should get real numbers. The systemd unit comes later, once you know which
+transport you're using, because the command line differs.
 
-Finally, forward UDP 51820 to the DietPi on your router, unless the box already
-has a directly reachable public IP.
-
-### 1b. Cloudflare relay (skip if you're using Direct)
+### 2a. Cloudflare relay — no port forward, no VPN
 
 ```bash
 cd cloudflare
@@ -245,7 +231,67 @@ variable it wants.
 > partway through day one. Worker requests themselves are ~35k/day against a
 > 100k/day free allowance.
 
-### 2. On the ESP32 — Arduino IDE
+Make it permanent:
+
+```bash
+sudo tee /etc/systemd/system/peek-agent.service >/dev/null <<'EOF'
+[Unit]
+Description=PeekESP telemetry agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=PEEK_PUSH_TOKEN=YOUR_PUSH_TOKEN
+ExecStart=/usr/bin/python3 /usr/local/bin/peek-agent --push https://peek-relay.YOU.workers.dev/ingest
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload && sudo systemctl enable --now peek-agent
+```
+
+**Tailscale plays no part in this path.** The host reaches Cloudflare over the
+ordinary internet and the ESP32 does the same. WireGuard stays down — bringing
+it up would make it the device's default route and swallow the HTTPS request.
+
+### 2b. Direct — WireGuard tunnel *(alternative to 2a)*
+
+Only workable if the host can accept an inbound connection: you control its
+router and have a real public IP, not CGNAT. If that's not true, use 2a.
+
+```bash
+sudo bash dietpi-wireguard-setup.sh
+```
+
+It generates both keypairs, writes `/etc/wireguard/wg0.conf`, starts the tunnel,
+and prints the values you paste into the setup portal. Then forward **UDP 51820**
+to the host on your router.
+
+Run the agent in serve mode — no `--push`, no tokens:
+
+```bash
+sudo tee /etc/systemd/system/peek-agent.service >/dev/null <<'EOF'
+[Unit]
+Description=PeekESP telemetry endpoint
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/peek-agent
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload && sudo systemctl enable --now peek-agent
+```
+
+This is the path where Tailscale matters — see
+[Tailscale and the Direct transport](#tailscale-and-the-direct-transport).
+
+### 3. On the ESP32 — Arduino IDE
 
 1. **Boards Manager** → *esp32* by Espressif → install **2.0.17**.
    Core 3.x sits on ESP-IDF 5, which removed the `tcpip_adapter` API that
@@ -295,7 +341,7 @@ That 39 % is with **Huge APP**. On the default 1.2 MB partition it's **94 %** �
 it still fits, but there's nothing left, so set *Tools → Partition Scheme →
 Huge APP (3MB No OTA/1MB SPIFFS)*.
 
-### 2b. On the ESP32 — PlatformIO
+### 3b. On the ESP32 — PlatformIO
 
 Steps 3 and 5 are unnecessary; `platformio.ini` supplies the TFT_eSPI pinout and
 the LVGL config path as build flags, which is why PlatformIO never had the
@@ -305,12 +351,15 @@ the LVGL config path as build flags, which is why PlatformIO never had the
 pio run -t upload -t monitor
 ```
 
-## Bringing it up without the tunnel
+## Bringing it up on the LAN first
 
-In the setup portal, untick **"Route telemetry through the tunnel"** and point
-the telemetry host at the DietPi's plain LAN address. That isolates display and
-UI problems from tunnel problems, which is worth doing once before you debug a
-handshake.
+Worth doing once, whichever transport you end up on: it separates display and UI
+faults from network faults.
+
+In the setup portal pick **Direct**, untick *"Route telemetry through the
+tunnel"*, and point the telemetry host at the host's plain `192.168.x.x`
+address with the agent running in serve mode. If the gauges move, the display
+and firmware are fine and anything that breaks afterwards is transport.
 
 ## Configuration
 

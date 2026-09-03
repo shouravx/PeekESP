@@ -27,18 +27,23 @@ built, see the [README](https://github.com/shouravx/PeekESP).
 Both ends dial **out**. Neither needs an inbound port, which is what makes this
 work behind CGNAT or on a network you do not administer.
 
+**This path uses no VPN and no Tailscale.** The host reaches Cloudflare over the
+ordinary internet, the device does the same, and WireGuard stays down.
+
 There is a second, more private option — **Direct**, where the ESP32 reaches the
-host over a WireGuard tunnel with nothing in between. It needs the host to
-accept an inbound connection. Both are supported and switchable from the
-device's own setup screen without reflashing.
+host over a WireGuard tunnel with nothing in between. It keeps traffic entirely
+inside your own infrastructure, but needs the host to accept an inbound
+connection: a port forward and a real public IP, not CGNAT. Both transports are
+switchable from the device's own setup screen without reflashing.
 
 ## Two things worth knowing up front
 
 **An ESP32 cannot join a Tailscale network.** Tailscale is WireGuard plus a
 control plane — node registration, rotating keys, DERP relays — and none of that
-has an embedded client. The direct transport works by dialling a plain WireGuard
-listener running *alongside* Tailscale on the host, which then bridges into the
-tailnet.
+has an embedded client. This only matters on the Direct transport, which works
+by dialling a plain WireGuard listener running *alongside* Tailscale on the
+host, which then bridges into the tailnet. On the relay path Tailscale is not
+involved at all.
 
 **Configuration lives in four unconnected places** — GitHub Actions secrets,
 Cloudflare Worker secrets, the device's setup portal, and the agent's command
