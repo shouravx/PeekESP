@@ -60,9 +60,14 @@ a bare deployment supports pairing immediately. Paired streams authenticate by
 the first time it sees one, and requires a match afterwards. Only the hash is
 stored, so a dump of the object yields no working tokens.
 
-What stops a stranger claiming your stream is needing to know the stream id,
-which is 16 hex derived from a code with ~50 bits of entropy shown only on your
-device's screen. Paired streams are always 16 hex characters, which keeps them
+The guarantee is precisely **"once a role is claimed, only that token works"** —
+not "only the right token was ever possible". An unclaimed stream is claimed by
+whoever reaches it first, so someone who learned your stream id *before* your
+device first connected could squat it and lock your device out. That needs the
+16-hex id, which needs the code (~50 bits, shown only on your device's screen),
+and the window is the few seconds between flashing and first boot. It is a real
+property of trust-on-first-use rather than a bug, and worth knowing rather than
+glossing. Paired streams are always 16 hex characters, which keeps them
 in a separate namespace from named streams like `alice` so the two auth paths
 never overlap.
 

@@ -219,12 +219,23 @@ await check("the push token cannot read the paired stream either",
 await check("no token at all on a paired stream -> 401",
   await worker.fetch(req(`/telemetry/${d.stream}`), bare), 401);
 
-const other = await derivePairing("AAAABBBBCC");
-await check("a second pairing code gets its own empty stream",
-  await worker.fetch(req(`/telemetry/${other.stream}`, { token: other.read }), bare), 503);
+// Trust on first use, stated plainly: an UNCLAIMED stream is claimed by
+// whoever arrives first, so the guarantee is "once claimed, only that token" -
+// not "only the right token was ever possible". Squatting still requires
+// knowing the 16-hex stream id, which requires the code.
+const squat = await derivePairing("AAAABBBBCC");
+await check("an unclaimed stream accepts the first token it sees (this is TOFU)",
+  await worker.fetch(req(`/telemetry/${squat.stream}`, { token: "1".repeat(48) }), bare), 503);
 
-await check("one code's token is useless on another code's stream",
-  await worker.fetch(req(`/telemetry/${other.stream}`, { token: d.read }), bare), 401);
+await check("...and having claimed it, the code's own token is now refused",
+  await worker.fetch(req(`/telemetry/${squat.stream}`, { token: squat.read }), bare), 401);
+
+const fresh = await derivePairing("CCCCDDDDEE");
+await check("a second pairing code gets its own empty stream",
+  await worker.fetch(req(`/telemetry/${fresh.stream}`, { token: fresh.read }), bare), 503);
+
+await check("one code's token is refused on another code's CLAIMED stream",
+  await worker.fetch(req(`/telemetry/${fresh.stream}`, { token: d.read }), bare), 401);
 
 // A 16-hex name must take the pairing path even when MASTER_SECRET is set,
 // or the two namespaces would overlap and a paired stream would be rejected.
