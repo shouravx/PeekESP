@@ -140,6 +140,12 @@ def main():
         "--name", "peek-agent",
         "--distpath", str(DIST), "--workpath", str(WORK), "--specpath", str(HERE),
         "--noconfirm", "--console",
+        # PyInstaller compresses with UPX whenever it finds it on PATH, and a
+        # UPX-packed binary is one of the strongest heuristics antivirus
+        # engines have for "packed malware". An unsigned Python exe already
+        # starts with no reputation; packing it turns a SmartScreen prompt
+        # into a Defender quarantine on someone else's machine.
+        "--noupx",
         # tkinter only - it is genuinely unused HERE and is the one big win.
         # Do NOT also exclude email/xml/unittest/pydoc: http.server imports
         # email, so dropping it builds cleanly and then fails at runtime with
@@ -166,6 +172,7 @@ def main():
             "--name", "PeekESP",
             "--distpath", str(DIST), "--workpath", str(WORK), "--specpath", str(HERE),
             "--noconfirm",
+            "--noupx",          # see the note on the headless build above
             # No console window: this one lives in the tray.
             "--windowed" if "--console" not in args else "--console",
             "--icon", str(ICON),

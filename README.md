@@ -201,7 +201,15 @@ less install.sh && sudo sh install.sh
 ```
 
 **Windows** — same JSON, same fields, standard library only. See
-[windows/](windows/):
+[windows/](windows/). Once the [winget submission](packaging/winget/README.md)
+lands:
+
+```powershell
+winget install shouravx.PeekESP
+```
+
+Until then, grab the zip from [Releases](https://github.com/shouravx/PeekESP/releases),
+or run it from source:
 
 ```bash
 python windows\peek_agent_win.py --once

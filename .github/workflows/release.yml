@@ -1,0 +1,102 @@
+name: Release
+
+# Tag-triggered, and the release it creates is a DRAFT. A published release is
+# a public artefact with a URL that people and tools hold on to, and
+# un-publishing one after the fact does not fully work - so the last step is a
+# person clicking publish, not a push.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (defaults to the VERSION file)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows app
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the tag matches the VERSION file
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          $file = (Get-Content VERSION -Raw).Trim()
+          if ($tag -ne $file) {
+            # These drift silently otherwise, and the result is a release whose
+            # assets are named for one version while the manifests point at
+            # another - which only shows up as a 404 during winget review.
+            Write-Error "tag v$tag does not match VERSION ($file)"
+            exit 1
+          }
+          Write-Output "version $file"
+
+      - name: Build and package
+        shell: pwsh
+        run: |
+          cd windows
+          python package.py
+
+      - name: Smoke-test the headless agent
+        shell: pwsh
+        run: |
+          # A build that succeeds is not evidence the binary works: excluding a
+          # module PyInstaller thought was unused once built cleanly here and
+          # died at launch. Run it before anyone can download it.
+          $out = & windows\dist\peek-agent.exe --once | Out-String
+          Write-Output $out
+          $json = $out | ConvertFrom-Json
+          foreach ($k in 'host','cpu_percent','ram_percent','storage_percent','cpu_temp_c') {
+            if ($null -eq $json.$k) { Write-Error "missing field: $k"; exit 1 }
+          }
+          Write-Output "agent reports $($json.storage_total_gb) GB storage, temp $($json.cpu_temp_c)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-app
+          path: |
+            windows/dist/*.zip
+            windows/dist/*.sha256
+            packaging/winget/*/*.yaml
+
+      - name: Draft the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: PeekESP ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            windows/dist/*.zip
+            windows/dist/*.sha256
+            firmware/PeekESP-merged.bin
+          fail_on_unmatched_files: true
+
+      - name: What happens next
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          Write-Output @"
+          The release is a DRAFT. Nothing is public yet.
+
+            1. Check the assets on the Releases page, then publish it.
+            2. Confirm the zip URL serves the file.
+            3. winget validate --manifest packaging\winget\<version>
+               winget install  --manifest packaging\winget\<version>
+            4. Submit to microsoft/winget-pkgs - see packaging/winget/README.md
+
+          The exes are unsigned. See windows/SIGNING.md for what that costs
+          and what it would take to change.
+          "@

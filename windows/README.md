@@ -142,6 +142,33 @@ PyInstaller, pystray and Pillow go into a local `.venv`, not your system Python
 — nothing outside this folder changes. Output is `dist/`. `--clean` removes the
 artefacts; `--console` builds the tray app with a console window for debugging.
 
+**Quit the tray app first.** Windows locks a running exe, and PyInstaller then
+fails several screens into its output — long after the part anyone reads —
+while the previous binary survives in `dist/`, looking like a fresh build. The
+build checks for this per target and stops with the taskkill command.
+
+`--noupx` is passed deliberately. PyInstaller compresses with UPX whenever it
+finds it on PATH, and a UPX-packed binary is one of the strongest heuristics
+antivirus engines have for "packed malware" — which turns a SmartScreen prompt
+into a quarantine on someone else's machine.
+
+## Distributing it
+
+```bash
+python package.py       # build, zip, checksum, winget manifests
+```
+
+Produces `dist/PeekESP-<version>-win-x64.zip`, its SHA-256, and the winget
+manifests. The version comes from the `VERSION` file at the repository root.
+
+**These builds are unsigned**, so Windows SmartScreen warns the first time
+someone runs one. [SIGNING.md](SIGNING.md) covers why, what a self-signed
+certificate does *not* fix, and what the real options cost. `sign.py` does the
+signing once you have a certificate.
+
+For the winget submission, see
+[../packaging/winget/README.md](../packaging/winget/README.md).
+
 Both exes get `img/logo.ico`. That icon is generated, not hand-drawn:
 
 ```bash
