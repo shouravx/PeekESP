@@ -400,6 +400,20 @@ def push_loop(url, token, interval):
         time.sleep(interval)
 
 
+# Settings arrive from the environment so the systemd unit can stay fixed:
+# changing the poll interval rewrites one line of a config file rather than
+# regenerating and reloading a unit.
+def _env_flag(name):
+    return (os.environ.get(name, "") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name, fallback):
+    try:
+        return float(os.environ.get(name, "") or fallback)
+    except ValueError:
+        return fallback
+
+
 def main():
     import argparse
 
@@ -408,16 +422,27 @@ def main():
                     default=os.environ.get("PEEK_PAIR_CODE", ""),
                     help="the code shown on the device; derives everything else "
                          "(or set PEEK_PAIR_CODE)")
-    ap.add_argument("--relay-base", metavar="URL", default=RELAY_BASE,
-                    help="relay to pair against (default: %s)" % RELAY_BASE)
+    ap.add_argument("--relay-base", metavar="URL",
+                    default=os.environ.get("PEEK_RELAY_BASE") or RELAY_BASE,
+                    # %(default)s, not the constant: this way --help shows what
+                    # the service will actually use, environment included,
+                    # rather than what it would use if nothing were configured.
+                    help="relay to pair against (or set PEEK_RELAY_BASE; "
+                         "default: %(default)s)")
     ap.add_argument("--push", metavar="URL",
                     help="POST telemetry to this Cloudflare Worker /ingest URL")
     ap.add_argument("--token", default=os.environ.get("PEEK_PUSH_TOKEN", ""),
                     help="bearer token for --push (or set PEEK_PUSH_TOKEN)")
-    ap.add_argument("--interval", type=float, default=5.0,
-                    help="seconds between pushes (default: 5)")
+    ap.add_argument("--interval", type=float, default=_env_float("PEEK_INTERVAL", 5.0),
+                    help="seconds between pushes (or set PEEK_INTERVAL; "
+                         "default: %(default)s)")
+    ap.add_argument("--serve", action="store_true", default=_env_flag("PEEK_SERVE"),
+                    help="also listen on :%d while pushing (or set PEEK_SERVE=1)" % PORT)
     ap.add_argument("--no-serve", action="store_true",
                     help="do not listen on :%d, push only" % PORT)
+    ap.add_argument("--once", action="store_true",
+                    help="print one reading as JSON and exit - what this "
+                         "machine would report")
     ap.add_argument("--verify", action="store_true",
                     help="check the pairing code, print the stream it derives, "
                          "and exit without pushing anything")
@@ -451,16 +476,29 @@ def main():
     if not _primed.wait(SAMPLE_SECONDS * 3):   # wait for a real delta, not a guess
         print("warning: first sample did not arrive; rates may read 0", flush=True)
 
+    # Before any of the serve/push argument checks: "show me what this machine
+    # reports" is a question about this machine, not about where it sends it.
+    if args.once:
+        print(json.dumps(snapshot(), indent=2))
+        return
+
+    # Listening is opt-in as soon as something is being pushed. Opening
+    # 0.0.0.0:8080 as a side effect of pushing is a port on the LAN that nobody
+    # asked for; --serve turns it back on for a device that polls directly.
+    serving = args.serve or not args.push
+    if args.no_serve:
+        serving = False
+    if not args.push and not serving:
+        ap.error("--no-serve with nothing to push to would do nothing")
+
     if args.push:
         print("pushing to %s every %gs" % (args.push, args.interval), flush=True)
-        if args.no_serve:
+        if not serving:
             push_loop(args.push, args.token, args.interval)
             return
         threading.Thread(target=push_loop,
                          args=(args.push, args.token, args.interval),
                          daemon=True).start()
-    elif args.no_serve:
-        ap.error("--no-serve with no --push would do nothing")
 
     print("peek-agent on http://%s:%d%s" % (BIND, PORT, PATH), flush=True)
     ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()

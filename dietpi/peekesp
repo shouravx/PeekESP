@@ -1,0 +1,305 @@
+#!/bin/sh
+#
+# peekesp - control the PeekESP telemetry agent.
+#
+#   peekesp status              is it running, and is it actually pushing
+#   peekesp start | stop | restart
+#   peekesp enable | disable    start at boot, or not
+#   peekesp logs [-f] [-n N]
+#   peekesp test                one reading, as this machine would report it
+#   peekesp pair CODE           re-pair to a different device
+#   peekesp config              current settings
+#   peekesp set KEY VALUE       interval | relay | serve
+#   peekesp update              fetch the latest agent and restart
+#   peekesp uninstall
+#   peekesp version
+#
+# Installed by dietpi/install.sh. Everything that changes state needs root,
+# and says so rather than failing halfway through.
+#
+set -eu
+
+RAW_BASE="https://raw.githubusercontent.com/shouravx/PeekESP/main"
+PREFIX="/opt/peekesp"
+CONF_DIR="/etc/peekesp"
+CONF="$CONF_DIR/agent.conf"
+UNIT="/etc/systemd/system/peek-agent.service"
+SVC="peek-agent.service"
+SVC_USER="peekesp"
+AGENT="$PREFIX/peek-agent.py"
+SELF="/usr/local/bin/peekesp"
+
+say()  { printf '%s\n' "$*"; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+need_root() {
+    [ "$(id -u)" = "0" ] || die "'peekesp $1' needs root:  sudo peekesp $*"
+}
+
+installed() {
+    [ -f "$AGENT" ] || die "PeekESP is not installed here.
+       curl -fsSL $RAW_BASE/dietpi/install.sh | sudo sh"
+}
+
+# The config is root-only on purpose: the pairing code in it is the credential.
+load_conf() {
+    [ -r "$CONF" ] || die "cannot read $CONF - run this with sudo"
+    # shellcheck disable=SC1090
+    . "$CONF"
+}
+
+conf_set() {
+    # Rewritten through a temp file beside the original so the 0600 root-only
+    # mode is inherited rather than recreated, and a failed write cannot leave
+    # a half-written credential file behind.
+    _key=$1; _val=$2
+    umask 077
+    _tmp="$CONF.new"
+    if [ -f "$CONF" ]; then
+        grep -v "^${_key}=" "$CONF" > "$_tmp" || true
+    else
+        : > "$_tmp"
+    fi
+    printf '%s=%s\n' "$_key" "$_val" >> "$_tmp"
+    mv "$_tmp" "$CONF"
+    chmod 0600 "$CONF"
+    chown root:root "$CONF" 2>/dev/null || true
+}
+
+restart_if_running() {
+    if systemctl is-enabled --quiet "$SVC" 2>/dev/null \
+       || systemctl is-active --quiet "$SVC" 2>/dev/null; then
+        systemctl restart "$SVC"
+        say "restarted"
+    fi
+}
+
+usage() {
+    # Written out rather than sed'd out of this file's own header: a script
+    # that prints its help by line number goes wrong the first time someone
+    # adds a comment above it, and does so silently.
+    cat <<'EOF'
+peekesp - control the PeekESP telemetry agent
+
+  peekesp status              is it running, and is it actually pushing
+  peekesp start|stop|restart  service control
+  peekesp enable|disable      start at boot, or not
+  peekesp logs [-f] [-n N]    journal for the agent
+  peekesp test                one reading, as this machine would report it
+
+  sudo peekesp pair CODE      re-pair to a different device
+  peekesp config              current settings
+  sudo peekesp set KEY VALUE  interval SECONDS | relay URL | serve on|off
+  sudo peekesp update         fetch the latest agent and restart
+  sudo peekesp uninstall      remove the service, the files and the account
+  peekesp version
+
+Anything that changes state needs root. The pairing code is the credential,
+so reading the config does too.
+EOF
+}
+
+
+cmd=${1:-status}
+[ $# -gt 0 ] && shift || true
+
+case "$cmd" in
+
+status)
+    installed
+    if systemctl is-active --quiet "$SVC"; then
+        say "service   running"
+    else
+        say "service   stopped"
+    fi
+    if systemctl is-enabled --quiet "$SVC" 2>/dev/null; then
+        say "at boot   enabled"
+    else
+        say "at boot   disabled"
+    fi
+
+    if [ -r "$CONF" ]; then
+        # shellcheck disable=SC1090
+        . "$CONF"
+        say "machine   $(hostname)"
+        say "interval  ${PEEK_INTERVAL:-5}s"
+        say "relay     ${PEEK_RELAY_BASE:-https://peek-relay.peekesp.workers.dev}"
+        if [ -n "${PEEK_PAIR_CODE:-}" ]; then
+            say "stream    $(python3 "$AGENT" --pair-code "$PEEK_PAIR_CODE" --verify 2>/dev/null || echo '?')"
+        fi
+    else
+        say "config    (run with sudo to read it)"
+    fi
+
+    # "Running" is not the same as "working", and the difference is the whole
+    # question. A rejected push leaves the service perfectly active.
+    if journalctl -u "$SVC" -n 200 --no-pager 2>/dev/null | grep -q 'push rejected'; then
+        say ""
+        say "pushes are being REJECTED - usually the wrong pairing code."
+        journalctl -u "$SVC" -n 3 --no-pager 2>/dev/null | grep 'push rejected' | tail -1
+        say "re-pair with:  sudo peekesp pair NEW-CODE"
+    elif journalctl -u "$SVC" -n 200 --no-pager 2>/dev/null | grep -q 'pushing to'; then
+        say ""
+        say "pushing normally"
+    fi
+    ;;
+
+start|stop|restart)
+    installed
+    need_root "$cmd"
+    systemctl "$cmd" "$SVC"
+    say "$cmd ok"
+    ;;
+
+enable|disable)
+    installed
+    need_root "$cmd"
+    if [ "$cmd" = "enable" ]; then
+        systemctl enable --now "$SVC"
+        say "enabled and started"
+    else
+        systemctl disable --now "$SVC"
+        say "disabled and stopped"
+    fi
+    ;;
+
+logs)
+    installed
+    journalctl -u "$SVC" --no-pager "$@" 2>/dev/null \
+        || die "no journal for $SVC yet"
+    ;;
+
+test)
+    installed
+    # Reads /proc and /sys and pushes nothing, so this is safe at any time and
+    # answers "is the agent reading this machine correctly" separately from
+    # "is it reaching the relay".
+    say "reading this machine (about 2 seconds) ..."
+    python3 "$AGENT" --once
+    ;;
+
+pair)
+    installed
+    need_root pair "$@"
+    [ $# -ge 1 ] || die "usage: sudo peekesp pair K7M2-P4QX-9R"
+    stream=$(python3 "$AGENT" --pair-code "$1" --verify) \
+        || die "that does not look like a pairing code.
+       Ten characters, dashes and case optional, as shown on the device."
+    conf_set PEEK_PAIR_CODE "$1"
+    say "paired to stream $stream"
+    restart_if_running
+    ;;
+
+config)
+    installed
+    load_conf
+    say "pair code   ${PEEK_PAIR_CODE:-(unset)}"
+    say "relay       ${PEEK_RELAY_BASE:-https://peek-relay.peekesp.workers.dev}"
+    say "interval    ${PEEK_INTERVAL:-5}s"
+    say "serve       $([ "${PEEK_SERVE:-0}" = "1" ] && echo 'yes, on :8080' || echo no)"
+    say ""
+    say "file        $CONF"
+    say "agent       $AGENT"
+    ;;
+
+set)
+    installed
+    need_root set "$@"
+    [ $# -ge 2 ] || die "usage: sudo peekesp set KEY VALUE
+       interval SECONDS   how often to push (5 is the default)
+       relay    URL       a different Worker
+       serve    on|off    also answer on :8080, for a device on the same LAN"
+    case "$1" in
+        interval)
+            case "$2" in
+                ''|*[!0-9.]*) die "interval must be a number of seconds" ;;
+            esac
+            conf_set PEEK_INTERVAL "$2"
+            say "interval $2s"
+            say "(each agent costs 86400/$2 requests a day against Cloudflare's"
+            say " free 100,000 - raising this is how you fit more machines)"
+            ;;
+        relay)
+            case "$2" in
+                https://*) ;;
+                *) die "the relay must be an https:// URL" ;;
+            esac
+            conf_set PEEK_RELAY_BASE "$2"
+            say "relay $2"
+            ;;
+        serve)
+            case "$2" in
+                on|yes|1|true)  conf_set PEEK_SERVE 1; say "serving on :8080 as well" ;;
+                off|no|0|false) conf_set PEEK_SERVE 0; say "pushing only" ;;
+                *) die "serve is on or off" ;;
+            esac
+            ;;
+        *)
+            die "unknown setting '$1' - try interval, relay or serve"
+            ;;
+    esac
+    restart_if_running
+    ;;
+
+update)
+    installed
+    need_root update
+    say "fetching the latest agent ..."
+    tmp="$PREFIX/.peek-agent.py.new"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --proto '=https' --tlsv1.2 "$RAW_BASE/dietpi/peek-agent.py" -o "$tmp"
+    else
+        wget -q --https-only -O "$tmp" "$RAW_BASE/dietpi/peek-agent.py"
+    fi
+    # Checked before it replaces anything: a truncated download that parses as
+    # nothing would otherwise take the service down until the next release.
+    python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$tmp" \
+        || { rm -f "$tmp"; die "the download is not valid Python - nothing was changed"; }
+    mv "$tmp" "$AGENT"
+    chmod 0755 "$AGENT"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --proto '=https' --tlsv1.2 "$RAW_BASE/dietpi/peekesp" -o "$SELF.new"
+    else
+        wget -q --https-only -O "$SELF.new" "$RAW_BASE/dietpi/peekesp"
+    fi
+    sh -n "$SELF.new" && mv "$SELF.new" "$SELF" && chmod 0755 "$SELF" \
+        || { rm -f "$SELF.new"; say "(kept the existing peekesp command)"; }
+
+    say "updated"
+    restart_if_running
+    ;;
+
+uninstall)
+    need_root uninstall
+    systemctl disable --now "$SVC" 2>/dev/null || true
+    rm -f "$UNIT"
+    systemctl daemon-reload 2>/dev/null || true
+    rm -rf "$PREFIX" "$CONF_DIR"
+    userdel "$SVC_USER" 2>/dev/null || true
+    rm -f "$SELF"
+    say "Removed. The relay keeps this machine's last reading for 24 hours,"
+    say "then drops it from the device on its own."
+    ;;
+
+version)
+    if [ -f "$AGENT" ]; then
+        say "agent     $AGENT"
+        say "modified  $(date -r "$AGENT" '+%Y-%m-%d %H:%M' 2>/dev/null || echo unknown)"
+    else
+        say "not installed"
+    fi
+    say "source    https://github.com/shouravx/PeekESP"
+    ;;
+
+help|-h|--help)
+    usage
+    ;;
+
+*)
+    say "unknown command '$cmd'"
+    say ""
+    usage
+    exit 2
+    ;;
+esac

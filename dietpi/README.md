@@ -32,12 +32,60 @@ curl -fsSLO https://raw.githubusercontent.com/shouravx/PeekESP/main/dietpi/insta
 less install.sh && sudo sh install.sh
 ```
 
-| | |
-|---|---|
-| re-pair | `sudo sh install.sh NEW-CODE` |
-| status | `systemctl status peek-agent` |
-| logs | `journalctl -u peek-agent -f` |
-| remove | `sudo sh install.sh --uninstall` |
+## The `peekesp` command
+
+The installer puts a `peekesp` command on the path. It is the whole interface —
+you should not need `systemctl` or `journalctl` for anything routine.
+
+```
+peekesp status              is it running, and is it actually pushing
+peekesp start|stop|restart  service control
+peekesp enable|disable      start at boot, or not
+peekesp logs [-f] [-n N]    journal for the agent
+peekesp test                one reading, as this machine would report it
+
+sudo peekesp pair CODE      re-pair to a different device
+peekesp config              current settings
+sudo peekesp set KEY VALUE  interval SECONDS | relay URL | serve on|off
+sudo peekesp update         fetch the latest agent and restart
+sudo peekesp uninstall      remove the service, the files and the account
+peekesp version
+```
+
+`status` answers the question that actually matters, which is not whether a
+service is running. A rejected push leaves the unit perfectly `active` while
+nothing reaches the display, so `status` reads the journal and says so:
+
+```
+$ peekesp status
+service   running
+at boot   enabled
+machine   dietpi
+interval  5s
+relay     https://peek-relay.peekesp.workers.dev
+stream    e67e3b0d5b07d6ba
+
+pushes are being REJECTED - usually the wrong pairing code.
+re-pair with:  sudo peekesp pair NEW-CODE
+```
+
+`test` prints one reading and pushes nothing, which separates *is the agent
+reading this machine correctly* from *is it reaching the relay* — two problems
+that look identical from the device.
+
+`set` writes to the config file and restarts the service if it was running.
+The systemd unit carries no flags at all: everything comes from
+`/etc/peekesp/agent.conf`, so changing the poll interval rewrites one line
+rather than regenerating and reloading a unit.
+
+```bash
+sudo peekesp set interval 15      # a third of the requests
+sudo peekesp set serve on         # also answer on :8080, for a LAN device
+sudo peekesp set relay https://my-worker.workers.dev
+```
+
+`update` refuses to install a download that is not valid Python, because a
+truncated fetch would otherwise take the service down until the next release.
 
 ## Several machines, one code
 
@@ -93,7 +141,13 @@ numbers it is displaying.
 ## Running it by hand
 
 ```bash
-python3 peek-agent.py --pair-code K7M2-P4QX-9R --no-serve
+python3 peek-agent.py --pair-code K7M2-P4QX-9R
+```
+
+See what this machine reports, without pushing anything anywhere:
+
+```bash
+python3 peek-agent.py --once
 ```
 
 Check a code without pushing anything:
@@ -114,9 +168,15 @@ python3 peek-agent.py
 curl http://localhost:8080/telemetry
 ```
 
-Other flags: `--relay-base URL` to pair against your own Worker rather than the
-default one, `--interval` for the push period, and `--push URL --token TOKEN`
-for the private and named-stream modes that do not use pairing at all.
+**Pushing no longer opens a port as a side effect.** Once there is somewhere to
+push, listening is opt-in via `--serve` (or `PEEK_SERVE=1`). An agent that
+dials out has no reason to also accept connections from the whole LAN, and an
+open port nobody asked for is the kind of default that is only noticed later.
+
+Every setting has an environment variable, because the systemd unit passes no
+flags: `PEEK_PAIR_CODE`, `PEEK_RELAY_BASE`, `PEEK_INTERVAL`, `PEEK_SERVE`.
+`--push URL --token TOKEN` still drives the private and named-stream modes that
+do not use pairing at all.
 
 ## What the installer does
 
@@ -127,7 +187,8 @@ for the private and named-stream modes that do not use pairing at all.
    one in place instead of a truncated file.
 3. Validates the code by asking the agent, so the alphabet lives in exactly one
    place and cannot drift out of step with the firmware.
-4. Creates a system account `peekesp` with no home and no shell.
+4. Installs the `peekesp` command to `/usr/local/bin`, after checking it
+   parses. Creates a system account `peekesp` with no home and no shell.
 5. Writes the code to `/etc/peekesp/agent.conf`, mode `0600`, root-owned.
    **The code is the credential** — the stream id and push token are derived
    from it, so anything that can read that file can push telemetry to your

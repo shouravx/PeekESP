@@ -179,7 +179,11 @@ curl -fsSL https://raw.githubusercontent.com/shouravx/PeekESP/main/dietpi/instal
 It asks for the pairing code and derives everything else — relay URL, stream,
 push token — locally. Then it installs a hardened systemd service, starts it,
 and waits to confirm the machine is actually pushing before it says it worked.
-Full detail in [dietpi/](dietpi/).
+
+Afterwards everything is managed with the `peekesp` command it installs —
+`peekesp status`, `peekesp logs -f`, `peekesp test`, `sudo peekesp pair CODE`,
+`sudo peekesp set interval 15`, `sudo peekesp uninstall`. Full detail in
+[dietpi/](dietpi/).
 
 To skip the prompt, or to run it from a script:
 

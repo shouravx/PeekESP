@@ -32,6 +32,7 @@ CONF="$CONF_DIR/agent.conf"
 UNIT="/etc/systemd/system/peek-agent.service"
 SVC_USER="peekesp"
 AGENT="$PREFIX/peek-agent.py"
+CLI="/usr/local/bin/peekesp"
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -56,6 +57,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     rm -f "$UNIT"
     systemctl daemon-reload
     rm -rf "$PREFIX" "$CONF_DIR"
+    rm -f "$CLI"
     userdel "$SVC_USER" 2>/dev/null || true
     say "Removed. The relay keeps this machine's last reading for 24 hours,"
     say "then drops it from the device on its own."
@@ -110,6 +112,13 @@ fetch "$RAW_BASE/dietpi/peek-agent.py" "$TMP" \
 mv "$TMP" "$AGENT"
 chmod 0755 "$AGENT"
 
+step "Installing the peekesp command"
+TMP="$PREFIX/.peekesp.new"
+fetch "$RAW_BASE/dietpi/peekesp" "$TMP" || die "could not download the peekesp command"
+sh -n "$TMP" || { rm -f "$TMP"; die "the downloaded peekesp command does not parse"; }
+mv "$TMP" "$CLI"
+chmod 0755 "$CLI"
+
 step "Checking the pairing code"
 # The agent validates it, so the alphabet lives in exactly one place. A copy
 # here would be one more thing to drift out of step with the firmware.
@@ -139,12 +148,24 @@ mkdir -p "$CONF_DIR"
 chmod 0750 "$CONF_DIR"
 umask 077
 cat > "$CONF" <<EOF
-# PeekESP agent configuration.
+# PeekESP agent configuration.  Edit with:  sudo peekesp set KEY VALUE
 #
 # The pairing code is the only secret here: the stream id and the push token
 # are derived from it, so anything that can read this file can push telemetry
 # to your device. Re-pair the device to invalidate it.
 PEEK_PAIR_CODE=$CODE
+
+# Seconds between pushes. Each agent costs 86400/interval requests a day
+# against Cloudflare's free 100,000, so this is the dial for fitting more
+# machines onto one relay.
+PEEK_INTERVAL=5
+
+# A different Worker, if you deployed your own.
+PEEK_RELAY_BASE=https://peek-relay.peekesp.workers.dev
+
+# Also answer on :8080, for a device polling over the same LAN. Off by
+# default: an open port is not something pushing telemetry should imply.
+PEEK_SERVE=0
 EOF
 chmod 0600 "$CONF"
 chown root:root "$CONF"
@@ -163,7 +184,9 @@ Type=simple
 # arrive in lumps - or not at all until the service stops.
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=$CONF
-ExecStart=$PY $AGENT --no-serve
+# No flags: everything comes from the config file above, so changing the poll
+# interval rewrites one line rather than regenerating and reloading a unit.
+ExecStart=$PY $AGENT
 Restart=always
 RestartSec=10
 
@@ -232,12 +255,17 @@ cat <<EOF
 
 Done. $(hostname) is now pushing to the relay every 5 seconds.
 
-  status   systemctl status peek-agent
-  logs     journalctl -u peek-agent -f
-  re-pair  sudo sh $0 NEW-CODE
-  remove   sudo sh $0 --uninstall
+Everything is managed with the peekesp command:
 
-The device should show this machine within a few seconds. Run this on other
-machines with the SAME code to have them all appear on the one display - tap
-the left button to swipe between them.
+  peekesp status              is it running, and is it actually pushing
+  peekesp logs -f             follow the journal
+  peekesp test                one reading, as this machine reports it
+  sudo peekesp pair NEW-CODE  point it at a different device
+  sudo peekesp set interval 15
+  sudo peekesp uninstall
+  peekesp help                the rest
+
+The device should show this machine within a few seconds. Run the same
+installer on other machines with the SAME code and they all appear on the one
+display - tap the left button to swipe between them.
 EOF
