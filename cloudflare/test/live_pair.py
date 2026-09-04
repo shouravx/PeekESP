@@ -85,6 +85,31 @@ check("a fresh code's stream starts empty and claims its own token", s, 503)
 s, _ = call("GET", ou, d["read"])
 check("another code's token is refused on that now-claimed stream", s, 401)
 
+# Several machines behind the one code. The point of checking this live rather
+# than only in the unit tests is that Durable Object storage list() behaves for
+# real here - the stub cannot prove the prefix scan works against the SQLite
+# backend the free plan actually runs.
+for host in ("live-laptop", "live-pi"):
+    s, _ = call("POST", u["ingest"], d["push"],
+                {"host": host, "cpu_percent": 7.0, "ram_percent": 8.0})
+    check(f"a second machine pushes to the same code ({host})", s, 200)
+
+s, b = call("GET", u["telemetry"], d["read"])
+names = [x.get("host") for x in b.get("devices", [])]
+res.append((
+    f"all three machines come back in one poll  -> {s}  {names}",
+    s == 200 and sorted(names) == ["live-laptop", "live-pi", "live-test"]))
+res.append((
+    f"the array is sorted by name so the swipe order is stable  -> {names}",
+    names == sorted(names)))
+res.append((
+    f"every machine carries its own age  -> {s}",
+    all(isinstance(x.get("age_s"), int) for x in b.get("devices", []))))
+res.append((
+    "the freshest is still mirrored at the top level for old firmware"
+    f"  -> {b.get('host')}",
+    b.get("host") == "live-pi"))
+
 print()
 fails = 0
 for name, ok in res:

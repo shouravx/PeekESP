@@ -738,6 +738,17 @@ static void fmt_uptime(char *out, size_t n, uint32_t s) {
   else        snprintf(out, n, "up %um",     (unsigned)m);
 }
 
+// How long ago a machine last reported. Not fmt_uptime with the prefix cut
+// off: a machine goes stale after 30 seconds, and "0m" is the wrong thing to
+// say about something that went quiet 40 seconds ago.
+static void fmt_ago(char *out, size_t n, uint32_t s) {
+  const uint32_t d = s / 86400u, h = (s % 86400u) / 3600u, m = (s % 3600u) / 60u;
+  if      (d) snprintf(out, n, "%ud %uh", (unsigned)d, (unsigned)h);
+  else if (h) snprintf(out, n, "%uh %um", (unsigned)h, (unsigned)m);
+  else if (m) snprintf(out, n, "%um",     (unsigned)m);
+  else        snprintf(out, n, "%us",     (unsigned)s);
+}
+
 // ---------------------------------------------------------------------------
 //  UI construction - runs once on core 1, before either task starts.
 // ---------------------------------------------------------------------------
@@ -1290,8 +1301,8 @@ static void render_selected() {
   // be perfectly healthy while this particular one has been off for an hour,
   // and an uptime frozen at that moment would read as live.
   if (snap.age_s > STALE_AFTER_S) {
-    fmt_uptime(a, sizeof a, snap.age_s);
-    snprintf(buf, sizeof buf, "silent %s", a + 3);   // skip fmt_uptime's "up "
+    fmt_ago(a, sizeof a, snap.age_s);
+    snprintf(buf, sizeof buf, "silent %s", a);
   } else {
     fmt_uptime(buf, sizeof buf, snap.uptime_seconds);
   }
