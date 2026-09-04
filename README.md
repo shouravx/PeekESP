@@ -377,23 +377,52 @@ Both buttons do two things, chosen by how long you hold them.
 
 | Button | Action |
 |---|---|
-| Left (GPIO 0) — tap | Next page — each machine in turn, then the power screen, then back to the first |
+| Left (GPIO 0) — tap | Next page — each machine in turn, then the two clock faces, then the power screen, then back to the first |
 | Left — hold 1.5 s | Reboot into setup mode |
 | Left — held at power-on | Boot straight into setup mode |
 | Right (GPIO 35) — tap | Cycle backlight brightness — 100 / 59 / 27 / 8 %, remembered across reboots |
-| Right — hold 1.2 s | Deep sleep. The panel is told to sleep as well as the backlight cut, since a dark screen still driven at full current is most of what there is to save |
-| Right — press while asleep | Wake |
+| Right — hold 1.2 s | Standby — panel off and polling paused |
+| Right — press while in standby | Wake, back to the page you left |
 
 Swiping costs nothing: one poll already carried every machine and the power
 page is local, so the device makes the same number of requests whether you look
 at one screen or at seven.
 
-> **The wake button is the right one, and it has to be.** GPIO 0 is a strapping
-> pin: held low across the reset that ends deep sleep, the ESP32 latches it and
-> comes up in the serial bootloader instead of running the sketch — a dark
-> screen and a board that looks dead until it is power-cycled. GPIO 35 is
-> RTC-capable, is not a strapping pin, and the board pulls it up externally, so
-> the button that sleeps the board is also the one that wakes it.
+> **Standby, not deep sleep.** Deep sleep on an ESP32 ends in a *reset*: the
+> chip comes back through `setup()`, rejoins WiFi, re-syncs NTP and lands on
+> the first page — so "wake" meant "reboot and lose your place". Standby keeps
+> RAM, the WiFi association and the page you were on, and wakes instantly.
+>
+> The cost is real and worth stating: standby draws milliamps where deep sleep
+> draws microamps. But the backlight dominates this board's consumption by a
+> wide margin, and turning that off plus pausing the polling is most of the
+> saving. For a mains-powered desk gadget that is the right trade; for a month
+> on a battery it would not be.
+>
+> (The earlier deep-sleep implementation also could not be woken at all, because
+> GPIO 0 is a strapping pin — held low across the reset that ends deep sleep,
+> the ESP32 latches it and comes up in the serial bootloader instead of running
+> the sketch.)
+
+## Clock
+
+Two faces, both on Dhaka time (UTC+6, no daylight saving), swiped to like any
+other page. They live in [`PeekESP/clock_faces.h`](PeekESP/clock_faces.h) so a
+face can be redesigned without reading past a thousand lines of networking.
+
+**Dated** — time, seconds, weekday and full date, with a bar that fills across
+the minute so the page never looks frozen.
+
+**Vanilla** — the time and nothing else, as large as the panel allows, for
+reading across a room. A single dot breathes once a second: a clock with no
+seconds is indistinguishable from a screenshot for up to a minute at a time,
+which is unsettling on a device whose whole job is being live.
+
+The time comes from the NTP sync the TLS handshake needed anyway. The board has
+no battery-backed RTC — the internal one keeps counting between syncs but
+drifts, and loses everything on a power cut — so both faces show `--:--` until
+the first sync lands, rather than 01:00 on 1 January 1970, which is what an
+unsynced ESP32 sincerely believes.
 
 ## Power screen
 

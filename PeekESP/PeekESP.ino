@@ -125,6 +125,11 @@
 
 // 32 characters with I, O, 0 and 1 removed - the pairs people mistype reading
 // a code off a 1.14" screen. 10 characters is 2^50.
+// POSIX TZ for Bangladesh: six hours ahead, and no daylight saving to
+// describe. The sign is inverted in this format - "-6" means UTC+6 - which is
+// the single most common way to get a POSIX TZ string exactly backwards.
+#define TZ_DHAKA "<+06>-6"
+
 #define PAIR_ALPHABET "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 #define PAIR_CODE_LEN 10
 
@@ -164,6 +169,18 @@ static const uint16_t SCREEN_H = 135;
   #define F_BIG &lv_font_montserrat_20
 #else
   #define F_BIG LV_FONT_DEFAULT
+#endif
+#if LV_FONT_MONTSERRAT_14
+  #define F_MD  &lv_font_montserrat_14
+#else
+  #define F_MD  LV_FONT_DEFAULT
+#endif
+// The clock face. Guarded like the rest so the sketch still builds if someone
+// trims lv_conf.h - it degrades to a small clock rather than failing to link.
+#if LV_FONT_MONTSERRAT_44
+  #define F_HUGE &lv_font_montserrat_44
+#else
+  #define F_HUGE F_BIG
 #endif
 
 // ============================================================================
@@ -264,6 +281,10 @@ static volatile int8_t   g_view_step = 0;
 // difference between "20 %" and "flat".
 static float             g_vref_scale = 1.0f;
 
+// Set by the button loop, read by both tasks: the screen is off, so there is
+// nothing to draw and no reason to spend requests polling for it.
+static volatile bool     g_standby = false;
+
 
 // Core 1 only: which machine is on screen, and the state of the swipe.
 static DeviceSet         g_shown;
@@ -327,12 +348,21 @@ static const int PIN_ADC_BAT = 34;
 // discharging at 3.9 V. "CHARGING" here means "something external is holding
 // this up", not "current is flowing into the cell". If your board reads
 // differently, this is the single number to move.
-#define VOLTS_CHARGING   4.32f
+// Measured behaviour, not the datasheet ideal: on a real board the charger
+// holds the node at about 4.2 V, not above it, so the original 4.32 V never
+// triggered - the display simply reported a very full battery whenever the
+// cable was in, which is exactly what it looked like.
+//
+// The cost of moving it down is stated plainly because it is real: a cell just
+// off charge sits at 4.1-4.2 V for a while and will read as externally
+// powered until it settles. That is the wrong answer for a few minutes; the
+// old threshold was the wrong answer for as long as the cable was in.
+#define VOLTS_CHARGING   4.15f
 
 // Falling back below this counts as no longer charging. The gap between the
 // two is deliberate: a single threshold makes a cell resting near it flip
 // state on almost every sample.
-#define VOLTS_DISCHARGE  4.20f
+#define VOLTS_DISCHARGE  4.02f
 
 // Below this nothing is connected, or ADC_EN never went high. Reporting 0 %
 // would be a confident wrong answer about a battery that is not there.
@@ -721,7 +751,7 @@ static uint8_t battery_percent(float v) {
   return 100;
 }
 
-static float battery_volts() {
+static float battery_volts_raw() {
   // Averaged because a single ADC sample on this chip is noisy enough to swing
   // the reading by a few percent, which on screen looks like a battery that
   // cannot make its mind up.
@@ -732,6 +762,36 @@ static float battery_volts() {
   // 2.0 undoes the divider; 3.3 is the reference the ADC is characterised
   // against at 11 dB attenuation.
   return (raw / 4095.0f) * 2.0f * 3.3f * g_vref_scale;
+}
+
+// Averaging sixteen samples inside one read removes the noise within that
+// read, and none of the noise between reads: WiFi transmit bursts pull the
+// rail down for milliseconds at a time, so consecutive reads still disagree
+// by enough to walk the percentage up and down while nothing is happening. An
+// exponential average over reads is what stops that.
+//
+// Deliberately slow. Battery voltage has no business changing quickly, and a
+// filter that reacts fast enough to track a transmit burst is a filter that
+// shows you the transmit burst.
+#define VOLT_EMA_ALPHA 0.15f
+
+static float g_volts_filtered = 0.0f;
+
+static float battery_volts() {
+  const float v = battery_volts_raw();
+  if (g_volts_filtered <= 0.0f) {
+    g_volts_filtered = v;          // first read seeds it; no ramp up from zero
+  } else {
+    g_volts_filtered += VOLT_EMA_ALPHA * (v - g_volts_filtered);
+  }
+  return g_volts_filtered;
+}
+
+// Plugging in or pulling the cable is a real step change, not noise, and the
+// filter would otherwise crawl across it over half a minute while the display
+// showed values that were true at no point.
+static void battery_reset_filter() {
+  g_volts_filtered = 0.0f;
 }
 
 static void fmt_uptime(char *out, size_t n, uint32_t s) {
@@ -932,6 +992,8 @@ static void build_dashboard_ui() {
 
   apply_state(NET_BOOT);
 }
+
+#include "clock_faces.h"
 
 // ---------------------------------------------------------------------------
 //  Power overlay - the board's own battery, not the monitored machine's.
@@ -1243,6 +1305,21 @@ static void ui_sync_cb(lv_timer_t *t) {
 
   power_tick();
 
+  // The clock is the only thing here that has to move every second, and it
+  // only has to when it is the page being looked at.
+  {
+    const bool dated   = g_clk_panel  && !lv_obj_has_flag(g_clk_panel, LV_OBJ_FLAG_HIDDEN);
+    const bool vanilla = g_clkp_panel && !lv_obj_has_flag(g_clkp_panel, LV_OBJ_FLAG_HIDDEN);
+    if (dated || vanilla) {
+      static uint32_t clk_next = 0;
+      if ((int32_t)(millis() - clk_next) >= 0) {
+        clk_next = millis() + 200;
+        if (dated) render_clock_dated();
+        else       render_clock_vanilla();
+      }
+    }
+  }
+
   // A button press is a reason to redraw even when no new data has arrived.
   const int8_t step = g_view_step;
   if (step) {
@@ -1263,7 +1340,7 @@ static void ui_sync_cb(lv_timer_t *t) {
   // A machine dropping off the relay must not leave the view pointing past the
   // last page. The power page is always the final one, so that is where an
   // out-of-range view lands rather than on some arbitrary machine.
-  if (g_view > g_shown.n)     g_view = g_shown.n;
+  if (g_view >= page_count()) g_view = (uint8_t)(page_count() - 1);
   if (g_dev_view >= g_shown.n) g_dev_view = g_shown.n ? g_shown.n - 1 : 0;
 
   // Mid-swipe the body is parked off-screen with the OLD machine's values
@@ -1314,7 +1391,15 @@ static void render_host_battery() {
 static void render_selected() {
   // The last page belongs to the board rather than to any machine, so its
   // numbers come from the ADC sampler and only this line comes from telemetry.
-  if (g_view >= g_shown.n) {
+  if (g_view == g_shown.n) {
+    render_clock_dated();
+    return;
+  }
+  if (g_view == g_shown.n + 1) {
+    render_clock_vanilla();
+    return;
+  }
+  if (g_view > g_shown.n) {
     render_host_battery();
     return;
   }
@@ -1403,12 +1488,20 @@ static void power_tick() {
 
   // Hysteresis, and the reason it is here: a cell resting right on the
   // threshold crossed it on almost every sample, so the state flickered
-  // between CHARGING and ON BATTERY. It has to climb past 4.32 V to count as
-  // charging and fall back below 4.20 V to stop counting, so a reading that
-  // wobbles inside that band does not change anything.
+  // between CHARGING and ON BATTERY. It has to climb past VOLTS_CHARGING to
+  // count as powered and fall back below VOLTS_DISCHARGE to stop, so a reading
+  // that wobbles inside that band does not change anything.
   static bool charging = false;
-  if      (volts >= VOLTS_CHARGING) charging = true;
+  const bool was_charging = charging;
+  if      (volts >= VOLTS_CHARGING)  charging = true;
   else if (volts <= VOLTS_DISCHARGE) charging = false;
+
+  if (charging != was_charging) {
+    // A cable going in or out is a step change. Left alone the average would
+    // crawl across it for half a minute, showing numbers that were true at no
+    // point on either side of the transition.
+    battery_reset_filter();
+  }
 
   const uint8_t pct = absent ? 0 : battery_percent(volts);
   char buf[32];
@@ -1418,33 +1511,72 @@ static void power_tick() {
     lv_label_set_text(g_pwr_volts, "no reading");
     lv_label_set_text(g_pwr_state, "NO BATTERY");
     lv_obj_set_style_text_color(g_pwr_state, COL_TEXT_DIM, 0);
+  } else if (charging) {
+    // No percentage while something external is holding the node up, and this
+    // is the honest part: that voltage is the charger's, not the cell's state
+    // of charge. A charger pins the node near 4.2 V from the moment it is
+    // plugged in, so reporting a percentage from it reads "100 %" against an
+    // almost empty battery - which is precisely what it did, and why pulling
+    // the cable appeared to drop it to a fifth in an instant. Nothing dropped;
+    // the number was never a measurement of the battery.
+    lv_label_set_text(g_pwr_pct, LV_SYMBOL_CHARGE);
+    snprintf(buf, sizeof buf, "%.2f V", volts);
+    lv_label_set_text(g_pwr_volts, buf);
+    lv_label_set_text(g_pwr_state, "EXTERNAL POWER");
+    lv_obj_set_style_text_color(g_pwr_state, COL_GREEN, 0);
   } else {
     lv_label_set_text_fmt(g_pwr_pct, "%u%%", (unsigned)pct);
     snprintf(buf, sizeof buf, "%.2f V", volts);
     lv_label_set_text(g_pwr_volts, buf);
-    lv_label_set_text(g_pwr_state, charging ? "CHARGING" : "ON BATTERY");
-    lv_obj_set_style_text_color(g_pwr_state, charging ? COL_GREEN : COL_AMBER, 0);
+    lv_label_set_text(g_pwr_state, "ON BATTERY");
+    lv_obj_set_style_text_color(g_pwr_state, COL_AMBER, 0);
   }
 
-  // Colour follows what is left, not what it is doing: at 8 % it is red
-  // whether or not something is plugged in.
   lv_obj_set_style_bg_color(g_pwr_fill,
+                            charging ? COL_GREEN :
                             pct > 50 ? COL_GREEN : pct > 20 ? COL_AMBER : COL_RED, 0);
   if (charging && !absent) lv_obj_clear_flag(g_pwr_bolt, LV_OBJ_FLAG_HIDDEN);
   else                     lv_obj_add_flag(g_pwr_bolt, LV_OBJ_FLAG_HIDDEN);
 
   // Animated only when this page is actually being looked at; setting a width
   // on a hidden object every two seconds is just work nobody sees.
-  if (!lv_obj_has_flag(g_pwr_panel, LV_OBJ_FLAG_HIDDEN)) {
+  if (lv_obj_has_flag(g_pwr_panel, LV_OBJ_FLAG_HIDDEN)) return;
+
+  static bool sweeping = false;
+  lv_anim_del(g_pwr_fill, obj_set_w);
+
+  if (charging && !absent) {
+    // A repeating sweep, not a level. The same reasoning as the missing
+    // percentage: while a charger is holding the node up there is no
+    // measurement of how full the cell is, and a bar filled to the brim would
+    // assert one. A sweep says "power is going in" and claims nothing else.
+    sweeping = true;
     lv_anim_t fill;
     lv_anim_init(&fill);
     lv_anim_set_var(&fill, g_pwr_fill);
     lv_anim_set_exec_cb(&fill, obj_set_w);
-    lv_anim_set_values(&fill, lv_obj_get_width(g_pwr_fill), (102 * pct) / 100);
-    lv_anim_set_time(&fill, 400);
-    lv_anim_set_path_cb(&fill, lv_anim_path_ease_out);
+    lv_anim_set_values(&fill, 0, 102);
+    lv_anim_set_time(&fill, 1400);
+    lv_anim_set_repeat_count(&fill, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_repeat_delay(&fill, 250);
+    lv_anim_set_path_cb(&fill, lv_anim_path_ease_in_out);
     lv_anim_start(&fill);
+    return;
   }
+
+  lv_anim_t fill;
+  lv_anim_init(&fill);
+  lv_anim_set_var(&fill, g_pwr_fill);
+  lv_anim_set_exec_cb(&fill, obj_set_w);
+  // Coming off the sweep the bar is at whatever width the animation was
+  // passing through, which is not where the level is - start from 0 so it
+  // fills to the real value instead of jumping backwards from a random point.
+  lv_anim_set_values(&fill, sweeping ? 0 : lv_obj_get_width(g_pwr_fill),
+                     (102 * pct) / 100);
+  lv_anim_set_time(&fill, 400);
+  lv_anim_set_path_cb(&fill, lv_anim_path_ease_out);
+  lv_anim_start(&fill);
+  sweeping = false;
 }
 
 static void view_slide_in_done(lv_anim_t *a) {
@@ -1456,11 +1588,16 @@ static void view_slide_in_done(lv_anim_t *a) {
 // single gesture to learn and no screen that can appear without being asked
 // for.
 static uint8_t page_count() {
-  return (uint8_t)(g_shown.n + 1);
+  // Machines, then both clock faces, then power. The last three always exist,
+  // so a device that has never heard from a machine still has somewhere to go.
+  return (uint8_t)(g_shown.n + 3);
 }
 
 static lv_obj_t *page_obj(uint8_t page) {
-  return (page >= g_shown.n) ? g_pwr_panel : g_body;
+  if (page <  g_shown.n)      return g_body;
+  if (page == g_shown.n)      return g_clk_panel;    // dated
+  if (page == g_shown.n + 1)  return g_clkp_panel;   // vanilla
+  return g_pwr_panel;
 }
 
 // Halfway: the outgoing page is off-screen, so this is the one moment where
@@ -1527,8 +1664,11 @@ static void uiTask(void *arg) {
     lv_tick_inc(now - last_tick);      // lv_conf.h keeps LV_TICK_CUSTOM at 0
 #endif
     last_tick = now;
-    lv_timer_handler();
-    vTaskDelay(pdMS_TO_TICKS(5));      // yield to IDLE1 / the watchdog
+    // In standby the panel is off, so every frame is work nobody can see.
+    // The tick above still advances, so animations do not resume mid-sweep
+    // from a stale timebase when the screen comes back.
+    if (!g_standby) lv_timer_handler();
+    vTaskDelay(pdMS_TO_TICKS(g_standby ? 100 : 5));   // yield to IDLE1 / the watchdog
   }
 }
 
@@ -1569,7 +1709,10 @@ static bool time_sync(uint32_t timeout_ms) {
   // certificate validity dates, so a device with no clock cannot complete a
   // handshake - and fails it without saying why.
   g_state = NET_TIME;
-  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  // configTzTime rather than configTime: the epoch is the same either way and
+  // TLS only cares about that, but localtime() then gives Dhaka time without
+  // every caller having to remember to add six hours.
+  configTzTime(TZ_DHAKA, "pool.ntp.org", "time.google.com");
 
   const uint32_t start = millis();
   while (time(nullptr) < 1700000000) {          // ~Nov 2023, i.e. "plausible"
@@ -1771,6 +1914,13 @@ static void netTask(void *arg) {
     while ((int32_t)(millis() - wake) < 0 && !g_force) {
       if (g_reboot_at) break;
       vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    // Nothing is on screen in standby, so polling would spend requests and
+    // radio time on numbers nobody is looking at. Waking sets g_force, so the
+    // first thing that happens on the way back is a fresh reading.
+    while (g_standby && !g_force && !g_reboot_at) {
+      vTaskDelay(pdMS_TO_TICKS(200));
     }
     g_force = false;
   }
@@ -2139,6 +2289,8 @@ void setup() {
     build_dashboard_ui();
     // Before the pairing overlay, so pairing wins at boot: a device that has
     // never been paired has something more useful to say than its own voltage.
+    build_clock_dated(lv_scr_act());
+    build_clock_vanilla(lv_scr_act());
     build_power_panel(lv_scr_act());
     // The overlay sits on top until the first reading arrives, so a freshly
     // flashed device shows its code rather than a dashboard full of zeroes.
@@ -2192,37 +2344,50 @@ void setup() {
 // to sleep separately: cutting the backlight alone leaves the controller
 // driving a dark screen at full current, which is most of what there is to
 // save on a board with no other peripherals.
-static void enter_sleep() {
-  Serial.println("[peek] sleeping - press the right button to wake");
-  Serial.flush();
+// Standby, not deep sleep. Deep sleep on an ESP32 ends in a reset: the chip
+// comes back through setup(), rejoins WiFi, re-syncs NTP and lands on the
+// first page - so "wake" meant "reboot and lose your place", which is what it
+// looked like.
+//
+// This keeps RAM, the WiFi association and the whole UI exactly as they were.
+// The cost is real - standby draws milliamps where deep sleep draws
+// microamps - but the backlight is the dominant load on this board by a wide
+// margin, and turning that off plus stopping the polling is most of the
+// saving. For a mains-powered desk gadget that is the right trade; for a
+// month on a battery it would not be.
+//
+// Nothing here touches LVGL: this runs in loop(), on core 1 beside the UI
+// task, so it sets a flag and lets that task stand down on its own.
+static void enter_standby() {
+  Serial.println("[peek] standby - press the right button to wake");
+
+  g_standby = true;
+  vTaskDelay(pdMS_TO_TICKS(60));   // let uiTask finish the frame it is drawing
 
   backlight_set(0);
   tft.writecommand(0x28);          // DISPOFF
   tft.writecommand(0x10);          // SLPIN
-  delay(120);                      // the ST7789 wants ~120 ms to settle
 
-  // The wake pin is GPIO35, not the labelled BOOT button, and that is not a
-  // preference - GPIO0 cannot do this job at all.
-  //
-  // GPIO0 is a strapping pin. Deep-sleep wake is a reset, and the chip latches
-  // the strapping pins on that reset: held low across it, the ESP32 comes up
-  // in the serial bootloader instead of running this sketch. The symptom is a
-  // board that sleeps and then will not come back - a dark screen, no boot,
-  // apparently dead until it is power-cycled. Pressing the button harder or
-  // for longer makes it worse, because holding it low is the trigger.
-  //
-  // GPIO35 is RTC-capable, is not a strapping pin, and the board pulls it up
-  // externally - which it has to, since GPIO34-39 have no internal pulls at
-  // all. So the button that puts the board to sleep is also the one that
-  // wakes it, which is easier to remember anyway.
-  //
-  // Wait for it to be released first: ext0 wakes on a level, so arming it
-  // while the button is still down wakes the board on the press that slept it.
-  while (digitalRead(PIN_BTN_R) == LOW) delay(10);
-  delay(60);                       // let the contact stop bouncing
+  // The press that started this has to end before the release can mean
+  // anything, or the same hold would wake it again immediately.
+  while (digitalRead(PIN_BTN_R) == LOW) vTaskDelay(pdMS_TO_TICKS(10));
+  vTaskDelay(pdMS_TO_TICKS(80));   // contact bounce
 
-  esp_sleep_enable_ext0_wakeup(GPIO_NUM_35, 0);
-  esp_deep_sleep_start();          // never returns; waking is a fresh boot
+  while (digitalRead(PIN_BTN_R) == HIGH) vTaskDelay(pdMS_TO_TICKS(25));
+
+  tft.writecommand(0x11);          // SLPOUT
+  delay(120);                      // the ST7789 wants ~120 ms out of sleep
+  tft.writecommand(0x29);          // DISPON
+  backlight_set(BL_LEVELS[cfg.bl_idx]);
+
+  g_standby = false;
+  // The numbers on screen are as old as the standby was long. Ask for a fresh
+  // reading rather than showing a stale one and calling it live.
+  g_force = true;
+  Serial.println("[peek] awake");
+
+  // Do not let the press that woke it also register as a brightness tap.
+  while (digitalRead(PIN_BTN_R) == LOW) vTaskDelay(pdMS_TO_TICKS(10));
 }
 
 void loop() {
@@ -2264,7 +2429,7 @@ void loop() {
       // Not in setup mode: sleeping there would take the configuration portal
       // down mid-form, and the way out would be a power cycle.
       right_fired = true;
-      enter_sleep();
+      enter_standby();
     }
   } else {
     if (right_down && !right_fired && now - right_down > 30) {

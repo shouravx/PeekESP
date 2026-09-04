@@ -45,6 +45,21 @@ def main():
     if not cli:
         sys.exit("arduino-cli not found - run: python tools/setup_arduino.py")
 
+    # LVGL looks for lv_conf.h one directory ABOVE its own folder, so the file
+    # that governs the build is the copy in the libraries directory, not the one
+    # in this repository. Editing the repo copy and rebuilding therefore appears
+    # to work and changes nothing - which is exactly what happened when a font
+    # was enabled here and the firmware came out 83 KB smaller than it should
+    # have, rendering a clock at a fifth of the intended size with no error.
+    # Syncing before every export means the shipped binary always matches the
+    # configuration in the repository.
+    src = REPO / "lv_conf.h"
+    dst = setup.libraries_dir() / "lv_conf.h"
+    if src.exists() and dst.parent.exists():
+        if not dst.exists() or dst.read_bytes() != src.read_bytes():
+            shutil.copyfile(src, dst)
+            print(f"lv_conf.h -> {dst}  (was out of date)")
+
     OUT.mkdir(exist_ok=True)
     print("compiling ...")
     r = subprocess.run([str(cli), "compile", "--fqbn", FQBN,

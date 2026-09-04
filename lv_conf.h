@@ -54,6 +54,12 @@
 #define LV_FONT_MONTSERRAT_12  1
 #define LV_FONT_MONTSERRAT_14  1
 #define LV_FONT_MONTSERRAT_20  1
+/* 44 is for the clock page and nothing else. A time that has to be read from
+ * across a desk needs to be the size of the thing you are reading it on, and
+ * 20 px is a caption. Each enabled face is a glyph bitmap set compiled into
+ * flash, so this is not free - but at 39 % of a 3 MB partition it is affordable
+ * where a second large face would start to be a decision. */
+#define LV_FONT_MONTSERRAT_44  1
 #define LV_FONT_DEFAULT        &lv_font_montserrat_14
 
 /*------------------

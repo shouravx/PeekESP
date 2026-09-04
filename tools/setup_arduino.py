@@ -104,6 +104,17 @@ def user_dir(cli):
     return Path(r.stdout.strip() or (Path.home() / "Documents" / "Arduino"))
 
 
+def libraries_dir(cli=None):
+    """Where LVGL will actually look for lv_conf.h.
+
+    It searches one directory ABOVE its own folder, so the file that governs a
+    build is this copy - not the one in the repository. Anything that compiles
+    the sketch needs to be able to find it, or an edit to the repo's lv_conf.h
+    silently does nothing.
+    """
+    return user_dir(cli or cli_path()) / "libraries"
+
+
 def patch_tft_setup(libs):
     """
     TFT_eSPI picks its board by an #include in User_Setup_Select.h, and the
