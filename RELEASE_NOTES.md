@@ -1,51 +1,125 @@
-# PeekESP v1.0.0
+# PeekESP v1.1.0
 
 A physical system-metrics dashboard. An ESP32 with a 1.14" display shows live
-CPU, RAM, storage, temperature and network throughput for a machine anywhere on
+CPU, RAM, storage, temperature and network throughput for machines anywhere on
 the internet — no port forward, no VPN, no account.
 
 By [shouravx](https://github.com/shouravx) · MIT
 
 ---
 
-## Setup is one code
+## New in 1.1.0
+
+### One code, several machines
+
+A pairing code identifies *you*, not a machine. Run the agent on a Windows box,
+a Mac and a DietPi with the same code and all three appear on the display; the
+left button swipes between them. Six per code.
+
+Before this they overwrote a single slot in turn, which on the display looked
+exactly like one flapping agent — the worst possible failure for a monitor,
+because it is indistinguishable from a real problem with the machine you were
+watching.
+
+Swiping costs nothing. One poll already carried every machine, so a display
+makes the same number of requests whether it shows one or six.
+
+### Install on Linux in one line
 
 ```bash
-python quickstart.py
+curl -fsSL https://raw.githubusercontent.com/shouravx/PeekESP/main/dietpi/install.sh | sudo sh
 ```
 
-Builds the Windows app and flashes the board. Then the device shows a code:
+Asks for the pairing code, derives the relay URL, stream and push token
+locally, installs a hardened systemd service, and **waits to confirm the
+machine is actually pushing** before saying it worked. A rejected push says so,
+and says the usual cause is the wrong code.
 
-```
-K7M2-P4QX-9R
-```
+Then everything is managed with a `peekesp` command — `status`, `logs -f`,
+`test`, `pair`, `set interval 15`, `update`, `uninstall`. The unit passes no
+flags at all; settings live in a config file, so changing the poll interval
+rewrites one line rather than regenerating a unit.
 
-Type it into the app. Done — the relay URL, the stream and both tokens are
-derived from that code on both sides, and the relay never sees it.
+`peekesp status` answers the question that actually matters, which is not
+whether a service is running: a rejected push leaves the unit perfectly active
+while nothing reaches the display.
 
-Nothing else is typed. No account, no token to copy, no port to forward.
+### Storage is every disk
+
+It reported the system drive only. A machine with a full 240 GB SSD and two
+mostly empty 1 TB disks read 95 % when it was 57 % full — the honest number was
+on the drives nobody asked about. Both agents now sum every real disk, and the
+device shows `STORAGE  906G FREE` beside the bar.
+
+### Temperature on Windows
+
+This had never worked, and not for the reason previously stated. The WMI
+fallback referenced `subprocess` in a module that never imported it, so every
+attempt raised `NameError` into a bare `except Exception` and came back as
+"this machine has no temperature sensor".
+
+With that fixed there is a source that needs nothing installed and no
+administrator: the thermal-zone performance counter. It reports an ACPI zone
+rather than the CPU die, so it reads cooler than LibreHardwareMonitor would for
+the same machine — which the docs now say plainly, because an unexplained 28 °C
+on a busy laptop looks like a bug. LibreHardwareMonitor still comes first when
+it is running.
+
+### Battery, and a power screen
+
+The last page of the swipe carousel shows the board's own cell — charge,
+voltage, and whether something is holding it up — and underneath it, the
+battery of the machine you were just looking at.
+
+It does not appear on its own. An earlier build raised it whenever the charge
+state changed, which on a board resting near the threshold meant every couple
+of seconds, over the top of whatever you were reading. There is hysteresis now.
+
+Honest limit: the T-Display exposes no charge-status pin, so state is inferred
+from voltage. A cell being topped up at 3.9 V reads exactly like one
+discharging at 3.9 V.
+
+### The board can be woken again
+
+Holding the right button sleeps it. **GPIO 0 cannot be the wake pin** — it is a
+strapping pin, and deep-sleep wake is a reset, so held low across it the ESP32
+comes up in the serial bootloader instead of running the sketch. The symptom is
+a board that sleeps and will not come back, and pressing harder or longer makes
+it worse because holding it low is the trigger. Wake is GPIO 35 now, so the
+button that sleeps it is the one that wakes it.
+
+### Windows packaging
+
+`package.py` builds, zips both executables, writes the SHA-256 beside it and
+generates winget manifests with the hash already in them, cross-checked against
+the archive. The build passes `--noupx`, because UPX-packed binaries are one of
+the strongest heuristics antivirus engines have.
+
+**The executables are unsigned**, so SmartScreen warns the first time. *More
+info → Run anyway.* [SIGNING.md](windows/SIGNING.md) explains what a
+self-signed certificate does *not* fix — it is trusted by exactly one machine —
+and what the real options cost.
 
 ---
 
 ## What's in the box
 
 **Firmware** — LVGL dashboard on a LilyGO TTGO T-Display. Two arcs, a bar, a
-temperature and throughput panel. Values sweep to new readings over 500 ms
-rather than snapping; the gauges run on a 0–1000 range so a 3 % change still
-resolves into a visible sweep instead of a staircase. Boot logo, on-device WiFi
-setup portal with a QR code to join it, and a status line that names what it is
-doing.
+temperature and throughput panel, and a power page. Values sweep to new
+readings over 500 ms rather than snapping. Swiping between machines slides the
+whole dashboard body as one object, with values swapped at the midpoint while
+nothing is visible.
 
-**Cloudflare Worker relay** — the host pushes, the device polls, both only ever
+**Cloudflare Worker relay** — the hosts push, the device polls, both only ever
 dial *out*. Three modes on one deployment: paired (no secrets at all), private
-(two tokens), shared (named streams for several people). 50 automated tests.
+(two tokens), shared (named streams). 74 automated tests plus 17 live checks
+against the real deployment.
 
-**Agents** — Linux (`dietpi/peek-agent.py`) and Windows, both standard-library
-only. The Windows build adds a tray app with a settings window, and a headless
-`peek-agent.exe` for running as a service.
+**Agents** — Linux and Windows, both standard-library only. The Windows build
+adds a tray app with a settings window and a headless `peek-agent.exe`.
 
-**Prebuilt firmware** — `firmware/PeekESP-merged.bin`, 1.25 MB. Flashing needs
-no Arduino IDE, no ESP32 core and no libraries; only esptool, about 3 MB.
+**Prebuilt firmware** — `firmware/PeekESP-merged.bin`. Flashing needs no
+Arduino IDE, no ESP32 core and no libraries; only esptool.
 
 ---
 
@@ -55,7 +129,7 @@ Two pinned FreeRTOS tasks sharing nothing but a mutex-guarded struct. Core 0
 does WiFi, NTP and the blocking HTTPS request. Core 1 runs `lv_timer_handler()`
 and never opens a socket, so a slow link cannot drop a frame.
 
-The pairing derivation is the same three lines in three languages:
+The pairing derivation is the same three lines in four languages:
 
 ```
 stream = SHA-256("peek-stream:" + CODE)  first 16 hex
@@ -63,15 +137,11 @@ push   = SHA-256("peek-push:"   + CODE)  first 48 hex
 read   = SHA-256("peek-read:"   + CODE)  first 48 hex
 ```
 
-C++ on the device, Python in the app, JavaScript in the tests — pinned against
-vectors generated independently by `openssl`, because a drift between any two
-would mean the PC and the device derive different streams and never meet, with
-every request still looking perfectly valid.
-
-Paired streams authenticate by trust-on-first-use. The guarantee is precisely
-*"once a role is claimed, only that token works"* — not *"only the right token
-was ever possible"*. Squatting an unclaimed stream requires the 16-hex id,
-which requires the code.
+C++ on the device, Python in the Windows app, Python again in the Linux agent,
+JavaScript in the Worker — all pinned against vectors generated independently
+by `openssl`. A drift between any two would mean a machine pushing to a stream
+the device never reads, with every request still looking perfectly valid from
+both ends.
 
 ---
 
@@ -79,74 +149,45 @@ which requires the code.
 
 | | |
 |---|---|
-| Firmware | compiles clean, no warnings, 39 % of a 3 MB partition |
-| Worker | 50 unit tests, plus 9 live checks against the real deployment |
-| Pairing | full round-trip proven end to end on the deployed Worker |
-| Windows app | both executables run; settings window driven by smoke tests |
-| CI | deploys the Worker on merge, proven with a real change |
+| Firmware | compiles clean under `--warnings all`, 39 % of a 3 MB partition |
+| Worker | 74 unit tests, plus 17 live checks against the real deployment |
+| Multi-device | three machines under one code, proven live end to end |
+| Agents | Windows snapshot checked against PowerShell; Linux tested with stubbed `/proc` |
+| Packaging | manifests pass `winget validate`; zip cross-checked, negative-tested |
 
 ## Not verified
 
-The display was brought up on real hardware late, and several things there have
-been exercised only briefly or not at all: the boot splash, the QR setup portal,
-the on-device SHA-256 derivation, and the TLS handshake under poor signal. The
-device-side code compiles and the parts that have run, worked — but this is a
-1.0.0, not a soak-tested release.
+**None of the device-side work in this release has run on hardware.** It
+compiles; that is all that can be said. The swipe, the power page, deep sleep
+and the wake button get their first run when you flash it.
+
+The charging threshold is a documented guess — 4.32 V — because there is no
+charge-status pin to check it against. The voltage is on screen next to the
+percentage so it can be corrected against a real board.
+
+`winget install --manifest` was not run: it needs administrator rights. The
+winget-pkgs pipeline installs on a clean VM, which is the real test.
 
 ---
 
 ## Known limits
 
-**The free tier is a request budget, not a device count.** Cloudflare allows
-100,000 requests/day. At a 5-second interval each agent costs 17,280 and each
-display costs 17,280, so a display with two machines is ~52k and fits, while a
-display with four is ~86k and is close to the edge. A display costs the same
-whether it shows one machine or six — one poll returns all of them. Raising the
-interval to 15 s divides everything by three.
+**The free tier is a request budget, not a device count.** At a 5-second
+interval each agent costs 17,280 requests/day and each display 17,280, against
+Cloudflare's 100,000. A display with two machines is ~52k and fits; four is
+~86k and is close. `peekesp set interval 15` divides it by three.
 
-**Temperature on Windows is an ACPI zone unless you install something.** A CPU
-die temperature sits behind a kernel driver that reads the chip's MSRs, so the
-only way to get one is LibreHardwareMonitor with its web server on. Without it
-the agent falls back to the thermal-zone performance counter, which needs no
-driver and no administrator but reports wherever the board vendor put a sensor —
-usually well below the CPU. It is a real reading of a real place; it just isn't
-the die. Linux needs none of this; `/sys/class/thermal` is enough.
+**Temperature on Windows is an ACPI zone** unless LibreHardwareMonitor is
+running. Real reading, real place, not the CPU die.
 
-**2.4 GHz only, WPA2.** An ESP32 has no 5 GHz radio. A network that does not
-appear in the scan list is usually 5 GHz-only or WPA3-only rather than a fault.
+**2.4 GHz only, WPA2.** An ESP32 has no 5 GHz radio.
 
 **Re-flashing keeps the pairing code.** It lives in NVS and survives a firmware
-update, which is correct and surprising the first time you want a new one. Use
-`python tools/flash.py --erase`.
+update. `python tools/flash.py --erase` gets a new one.
 
 **An ESP32 cannot join a Tailscale network.** Tailscale is WireGuard plus a
-control plane — node registration, rotating keys, DERP relays — and none of that
-has an embedded client. The relay exists because of this.
-
----
-
-## Notable fixes during development
-
-Several of these were only findable by running the thing, and are worth
-recording because each looked like something else:
-
-- **Watchdog reboot loop.** Core 0 is the core allowed to block, so the idle-task
-  watchdog on it was always contradictory. `WebServer::handleClient()` waits up
-  to 5 s for a client that never finishes its request — exactly what captive
-  portal probes do — and that starved IDLE0 at precisely the watchdog timeout.
-- **SSIDs were injected into the setup page unescaped.** An SSID is chosen by
-  whoever owns the access point; a neighbour naming theirs `"><script>…` had
-  script execution on the page where the WiFi password is typed.
-- **Cloudflare bans the default `Python-urllib` user agent** with error 1010,
-  before the Worker runs. Every push would have failed with an opaque 403 that
-  looks exactly like an auth problem.
-- **A build that succeeded and produced a broken binary.** Excluding `email`
-  from PyInstaller built cleanly and died at launch, because `http.server`
-  imports it.
-- **A build that failed and left the previous binary in place**, so the test
-  afterwards passed against stale code.
-- **`LV_USE_SPINNER` and `LV_USE_QRCODE` default to 0** in LVGL and fail at
-  *link* time, not compile time.
+control plane, and none of that has an embedded client. The relay exists
+because of this.
 
 ---
 
