@@ -15,6 +15,17 @@
  *                The device raises its own access point and serves a config
  *                page; the screen shows a QR code that joins you to it.
  *
+ *  One pairing code can carry several machines - a desktop, a laptop and a
+ *  Pi all running the agent with the same code. The relay returns them in one
+ *  response, so the display costs one request however many it shows, and the
+ *  left button swipes between them.
+ *
+ *  Buttons, both of which do two things depending on how long you hold:
+ *    LEFT  (BOOT, GPIO0)  tap  next machine (or refresh, if there is only one)
+ *                         hold setup mode
+ *    RIGHT (GPIO35)       tap  backlight brightness
+ *                         hold deep sleep; the left button wakes it
+ *
  *  ----------------------------------------------------------------------
  *  ARDUINO IDE SETUP (do these once, or nothing will compile / display)
  *  ----------------------------------------------------------------------
@@ -91,6 +102,7 @@
 #define HTTP_TIMEOUT_MS          8000  // TLS handshakes need more than plain HTTP
 #define MAX_CONSECUTIVE_FAILURES 12    // ~60 s of nothing -> reboot the stack
 #define SETUP_HOLD_MS            1500  // left-button hold that forces setup mode
+#define SLEEP_HOLD_MS            1200  // right-button hold that sleeps the board
 #define STALE_AFTER_S            30    // relay data older than this reads as stale
 
 // How the device reaches its telemetry. Both go through a Cloudflare Worker
@@ -175,6 +187,29 @@ struct Telemetry {
   char     host[20]        = "dietpi";
 };
 
+// A pairing code identifies a person, not a machine, so the relay hands back a
+// list and the display swipes through it. Six matches the relay's own cap: a
+// smaller number here would silently drop machines that the relay is perfectly
+// happy to hold.
+#define MAX_DEVICES 6
+
+struct DeviceSet {
+  Telemetry d[MAX_DEVICES];
+  uint8_t   n = 0;
+
+  // The link is healthy if ANY machine is reporting. A laptop shut for the
+  // night must not make the relay itself look broken - that sends someone to
+  // check their network over a machine they deliberately switched off.
+  uint32_t freshest_age_s() const {
+    if (!n) return 0xFFFFFFFFu;
+    uint32_t best = d[0].age_s;
+    for (uint8_t i = 1; i < n; i++) {
+      if (d[i].age_s < best) best = d[i].age_s;
+    }
+    return best;
+  }
+};
+
 enum NetState : uint8_t {
   NET_BOOT, NET_WIFI, NET_TIME, NET_TUNNEL, NET_ONLINE, NET_STALE, NET_ERROR
 };
@@ -209,7 +244,22 @@ struct Config {
 static Config            cfg;
 static Preferences       prefs;
 
-static Telemetry         g_telemetry;              // guarded by g_lock
+static DeviceSet         g_devset;                 // guarded by g_lock
+
+// Read by loop() so a tap knows whether there is anything to swipe to. Written
+// by core 0; a torn byte would at worst cost one press.
+static volatile uint8_t  g_device_count = 0;
+
+// Buttons run on core 1 beside the UI task but must never touch LVGL, so a tap
+// leaves a step here and the UI timer picks it up on its next tick.
+static volatile int8_t   g_view_step = 0;
+
+// Core 1 only: which machine is on screen, and the state of the swipe.
+static DeviceSet         g_shown;
+static uint8_t           g_view         = 0;
+static uint8_t           g_view_pending = 0;
+static int8_t            g_slide_dir    = 1;
+static bool              g_sliding      = false;
 static SemaphoreHandle_t g_lock = nullptr;
 
 static volatile NetState g_state    = NET_BOOT;
@@ -238,8 +288,17 @@ static lv_disp_draw_buf_t draw_buf;
 static lv_color_t lv_buf[SCREEN_W * 40];
 
 static const int PIN_BL      = 4;
-static const int PIN_BTN_L   = 0;    // "BOOT" - refresh, or hold for setup mode
-static const int PIN_BTN_R   = 35;   // cycle backlight brightness
+// Both buttons do two things, chosen by how long they are held. The pairing
+// screen and the footer say which, because a button whose function you have to
+// remember is a button nobody presses.
+//
+//   LEFT  (BOOT, GPIO0)  tap  - next machine, or force a refresh if there is
+//                              only one to look at
+//                        hold - setup mode
+//   RIGHT (GPIO35)       tap  - backlight brightness
+//                        hold - deep sleep, woken by the left button
+static const int PIN_BTN_L   = 0;
+static const int PIN_BTN_R   = 35;
 static const int BL_CHANNEL  = 0;
 
 static const uint8_t BL_LEVELS[] = { 255, 150, 70, 20 };
@@ -458,6 +517,8 @@ static bool consume_setup_request() {
 //  Widgets   (struct Gauge is declared up in the TYPES section)
 // ============================================================================
 static Gauge     g_cpu, g_ram;
+static lv_obj_t *g_body      = nullptr;   // everything that slides on a swipe
+static lv_obj_t *g_lbl_which = nullptr;   // "2/3", hidden with a single machine
 static lv_obj_t *g_bar       = nullptr;
 static lv_obj_t *g_bar_value = nullptr;
 static lv_obj_t *g_lbl_store = nullptr;
@@ -663,12 +724,35 @@ static void build_dashboard_ui() {
   lv_obj_t *scr = lv_scr_act();
   screen_base(scr);
 
+  // Everything that belongs to one machine lives in this container, so
+  // swiping to another is one animation on one object rather than a dozen
+  // co-ordinated ones. LVGL clips children to their parent, so a body parked
+  // at x = -240 is genuinely off-screen rather than drawn over the next one.
+  //
+  // Created before the header so the header, the status dot and the pairing
+  // overlay all draw on top of it; it is transparent, so it costs nothing.
+  g_body = lv_obj_create(scr);
+  lv_obj_remove_style_all(g_body);
+  lv_obj_set_size(g_body, SCREEN_W, SCREEN_H);
+  lv_obj_set_pos(g_body, 0, 0);
+  lv_obj_clear_flag(g_body, LV_OBJ_FLAG_SCROLLABLE);
+
   // ---- header ----
   make_label(scr, F_SM, COL_CYAN, 8, 3, "PEEK");
-  g_lbl_host = make_label(scr, F_SM, COL_TEXT_DIM, 44, 3, "// dietpi");
+  g_lbl_host = make_label(g_body, F_SM, COL_TEXT_DIM, 44, 3, "// dietpi");
+  lv_obj_set_width(g_lbl_host, 92);
+  lv_label_set_long_mode(g_lbl_host, LV_LABEL_LONG_CLIP);
 
-  g_lbl_ping = make_label(scr, F_SM, COL_TEXT_DIM, 140, 3, "-- ms");
-  lv_obj_set_width(g_lbl_ping, 66);
+  // Which of several machines is on screen. Hidden outright when there is only
+  // one, because "1/1" is noise on a 1.14" display.
+  g_lbl_which = make_label(scr, F_SM, COL_CYAN, 136, 3, "");
+  lv_obj_set_width(g_lbl_which, 26);        // "6/6" and no wider
+  lv_obj_set_style_text_align(g_lbl_which, LV_TEXT_ALIGN_RIGHT, 0);
+
+  // 44 px is what "999 ms" needs. Anything slower is rendered as seconds
+  // rather than allowed to grow into the indicator beside it.
+  g_lbl_ping = make_label(scr, F_SM, COL_TEXT_DIM, 162, 3, "-- ms");
+  lv_obj_set_width(g_lbl_ping, 44);
   lv_obj_set_style_text_align(g_lbl_ping, LV_TEXT_ALIGN_RIGHT, 0);
 
   lv_obj_t *rule = lv_obj_create(scr);
@@ -700,11 +784,11 @@ static void build_dashboard_ui() {
   lv_obj_set_style_outline_width(g_dot, 0, 0);
 
   // ---- gauges ----
-  make_gauge(&g_cpu, scr,  6, 23, COL_CYAN,    "CPU %");
-  make_gauge(&g_ram, scr, 78, 23, COL_MAGENTA, "RAM %");
+  make_gauge(&g_cpu, g_body,  6, 23, COL_CYAN,    "CPU %");
+  make_gauge(&g_ram, g_body, 78, 23, COL_MAGENTA, "RAM %");
 
   // ---- temperature / throughput panel ----
-  lv_obj_t *panel = lv_obj_create(scr);
+  lv_obj_t *panel = lv_obj_create(g_body);
   lv_obj_remove_style_all(panel);
   lv_obj_set_size(panel, 84, 66);
   lv_obj_set_pos(panel, 150, 23);
@@ -725,18 +809,18 @@ static void build_dashboard_ui() {
   // Not a static caption any more: once the host reports capacity this becomes
   // "STORAGE  906G FREE", which is the number people actually want. It stays
   // left of x=162 so it cannot collide with the percentage.
-  g_lbl_store = make_label(scr, F_SM, COL_TEXT_DIM, 8, 92, "STORAGE");
+  g_lbl_store = make_label(g_body, F_SM, COL_TEXT_DIM, 8, 92, "STORAGE");
   // Bounded rather than measured: the default long mode wraps, which would put
   // a second line straight through the bar at y=108, and an unbounded label on
   // a 12 TB array would reach the percentage. Clipping does neither.
   lv_obj_set_width(g_lbl_store, 150);
   lv_label_set_long_mode(g_lbl_store, LV_LABEL_LONG_CLIP);
 
-  g_bar_value = make_label(scr, F_SM, COL_TEXT, 162, 92, "0%");
+  g_bar_value = make_label(g_body, F_SM, COL_TEXT, 162, 92, "0%");
   lv_obj_set_width(g_bar_value, 70);
   lv_obj_set_style_text_align(g_bar_value, LV_TEXT_ALIGN_RIGHT, 0);
 
-  g_bar = lv_bar_create(scr);
+  g_bar = lv_bar_create(g_body);
   lv_obj_set_size(g_bar, 226, 8);
   lv_obj_set_pos(g_bar, 7, 108);
   lv_bar_set_range(g_bar, 0, 1000);
@@ -749,7 +833,7 @@ static void build_dashboard_ui() {
   lv_obj_set_style_radius(g_bar, 4, LV_PART_INDICATOR);
 
   // ---- footer ----
-  g_lbl_foot  = make_label(scr, F_SM, COL_TEXT_DIM,   8, 118, "waiting for host");
+  g_lbl_foot  = make_label(g_body, F_SM, COL_TEXT_DIM,   8, 118, "waiting for host");
   g_lbl_state = make_label(scr, F_SM, COL_TEXT_DIM, 124, 118, "BOOT");
   lv_obj_set_width(g_lbl_state, 108);
   lv_obj_set_style_text_align(g_lbl_state, LV_TEXT_ALIGN_RIGHT, 0);
@@ -799,8 +883,10 @@ static void build_pair_overlay(lv_obj_t *scr) {
   lv_obj_set_width(g_lbl_pair_hint, 224);
   lv_obj_set_style_text_align(g_lbl_pair_hint, LV_TEXT_ALIGN_CENTER, 0);
 
+  // The only place both holds are ever spelled out. A button whose function
+  // you have to remember is a button nobody presses.
   make_label(g_pair_panel, F_SM, COL_TEXT_DIM, 8, 116,
-             "hold left button to change settings");
+             "hold L: settings   hold R: sleep");
 }
 
 // ---------------------------------------------------------------------------
@@ -977,16 +1063,47 @@ static void ui_sync_cb(lv_timer_t *t) {
     else      lv_obj_add_flag(g_spinner, LV_OBJ_FLAG_HIDDEN);
   }
 
+  // A button press is a reason to redraw even when no new data has arrived.
+  const int8_t step = g_view_step;
+  if (step) {
+    g_view_step = 0;
+    view_step(step);
+  }
+
   const uint32_t seq = g_seq;
   if (seq == last_seq) return;
 
-  Telemetry snap;
   if (xSemaphoreTake(g_lock, 0) != pdTRUE) return;   // never block the UI
-  snap = g_telemetry;
+  g_shown = g_devset;
   xSemaphoreGive(g_lock);
   last_seq = seq;
 
   pairing_done();          // first reading means the app found us
+
+  // A machine dropping off the relay must not leave the view pointing past the
+  // end of the list, and one arriving must not silently move what is on screen.
+  if (g_view >= g_shown.n) g_view = g_shown.n ? g_shown.n - 1 : 0;
+
+  // Mid-swipe the body is parked off-screen with the OLD machine's values
+  // still in it. Writing the new ones now would show the wrong data sliding
+  // in; the swipe writes them itself at the point where nothing is visible.
+  if (!g_sliding) render_selected();
+}
+
+// ---------------------------------------------------------------------------
+//  Rendering one machine, and sliding between two.
+//
+//  Split out of the sync callback because a swipe has to redraw with no new
+//  data, and has to do it at a precise moment - while the body is off-screen.
+// ---------------------------------------------------------------------------
+static void render_selected() {
+  if (!g_shown.n) return;
+  const Telemetry snap = g_shown.d[g_view];
+
+  if (g_shown.n > 1) lv_label_set_text_fmt(g_lbl_which, "%u/%u",
+                                           (unsigned)(g_view + 1), (unsigned)g_shown.n);
+  else               lv_label_set_text(g_lbl_which, "");
+
   gauge_set(&g_cpu, snap.cpu_percent);
   gauge_set(&g_ram, snap.ram_percent);
   bar_set(snap.storage_percent);
@@ -1010,13 +1127,71 @@ static void ui_sync_cb(lv_timer_t *t) {
   snprintf(buf, sizeof buf, LV_SYMBOL_DOWN " %s  " LV_SYMBOL_UP " %s", a, b);
   lv_label_set_text(g_lbl_net, buf);
 
-  fmt_uptime(buf, sizeof buf, snap.uptime_seconds);
+  // Per-machine staleness, not the link's. With several machines the relay can
+  // be perfectly healthy while this particular one has been off for an hour,
+  // and an uptime frozen at that moment would read as live.
+  if (snap.age_s > STALE_AFTER_S) {
+    fmt_uptime(a, sizeof a, snap.age_s);
+    snprintf(buf, sizeof buf, "silent %s", a + 3);   // skip fmt_uptime's "up "
+  } else {
+    fmt_uptime(buf, sizeof buf, snap.uptime_seconds);
+  }
   lv_label_set_text(g_lbl_foot, buf);
 
   snprintf(buf, sizeof buf, "// %s", snap.host);
   lv_label_set_text(g_lbl_host, buf);
 
-  lv_label_set_text_fmt(g_lbl_ping, "%d ms", (int)g_latency);
+  // A TLS handshake over a weak signal runs to several seconds, and "4213 ms"
+  // is both wider than the space and harder to read than "4.2 s".
+  const uint32_t ms = g_latency;
+  if (ms < 1000) snprintf(buf, sizeof buf, "%u ms", (unsigned)ms);
+  else           snprintf(buf, sizeof buf, "%.1f s", ms / 1000.0f);
+  lv_label_set_text(g_lbl_ping, buf);
+}
+
+static void view_slide_in_done(lv_anim_t *a) {
+  (void)a;
+  g_sliding = false;
+}
+
+// Halfway: the body is off-screen, so this is the one moment where swapping
+// every value at once is invisible.
+static void view_slide_swap(lv_anim_t *a) {
+  (void)a;
+  g_view = g_view_pending;
+  lv_obj_set_x(g_body, g_slide_dir * SCREEN_W);
+  render_selected();
+
+  lv_anim_t in;
+  lv_anim_init(&in);
+  lv_anim_set_var(&in, g_body);
+  lv_anim_set_exec_cb(&in, (lv_anim_exec_xcb_t)lv_obj_set_x);
+  lv_anim_set_values(&in, g_slide_dir * SCREEN_W, 0);
+  lv_anim_set_time(&in, 190);
+  lv_anim_set_path_cb(&in, lv_anim_path_ease_out);
+  lv_anim_set_ready_cb(&in, view_slide_in_done);
+  lv_anim_start(&in);
+}
+
+static void view_step(int8_t step) {
+  // Ignoring a press mid-swipe rather than queueing it: a queued swipe arrives
+  // after the animation people were already reading, which feels like a lag
+  // rather than a second step.
+  if (g_sliding || g_shown.n < 2) return;
+
+  g_view_pending = (uint8_t)((g_view + g_shown.n + step) % g_shown.n);
+  g_slide_dir    = step;
+  g_sliding      = true;
+
+  lv_anim_t out;
+  lv_anim_init(&out);
+  lv_anim_set_var(&out, g_body);
+  lv_anim_set_exec_cb(&out, (lv_anim_exec_xcb_t)lv_obj_set_x);
+  lv_anim_set_values(&out, 0, -g_slide_dir * SCREEN_W);
+  lv_anim_set_time(&out, 150);
+  lv_anim_set_path_cb(&out, lv_anim_path_ease_in);
+  lv_anim_set_ready_cb(&out, view_slide_swap);
+  lv_anim_start(&out);
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,12 +1258,29 @@ static bool time_sync(uint32_t timeout_ms) {
   return true;
 }
 
-static bool parse_payload(const String &payload, Telemetry &out) {
+static void parse_one(JsonObjectConst o, Telemetry &out) {
+  out.cpu_percent      = o["cpu_percent"]      | 0.0f;
+  out.ram_percent      = o["ram_percent"]      | 0.0f;
+  out.storage_percent  = o["storage_percent"]  | 0.0f;
+  out.storage_total_gb = o["storage_total_gb"] | 0.0f;
+  out.storage_free_gb  = o["storage_free_gb"]  | 0.0f;
+  out.cpu_temp_c       = o["cpu_temp_c"]       | -1.0f;
+  out.rx_kbps          = o["net_rx_kbps"]      | 0.0f;
+  out.tx_kbps          = o["net_tx_kbps"]      | 0.0f;
+  out.uptime_seconds   = o["uptime_seconds"]   | 0u;
+  out.age_s            = o["age_s"]            | 0u;   // relay only
+  strlcpy(out.host, o["host"] | "dietpi", sizeof out.host);
+}
+
+static bool parse_payload(const String &payload, DeviceSet &out) {
   // ArduinoJson 7 sizes itself; 6 needs the capacity up front.
 #if ARDUINOJSON_VERSION_MAJOR >= 7
   JsonDocument doc;
 #else
-  StaticJsonDocument<768> doc;   // two storage_*_gb fields wider than 1.0.0
+  // Six machines of ten fields each, plus the top-level copy of the freshest.
+  // Static sizing cannot stretch and a document one byte short fails the whole
+  // parse, which would look exactly like the relay being down.
+  DynamicJsonDocument doc(4096);
 #endif
   const DeserializationError err = deserializeJson(doc, payload);
   if (err) {
@@ -1096,22 +1288,28 @@ static bool parse_payload(const String &payload, Telemetry &out) {
     return false;
   }
 
-  out.cpu_percent     = doc["cpu_percent"]     | 0.0f;
-  out.ram_percent     = doc["ram_percent"]     | 0.0f;
-  out.storage_percent  = doc["storage_percent"]  | 0.0f;
-  out.storage_total_gb = doc["storage_total_gb"] | 0.0f;
-  out.storage_free_gb  = doc["storage_free_gb"]  | 0.0f;
-  out.cpu_temp_c       = doc["cpu_temp_c"]       | -1.0f;
-  out.rx_kbps         = doc["net_rx_kbps"]     | 0.0f;
-  out.tx_kbps         = doc["net_tx_kbps"]     | 0.0f;
-  out.uptime_seconds  = doc["uptime_seconds"]  | 0u;
-  out.age_s           = doc["age_s"]           | 0u;   // relay only
-  strlcpy(out.host, doc["host"] | "dietpi", sizeof out.host);
+  out.n = 0;
+
+  // The relay returns every machine behind the code in one response, which is
+  // what keeps a display costing one request no matter how many it shows.
+  JsonArrayConst devices = doc["devices"];
+  if (!devices.isNull()) {
+    for (JsonObjectConst o : devices) {
+      if (out.n >= MAX_DEVICES) break;
+      parse_one(o, out.d[out.n++]);
+    }
+  }
+
+  // A relay older than multi-device support returns a single flat object, and
+  // so does an agent polled directly. Both are still perfectly valid.
+  if (!out.n) {
+    parse_one(doc.as<JsonObjectConst>(), out.d[out.n++]);
+  }
   return true;
 }
 
 // --- RELAY: HTTPS to the Cloudflare Worker the host pushes into -------------
-static bool fetch_relay(Telemetry &out, uint32_t &latency_ms) {
+static bool fetch_relay(DeviceSet &out, uint32_t &latency_ms) {
   if (cfg.relay_url[0] == '\0') {
     Serial.println("[relay] no URL configured");
     return false;
@@ -1160,7 +1358,7 @@ static bool fetch_relay(Telemetry &out, uint32_t &latency_ms) {
   return parse_payload(payload, out);
 }
 
-static bool fetch(Telemetry &out, uint32_t &latency_ms) {
+static bool fetch(DeviceSet &out, uint32_t &latency_ms) {
   return fetch_relay(out, latency_ms);
 }
 
@@ -1205,7 +1403,7 @@ static void netTask(void *arg) {
       continue;
     }
 
-    Telemetry fresh;
+    DeviceSet fresh;
     uint32_t  latency = 0;
 
     g_busy = true;
@@ -1214,15 +1412,20 @@ static void netTask(void *arg) {
 
     if (ok) {
       if (xSemaphoreTake(g_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-        g_telemetry = fresh;
+        g_devset = fresh;
         xSemaphoreGive(g_lock);
-        g_latency = latency;
+        g_latency      = latency;
+        g_device_count = fresh.n;
         g_seq++;                 // publish last: the UI polls on this
       }
       // A reachable relay holding old data is a different fault from an
       // unreachable one: the network is fine, the host stopped reporting.
       // Showing LINK OK over frozen numbers would be the worst outcome.
-      g_state  = (fresh.age_s > STALE_AFTER_S) ? NET_STALE : NET_ONLINE;
+      //
+      // With several machines this asks about the freshest: one of them being
+      // switched off is that machine's business, and the dashboard says so on
+      // its own row rather than condemning the whole link.
+      g_state  = (fresh.freshest_age_s() > STALE_AFTER_S) ? NET_STALE : NET_ONLINE;
       failures = 0;
     } else {
       g_state = NET_ERROR;
@@ -1629,16 +1832,40 @@ void setup() {
   xTaskCreatePinnedToCore(uiTask, "ui", 8192, NULL, 2, NULL, 1);
 }
 
+// Deep sleep, entered by holding the right button. The panel has to be told
+// to sleep separately: cutting the backlight alone leaves the controller
+// driving a dark screen at full current, which is most of what there is to
+// save on a board with no other peripherals.
+static void enter_sleep() {
+  Serial.println("[peek] sleeping - press the left button to wake");
+  Serial.flush();
+
+  backlight_set(0);
+  tft.writecommand(0x28);          // DISPOFF
+  tft.writecommand(0x10);          // SLPIN
+  delay(120);                      // the ST7789 wants ~120 ms to settle
+
+  // ext0 wakes on a level rather than an edge, so the left button has to be
+  // released before this returns - otherwise a hold that overlapped both
+  // buttons would wake the board on the same press that slept it. The right
+  // button cannot do this job: it is the one being held right now.
+  while (digitalRead(PIN_BTN_L) == LOW) delay(10);
+
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+  esp_deep_sleep_start();          // never returns; waking is a fresh boot
+}
+
 void loop() {
   // Buttons only. This runs on core 1 alongside uiTask, so it must not call
   // into LVGL - it sets flags and pokes the backlight, nothing more.
-  static uint32_t left_down  = 0;
-  static bool     left_fired = false;
-  static uint32_t last_right = 0;
+  static uint32_t left_down   = 0;
+  static bool     left_fired  = false;
+  static uint32_t right_down  = 0;
+  static bool     right_fired = false;
 
   const uint32_t now = millis();
 
-  // --- left: tap to refresh, hold to drop into setup mode ---
+  // --- left: tap to swipe machines, hold to drop into setup mode ---
   if (digitalRead(PIN_BTN_L) == LOW) {
     if (!left_down) {
       left_down  = now;
@@ -1649,16 +1876,35 @@ void loop() {
       request_setup_mode();
     }
   } else {
-    if (left_down && !left_fired && now - left_down > 30) g_force = true;
+    if (left_down && !left_fired && now - left_down > 30) {
+      // Swiping costs nothing - the poll already carried every machine. Asking
+      // the relay again on each tap would multiply the request budget by how
+      // restless someone is feeling, so a refresh is only what the tap means
+      // when there is nothing to swipe to.
+      if (g_device_count > 1) g_view_step = 1;
+      else                    g_force     = true;
+    }
     left_down = 0;
   }
 
-  // --- right: cycle brightness, remembered across reboots ---
-  if (digitalRead(PIN_BTN_R) == LOW && now - last_right > 250) {
-    last_right = now;
-    cfg.bl_idx = (cfg.bl_idx + 1) % BL_LEVEL_COUNT;
-    backlight_set(BL_LEVELS[cfg.bl_idx]);
-    config_save_backlight();
+  // --- right: tap for brightness, hold to sleep ---
+  if (digitalRead(PIN_BTN_R) == LOW) {
+    if (!right_down) {
+      right_down  = now;
+      right_fired = false;
+    } else if (!right_fired && now - right_down > SLEEP_HOLD_MS && !g_setup_mode) {
+      // Not in setup mode: sleeping there would take the configuration portal
+      // down mid-form, and the way out would be a power cycle.
+      right_fired = true;
+      enter_sleep();
+    }
+  } else {
+    if (right_down && !right_fired && now - right_down > 30) {
+      cfg.bl_idx = (cfg.bl_idx + 1) % BL_LEVEL_COUNT;
+      backlight_set(BL_LEVELS[cfg.bl_idx]);
+      config_save_backlight();
+    }
+    right_down = 0;
   }
 
   // A reboot requested from the dashboard side lands here; the setup portal

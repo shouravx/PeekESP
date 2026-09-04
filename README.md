@@ -356,12 +356,19 @@ getting it wrong is swapped red and blue, not an error.
 
 ## Buttons
 
+Both buttons do two things, chosen by how long you hold them.
+
 | Button | Action |
 |---|---|
-| Left (GPIO 0) — tap | Refresh now instead of waiting out the poll interval |
+| Left (GPIO 0) — tap | Next machine. With only one machine paired there is nothing to swipe to, so it refreshes instead of waiting out the poll interval |
 | Left — hold 1.5 s | Reboot into setup mode |
 | Left — held at power-on | Boot straight into setup mode |
-| Right (GPIO 35) | Cycle backlight brightness — 100 / 59 / 27 / 8 %, remembered across reboots |
+| Left — press while asleep | Wake |
+| Right (GPIO 35) — tap | Cycle backlight brightness — 100 / 59 / 27 / 8 %, remembered across reboots |
+| Right — hold 1.2 s | Deep sleep. The panel is told to sleep as well as the backlight cut, since a dark screen still driven at full current is most of what there is to save |
+
+Swiping costs nothing: one poll already carried every machine, so the device
+makes the same number of requests whether you look at one or at six.
 
 ## Telemetry contract
 
