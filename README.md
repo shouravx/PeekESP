@@ -360,31 +360,44 @@ Both buttons do two things, chosen by how long you hold them.
 
 | Button | Action |
 |---|---|
-| Left (GPIO 0) — tap | Next machine. With only one machine paired there is nothing to swipe to, so it refreshes instead of waiting out the poll interval |
+| Left (GPIO 0) — tap | Next page — each machine in turn, then the power screen, then back to the first |
 | Left — hold 1.5 s | Reboot into setup mode |
 | Left — held at power-on | Boot straight into setup mode |
-| Left — press while asleep | Wake |
 | Right (GPIO 35) — tap | Cycle backlight brightness — 100 / 59 / 27 / 8 %, remembered across reboots |
 | Right — hold 1.2 s | Deep sleep. The panel is told to sleep as well as the backlight cut, since a dark screen still driven at full current is most of what there is to save |
+| Right — press while asleep | Wake |
 
-Swiping costs nothing: one poll already carried every machine, so the device
-makes the same number of requests whether you look at one or at six.
+Swiping costs nothing: one poll already carried every machine and the power
+page is local, so the device makes the same number of requests whether you look
+at one screen or at seven.
+
+> **The wake button is the right one, and it has to be.** GPIO 0 is a strapping
+> pin: held low across the reset that ends deep sleep, the ESP32 latches it and
+> comes up in the serial bootloader instead of running the sketch — a dark
+> screen and a board that looks dead until it is power-cycled. GPIO 35 is
+> RTC-capable, is not a strapping pin, and the board pulls it up externally, so
+> the button that sleeps the board is also the one that wakes it.
 
 ## Power screen
 
-Plug a charger in or pull it out and the device shows its **own** battery for
-six seconds — charge level, voltage, and whether something is holding it up —
-then fades back to the dashboard. Tap the left button to dismiss it sooner.
+The last page of the swipe carousel. Tap the left button past the last machine
+and you land on it: the board's own charge level and voltage, whether something
+is holding it up, and — on the line below — the battery of whichever machine you
+were just looking at.
 
-It is deliberately not a mode you can get stuck in. A desk gadget lives on USB,
-and a panel that took over whenever a charger was present would simply *be* the
-display.
+It does not appear on its own. An earlier version raised it whenever the charge
+state changed, which on a board whose voltage sits near the threshold meant it
+reappeared every couple of seconds over the top of whatever you were reading.
+The state now needs to climb past 4.32 V to count as charging and fall below
+4.20 V to stop, so a reading that wobbles inside that band changes nothing.
 
-This is the ESP32's own cell on the JST connector, not the monitored machine's
-battery. The board reads it through a 1:2 divider on GPIO 34, behind a MOSFET
-gated by GPIO 14 — a detail worth knowing, because leaving that pin low reads a
-floating node, which looks like a flat battery rather than like a measurement
-that never happened.
+Two different batteries are on this page. The big one is the **ESP32's own**
+cell on the JST connector, read through a 1:2 divider on GPIO 34 behind a MOSFET
+gated by GPIO 14 — worth knowing, because leaving that pin low reads a floating
+node, which looks like a flat battery rather than like a measurement that never
+happened. The line underneath is the **monitored machine's** battery, which the
+agent reports; a desktop says `no battery` there rather than showing an empty
+one.
 
 **What it can and cannot tell you.** The T-Display exposes no charge-status
 pin, so the state is inferred from voltage. A Li-ion cell off charge never sits
@@ -412,6 +425,10 @@ number to move.
   "storage_total_gb": 117.9,
   "storage_free_gb": 46.0,
   "cpu_temp_c": 48.3,
+  "battery_percent": 78,
+  "battery_charging": true,
+  "battery_ac": true,
+  "battery_minutes": 134,
   "uptime_seconds": 271830,
   "net_rx_kbps": 128.4,
   "net_tx_kbps": 12.9
@@ -464,6 +481,14 @@ drives are excluded. Linux counts each filesystem backed by a block device,
 deduplicated so a bind mount is not billed twice, and follows `df` — capacity is
 what a normal user can occupy, with root's reserved 5 % excluded from both the
 total and the free figure.
+
+`battery_percent` is `-1` on a machine with no battery, which the display shows
+as `no battery` rather than as a flat cell. `battery_charging` is the charging
+flag itself, not "plugged in": a laptop sitting on mains at 100 % reports
+`battery_ac: true, battery_charging: false`, because calling that *charging* is
+how a battery readout stops being believed. `battery_minutes` is `-1` whenever
+the OS declines to estimate, which it often does for the first minutes after a
+cable is moved.
 
 ## Troubleshooting
 

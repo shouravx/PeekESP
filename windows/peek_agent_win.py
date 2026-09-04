@@ -22,6 +22,7 @@ import ctypes.wintypes as w
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -240,9 +241,31 @@ def _storage():
 
 # Temperature is cached: the sources below are an HTTP request or a process
 # launch, neither of which belongs in a 2-second sampler.
-_temp = {"value": -1.0, "at": 0.0, "source": None}
+_temp = {"value": -1.0, "at": 0.0, "source": None, "misses": 0}
 TEMP_TTL = 20.0
+
+# A machine with no usable source at all backs off rather than launching
+# PowerShell every 20 seconds until the end of time.
+TEMP_TTL_MAX = 300.0
 LHM_PORTS = (8085, 8086)
+
+
+def _powershell(command, timeout=8):
+    """Run one PowerShell command and hand back stdout, or "" if it failed.
+
+    Catches what running a process can actually throw, and nothing else. A
+    bare `except Exception` here hid a missing `import subprocess` for the
+    whole life of the WMI fallback: every call raised NameError, was swallowed,
+    and came back as "this machine has no temperature sensor".
+    """
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 def _temp_from_hardware_monitor():
@@ -286,45 +309,123 @@ def _temp_from_hardware_monitor():
     return None
 
 
-def _temp_from_wmi():
-    """ACPI thermal zone. Needs administrator, and most desktops do not
-    implement the class at all - it is common on laptops and rare elsewhere."""
+def _temp_from_perf_zone():
+    """
+    The performance counter over the ACPI thermal zones. This is the one that
+    works on an ordinary machine: no driver to install, no administrator, and
+    present on Windows 8 and later.
+
+    What it is NOT is a CPU die temperature. An ACPI zone is wherever the board
+    vendor put a sensor - often the chassis or near the chipset - so it reads
+    well below what LibreHardwareMonitor would report for the same machine at
+    the same moment. That is why it sits second: a real CPU reading is better,
+    but a real chassis reading beats "--".
+    """
+    out = _powershell(
+        "$z = Get-CimInstance -ClassName "
+        "Win32_PerfFormattedData_Counters_ThermalZoneInformation "
+        "-ErrorAction Stop; "
+        "($z | Measure-Object -Property HighPrecisionTemperature -Maximum).Maximum")
     try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "(Get-CimInstance -Namespace root/wmi -ClassName "
-             "MSAcpi_ThermalZoneTemperature -ErrorAction Stop | "
-             "Select-Object -First 1).CurrentTemperature"],
-            capture_output=True, text=True, timeout=8,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        raw = r.stdout.strip()
-        if raw.isdigit():
-            c = int(raw) / 10.0 - 273.15
-            if 0 < c < 125:
-                return c
-    except Exception:
-        pass
-    return None
+        # Tenths of a Kelvin. The hottest zone, because a board with several
+        # is telling you about several different places and the warmest one is
+        # the one worth knowing about.
+        c = float(out) / 10.0 - 273.15
+    except ValueError:
+        return None
+    return c if 0 < c < 125 else None
+
+
+def _temp_from_wmi():
+    """ACPI thermal zone read directly. Needs administrator - unelevated it
+    returns Access denied - and plenty of boards do not implement the class."""
+    out = _powershell(
+        "(Get-CimInstance -Namespace root/wmi -ClassName "
+        "MSAcpi_ThermalZoneTemperature -ErrorAction Stop | "
+        "Select-Object -First 1).CurrentTemperature")
+    if not out.isdigit():
+        return None
+    c = int(out) / 10.0 - 273.15
+    return c if 0 < c < 125 else None
+
+
+# Best first. The two PowerShell ones cost a process launch each, which is why
+# the working source is remembered rather than rediscovered every time.
+_TEMP_SOURCES = (
+    ("hwmonitor", _temp_from_hardware_monitor),
+    ("perfzone", _temp_from_perf_zone),
+    ("acpi", _temp_from_wmi),
+)
 
 
 def _cpu_temp_c():
     now = time.monotonic()
-    if now - _temp["at"] < TEMP_TTL:
+
+    # A machine that has never produced a reading is asked less and less often,
+    # up to once every five minutes. One that has a working source is asked at
+    # the normal interval, because that answer is cheap and worth having fresh.
+    ttl = TEMP_TTL
+    if _temp["source"] is None and _temp["misses"]:
+        ttl = min(TEMP_TTL_MAX, TEMP_TTL * (1 + _temp["misses"]))
+    if now - _temp["at"] < ttl:
         return _temp["value"]
     _temp["at"] = now
 
-    val = _temp_from_hardware_monitor()
-    src = "hwmonitor"
-    if val is None and _temp["source"] in (None, "wmi"):
-        # Only ever retried if WMI has worked before, or has not been tried:
-        # a desktop where the class does not exist should not launch a
-        # PowerShell process every 20 seconds forever.
-        val = _temp_from_wmi()
-        src = "wmi"
+    known = _temp["source"]
+    order = [s for s in _TEMP_SOURCES if s[0] == known] if known else list(_TEMP_SOURCES)
 
-    _temp["value"] = val if val is not None else -1.0
-    _temp["source"] = src if val is not None else _temp["source"]
-    return _temp["value"]
+    for name, fn in order:
+        val = fn()
+        if val is not None:
+            _temp.update(value=val, source=name, misses=0)
+            return val
+
+    # The remembered source stopped answering - the monitor was closed, say.
+    # Forgetting it means the next tick tries everything again instead of
+    # reporting -1 forever because one thing went away.
+    _temp.update(value=-1.0, source=None, misses=_temp["misses"] + 1)
+    return -1.0
+
+
+class SYSTEM_POWER_STATUS(ctypes.Structure):
+    _fields_ = [("ACLineStatus", ctypes.c_ubyte),
+                ("BatteryFlag", ctypes.c_ubyte),
+                ("BatteryLifePercent", ctypes.c_ubyte),
+                ("SystemStatusFlag", ctypes.c_ubyte),
+                ("BatteryLifeTime", ctypes.c_ulong),
+                ("BatteryFullLifeTime", ctypes.c_ulong)]
+
+
+BATTERY_FLAG_CHARGING = 8
+BATTERY_FLAG_NO_BATTERY = 128
+UNKNOWN_BYTE = 255
+UNKNOWN_DWORD = 0xFFFFFFFF
+
+
+def _battery():
+    """(percent, charging, on_ac, minutes_left) for the monitored machine.
+
+    GetSystemPowerStatus rather than WMI's Win32_Battery: it is a plain kernel
+    call, needs no administrator, and does not cost a process launch - so it
+    can run on every snapshot instead of behind a cache. A desktop reports no
+    battery and the percent comes back as -1, which the display renders as
+    nothing at all rather than as a flat cell.
+    """
+    st = SYSTEM_POWER_STATUS()
+    if not kernel32.GetSystemPowerStatus(ctypes.byref(st)):
+        return -1, False, False, -1
+
+    on_ac = st.ACLineStatus == 1
+    if st.BatteryFlag & BATTERY_FLAG_NO_BATTERY or st.BatteryLifePercent == UNKNOWN_BYTE:
+        return -1, False, on_ac, -1
+
+    # Charging is its own flag, not "plugged in". A laptop sitting on AC at
+    # 100 % is plugged in and not charging, and calling that "charging" is how
+    # a battery readout stops being believed.
+    charging = bool(st.BatteryFlag & BATTERY_FLAG_CHARGING)
+    minutes = (-1 if st.BatteryLifeTime == UNKNOWN_DWORD
+               else int(st.BatteryLifeTime // 60))
+    return min(100, st.BatteryLifePercent), charging, on_ac, minutes
 
 
 def _uptime_seconds():
@@ -336,6 +437,7 @@ def snapshot():
     with _lock:
         rolling = dict(_state)
     pct, total, free = _storage()
+    bat_pct, bat_charging, bat_ac, bat_minutes = _battery()
     return {
         "host": socket.gethostname()[:19],       # the sketch stores 20 bytes
         "cpu_percent": round(rolling["cpu_percent"], 1),
@@ -344,6 +446,10 @@ def snapshot():
         "storage_total_gb": round(total / (1024 ** 3), 1),
         "storage_free_gb": round(free / (1024 ** 3), 1),
         "cpu_temp_c": round(_cpu_temp_c(), 1),
+        "battery_percent": bat_pct,          # -1 on a machine with no battery
+        "battery_charging": bat_charging,
+        "battery_ac": bat_ac,
+        "battery_minutes": bat_minutes,      # -1 when Windows will not estimate
         "uptime_seconds": _uptime_seconds(),
         "net_rx_kbps": round(rolling["net_rx_kbps"], 1),
         "net_tx_kbps": round(rolling["net_tx_kbps"], 1),

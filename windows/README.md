@@ -165,29 +165,45 @@ next size up.
 | `storage_total_gb` / `storage_free_gb` | the same call, as bytes |
 | `uptime_seconds` | `GetTickCount64` |
 | `net_rx_kbps` / `net_tx_kbps` | `GetIfTable`, deduplicated |
-| `cpu_temp_c` | LibreHardwareMonitor, else WMI, else `-1` — see below |
+| `cpu_temp_c` | LibreHardwareMonitor, else the thermal-zone perf counter, else WMI — see below |
+| `battery_*` | `GetSystemPowerStatus` |
 
 **Storage is every fixed disk.** `GetLogicalDrives` gives the mask,
 `GetDriveTypeW` filters it to `DRIVE_FIXED`, so removable, optical and mapped
 network drives don't inflate the total. Reporting `%SystemDrive%` alone said 95 %
 on a machine that was 57 % full, because the data lived on two other disks.
 
-**Temperature needs help on Windows.** There is no API for it: the value lives
-behind a kernel driver that reads the chip's MSRs, and nothing in user space can
-get at it. The agent tries, in order:
+**Temperature on Windows, in three attempts.** There is no single API for it —
+a CPU *die* temperature lives behind a kernel driver that reads the chip's MSRs,
+and nothing in user space can get at that. The agent tries, best first:
 
 1. **[LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)**
    (or OpenHardwareMonitor) with its web server enabled — *Options → Remote Web
-   Server → Run*, port 8085. This is the one that actually works. The agent
-   reads `/data.json` and prefers the CPU *package* sensor over the individual
-   cores, since the package is what a thermal readout normally means.
-2. **WMI** `MSAcpi_ThermalZoneTemperature` via PowerShell. Needs administrator,
-   and most desktop boards don't implement the class at all — it usually returns
-   *Access denied* or nothing.
-3. `-1`, which the display renders as `--` rather than a confident wrong number.
+   Server → Run*, port 8085. This is the only one that gives a real CPU
+   temperature. The agent reads `/data.json` and prefers the CPU *package*
+   sensor over the individual cores, since the package is what a thermal readout
+   normally means.
+2. **`Win32_PerfFormattedData_Counters_ThermalZoneInformation`.** No driver, no
+   administrator, present since Windows 8 — this is the one that works on an
+   ordinary machine. But an ACPI thermal zone is wherever the board vendor put a
+   sensor, often the chassis or near the chipset, so it reads well below what
+   LibreHardwareMonitor reports for the same machine at the same moment. If the
+   number looks implausibly cool, this is why. It is a real reading of a real
+   place; it just isn't the CPU die.
+3. **`MSAcpi_ThermalZoneTemperature`** read directly. Needs administrator —
+   unelevated it returns *Access denied* — and plenty of boards don't implement
+   the class.
 
-Results are cached for 20 s and the agent remembers which source worked, so a
-machine with neither doesn't spawn PowerShell every 20 seconds forever.
+Results are cached for 20 s and the working source is remembered, so a machine
+that has one doesn't pay for the others. A machine that has none backs off
+progressively to once every five minutes rather than launching PowerShell twice
+a minute forever.
+
+> This path was broken from the day it was written: `subprocess` was never
+> imported, so every PowerShell attempt raised `NameError` into a bare
+> `except Exception` and came back as "this machine has no temperature sensor".
+> The helper now catches only `OSError` and `SubprocessError`, so a coding
+> mistake surfaces as a crash instead of hiding as a missing sensor.
 
 **Network counters need deduplicating.** `GetIfTable` lists every NDIS *filter*
 bound to an adapter as its own row: one Realtek NIC typically appears four times

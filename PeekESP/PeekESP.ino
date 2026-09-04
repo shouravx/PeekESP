@@ -24,7 +24,7 @@
  *    LEFT  (BOOT, GPIO0)  tap  next machine (or refresh, if there is only one)
  *                         hold setup mode
  *    RIGHT (GPIO35)       tap  backlight brightness
- *                         hold deep sleep; the left button wakes it
+ *                         hold deep sleep; the same button wakes it
  *
  *  ----------------------------------------------------------------------
  *  ARDUINO IDE SETUP (do these once, or nothing will compile / display)
@@ -181,6 +181,10 @@ struct Telemetry {
   float    storage_total_gb = 0;      // 0 = host is older than these fields
   float    storage_free_gb  = 0;
   float    cpu_temp_c      = -1;      // <0 = host did not report one
+  int8_t   battery_percent  = -1;     // <0 = that machine has no battery
+  int16_t  battery_minutes  = -1;     // <0 = the OS would not estimate
+  bool     battery_charging = false;
+  bool     battery_ac       = false;
   float    rx_kbps         = 0;
   float    tx_kbps         = 0;
   uint32_t uptime_seconds  = 0;
@@ -260,14 +264,11 @@ static volatile int8_t   g_view_step = 0;
 // difference between "20 %" and "flat".
 static float             g_vref_scale = 1.0f;
 
-// Written by the UI task, read by the button loop: while the power panel is up
-// the left button dismisses it rather than swiping to the next machine.
-static volatile bool     g_pwr_visible = false;
-static volatile bool     g_pwr_dismiss = false;
 
 // Core 1 only: which machine is on screen, and the state of the swipe.
 static DeviceSet         g_shown;
-static uint8_t           g_view         = 0;
+static uint8_t           g_view         = 0;   // page: 0..n-1 machines, n power
+static uint8_t           g_dev_view     = 0;   // last machine page looked at
 static uint8_t           g_view_pending = 0;
 static int8_t            g_slide_dir    = 1;
 static bool              g_sliding      = false;
@@ -307,7 +308,7 @@ static const int PIN_BL      = 4;
 //                              only one to look at
 //                        hold - setup mode
 //   RIGHT (GPIO35)       tap  - backlight brightness
-//                        hold - deep sleep, woken by the left button
+//                        hold - deep sleep; the same button wakes it
 static const int PIN_BTN_L   = 0;
 static const int PIN_BTN_R   = 35;
 
@@ -328,14 +329,15 @@ static const int PIN_ADC_BAT = 34;
 // differently, this is the single number to move.
 #define VOLTS_CHARGING   4.32f
 
+// Falling back below this counts as no longer charging. The gap between the
+// two is deliberate: a single threshold makes a cell resting near it flip
+// state on almost every sample.
+#define VOLTS_DISCHARGE  4.20f
+
 // Below this nothing is connected, or ADC_EN never went high. Reporting 0 %
 // would be a confident wrong answer about a battery that is not there.
 #define VOLTS_ABSENT     1.00f
 
-// Long enough to read three numbers, short enough that a desk gadget which
-// lives on USB is not permanently showing its own battery instead of the
-// machine you asked it to watch.
-#define POWER_SHOW_MS    6000
 static const int BL_CHANNEL  = 0;
 
 static const uint8_t BL_LEVELS[] = { 255, 150, 70, 20 };
@@ -574,6 +576,7 @@ static lv_obj_t *g_pwr_bolt    = nullptr;
 static lv_obj_t *g_pwr_pct     = nullptr;
 static lv_obj_t *g_pwr_volts   = nullptr;
 static lv_obj_t *g_pwr_state   = nullptr;
+static lv_obj_t *g_pwr_host    = nullptr;
 static lv_obj_t *g_pair_panel   = nullptr;
 static lv_obj_t *g_lbl_code     = nullptr;
 static lv_obj_t *g_lbl_pair_hint = nullptr;
@@ -1001,8 +1004,15 @@ static void build_power_panel(lv_obj_t *scr) {
   lv_obj_set_width(g_pwr_state, 94);
   lv_label_set_long_mode(g_pwr_state, LV_LABEL_LONG_CLIP);
 
-  make_label(g_pwr_panel, F_SM, COL_TEXT_DIM, 8, 116,
-             "tap L: back   hold R: sleep");
+  // The monitored machine's own battery, which is a different thing from the
+  // board's and worth having on the same screen: this is the page you come to
+  // when you want to know what is running out of power.
+  g_pwr_host = make_label(g_pwr_panel, F_SM, COL_TEXT_DIM, 8, 98, "");
+  lv_obj_set_width(g_pwr_host, 224);
+  lv_label_set_long_mode(g_pwr_host, LV_LABEL_LONG_CLIP);
+
+  make_label(g_pwr_panel, F_SM, COL_TEXT_DIM, 8, 118,
+             "tap L: machines   hold R: sleep");
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,8 +1261,10 @@ static void ui_sync_cb(lv_timer_t *t) {
   pairing_done();          // first reading means the app found us
 
   // A machine dropping off the relay must not leave the view pointing past the
-  // end of the list, and one arriving must not silently move what is on screen.
-  if (g_view >= g_shown.n) g_view = g_shown.n ? g_shown.n - 1 : 0;
+  // last page. The power page is always the final one, so that is where an
+  // out-of-range view lands rather than on some arbitrary machine.
+  if (g_view > g_shown.n)     g_view = g_shown.n;
+  if (g_dev_view >= g_shown.n) g_dev_view = g_shown.n ? g_shown.n - 1 : 0;
 
   // Mid-swipe the body is parked off-screen with the OLD machine's values
   // still in it. Writing the new ones now would show the wrong data sliding
@@ -1266,8 +1278,49 @@ static void ui_sync_cb(lv_timer_t *t) {
 //  Split out of the sync callback because a swipe has to redraw with no new
 //  data, and has to do it at a precise moment - while the body is off-screen.
 // ---------------------------------------------------------------------------
+// How many machines are on the last page's battery line, and what it says.
+static void render_host_battery() {
+  if (!g_shown.n) {
+    lv_label_set_text(g_pwr_host, "");
+    return;
+  }
+
+  // Whichever machine you were looking at before swiping here, so this page
+  // answers a question you already had rather than picking one for you.
+  const Telemetry &t = g_shown.d[g_dev_view < g_shown.n ? g_dev_view : 0];
+  char buf[64], tail[24];
+
+  if (t.battery_percent < 0) {
+    snprintf(buf, sizeof buf, "%s  no battery", t.host);
+  } else {
+    if (t.battery_charging) {
+      snprintf(tail, sizeof tail, "charging");
+    } else if (t.battery_minutes > 0) {
+      char left[16];
+      fmt_ago(left, sizeof left, (uint32_t)t.battery_minutes * 60u);
+      snprintf(tail, sizeof tail, "%s left", left);
+    } else if (t.battery_ac) {
+      // On mains and not charging is a full battery, not a flat one, and
+      // saying "charging" there is how a battery readout stops being believed.
+      snprintf(tail, sizeof tail, "on AC");
+    } else {
+      snprintf(tail, sizeof tail, "on battery");
+    }
+    snprintf(buf, sizeof buf, "%s  %d%%  %s", t.host, (int)t.battery_percent, tail);
+  }
+  lv_label_set_text(g_pwr_host, buf);
+}
+
 static void render_selected() {
+  // The last page belongs to the board rather than to any machine, so its
+  // numbers come from the ADC sampler and only this line comes from telemetry.
+  if (g_view >= g_shown.n) {
+    render_host_battery();
+    return;
+  }
   if (!g_shown.n) return;
+
+  g_dev_view = g_view;
   const Telemetry snap = g_shown.d[g_view];
 
   if (g_shown.n > 1) lv_label_set_text_fmt(g_lbl_which, "%u/%u",
@@ -1322,121 +1375,75 @@ static void render_selected() {
 // ---------------------------------------------------------------------------
 //  Power panel: appears on a change of power source, then gets out of the way.
 // ---------------------------------------------------------------------------
-static void obj_set_opa(void *obj, int32_t v) {
-  lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)v, 0);
-}
-
 static void obj_set_w(void *obj, int32_t v) {
-  lv_obj_set_width((lv_obj_t *)obj, v);
+  lv_obj_set_width((lv_obj_t *)obj, (lv_coord_t)v);
 }
 
-static void power_hidden(lv_anim_t *a) {
-  (void)a;
-  lv_obj_add_flag(g_pwr_panel, LV_OBJ_FLAG_HIDDEN);
-  g_pwr_visible = false;
+// LVGL's own examples cast lv_obj_set_x straight to the animation callback
+// type, but lv_coord_t is a short and the callback takes an int32_t - calling
+// through a mismatched function pointer is undefined behaviour that happens to
+// work on this ABI. A wrapper costs nothing and is actually correct.
+static void obj_set_x(void *obj, int32_t v) {
+  lv_obj_set_x((lv_obj_t *)obj, (lv_coord_t)v);
 }
 
-static void power_hide() {
-  if (!g_pwr_visible) return;
-  lv_anim_t a;
-  lv_anim_init(&a);
-  lv_anim_set_var(&a, g_pwr_panel);
-  lv_anim_set_exec_cb(&a, obj_set_opa);
-  lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
-  lv_anim_set_time(&a, 260);
-  lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
-  lv_anim_set_ready_cb(&a, power_hidden);
-  lv_anim_start(&a);
-}
-
-static void power_show(uint8_t pct) {
-  lv_obj_set_style_opa(g_pwr_panel, LV_OPA_TRANSP, 0);
-  lv_obj_clear_flag(g_pwr_panel, LV_OBJ_FLAG_HIDDEN);
-  g_pwr_visible = true;
-
-  lv_anim_t fade;
-  lv_anim_init(&fade);
-  lv_anim_set_var(&fade, g_pwr_panel);
-  lv_anim_set_exec_cb(&fade, obj_set_opa);
-  lv_anim_set_values(&fade, LV_OPA_TRANSP, LV_OPA_COVER);
-  lv_anim_set_time(&fade, 220);
-  lv_anim_set_path_cb(&fade, lv_anim_path_ease_out);
-  lv_anim_start(&fade);
-
-  // The cell fills up as the panel arrives. 102 px is the inside of the shell.
-  lv_anim_t fill;
-  lv_anim_init(&fill);
-  lv_anim_set_var(&fill, g_pwr_fill);
-  lv_anim_set_exec_cb(&fill, obj_set_w);
-  lv_anim_set_values(&fill, 0, (102 * pct) / 100);
-  lv_anim_set_time(&fill, 620);
-  lv_anim_set_delay(&fill, 120);
-  lv_anim_set_path_cb(&fill, lv_anim_path_ease_out);
-  lv_anim_start(&fill);
-}
-
+// Sampled on a timer, drawn whenever the power page is the one on screen.
+// Nothing here shows or hides anything: this used to raise itself whenever the
+// charge state changed, which on a board whose voltage sits near the threshold
+// meant it reappeared every couple of seconds, over the top of whatever you
+// were actually trying to read. It is a page you swipe to now.
 static void power_tick() {
   static uint32_t next_sample = 0;
-  static uint32_t hide_at     = 0;
-  static bool     known       = false;
-  static bool     was_charged = false;
-  static uint8_t  pct         = 0;
-
   const uint32_t now = millis();
+  if ((int32_t)(now - next_sample) < 0) return;
+  next_sample = now + 2000;
 
-  if ((int32_t)(now - next_sample) >= 0) {
-    next_sample = now + 2000;
+  const float volts  = battery_volts();
+  const bool  absent = volts < VOLTS_ABSENT;
 
-    const float volts    = battery_volts();
-    const bool  absent   = volts < VOLTS_ABSENT;
-    const bool  charging = volts >= VOLTS_CHARGING;
-    pct = absent ? 0 : battery_percent(volts);
+  // Hysteresis, and the reason it is here: a cell resting right on the
+  // threshold crossed it on almost every sample, so the state flickered
+  // between CHARGING and ON BATTERY. It has to climb past 4.32 V to count as
+  // charging and fall back below 4.20 V to stop counting, so a reading that
+  // wobbles inside that band does not change anything.
+  static bool charging = false;
+  if      (volts >= VOLTS_CHARGING) charging = true;
+  else if (volts <= VOLTS_DISCHARGE) charging = false;
 
-    char buf[24];
-    if (absent) {
-      lv_label_set_text(g_pwr_pct, "--");
-      lv_label_set_text(g_pwr_volts, "no reading");
-      lv_label_set_text(g_pwr_state, "NO BATTERY");
-      lv_obj_set_style_text_color(g_pwr_state, COL_TEXT_DIM, 0);
-    } else {
-      lv_label_set_text_fmt(g_pwr_pct, "%u%%", (unsigned)pct);
-      snprintf(buf, sizeof buf, "%.2f V", volts);
-      lv_label_set_text(g_pwr_volts, buf);
-      lv_label_set_text(g_pwr_state, charging ? "CHARGING" : "ON BATTERY");
-      lv_obj_set_style_text_color(g_pwr_state, charging ? COL_GREEN : COL_AMBER, 0);
-    }
+  const uint8_t pct = absent ? 0 : battery_percent(volts);
+  char buf[32];
 
-    // Colour follows what is left, not what it is doing: at 8 % it is red
-    // whether or not something is plugged in.
-    lv_obj_set_style_bg_color(g_pwr_fill,
-                              pct > 50 ? COL_GREEN : pct > 20 ? COL_AMBER : COL_RED, 0);
-    if (charging && !absent) lv_obj_clear_flag(g_pwr_bolt, LV_OBJ_FLAG_HIDDEN);
-    else                     lv_obj_add_flag(g_pwr_bolt, LV_OBJ_FLAG_HIDDEN);
-    if (g_pwr_visible) lv_obj_set_width(g_pwr_fill, (102 * pct) / 100);
-
-    // The first sample only establishes what normal is. Announcing it would
-    // mean every boot opens on the power screen, over the top of pairing.
-    if (!known) {
-      known = true;
-      was_charged = charging;
-    } else if (charging != was_charged) {
-      was_charged = charging;
-      if (!pairing_showing()) {
-        power_show(pct);
-        hide_at = now + POWER_SHOW_MS;
-      }
-    }
+  if (absent) {
+    lv_label_set_text(g_pwr_pct, "--");
+    lv_label_set_text(g_pwr_volts, "no reading");
+    lv_label_set_text(g_pwr_state, "NO BATTERY");
+    lv_obj_set_style_text_color(g_pwr_state, COL_TEXT_DIM, 0);
+  } else {
+    lv_label_set_text_fmt(g_pwr_pct, "%u%%", (unsigned)pct);
+    snprintf(buf, sizeof buf, "%.2f V", volts);
+    lv_label_set_text(g_pwr_volts, buf);
+    lv_label_set_text(g_pwr_state, charging ? "CHARGING" : "ON BATTERY");
+    lv_obj_set_style_text_color(g_pwr_state, charging ? COL_GREEN : COL_AMBER, 0);
   }
 
-  if (g_pwr_dismiss) {
-    g_pwr_dismiss = false;
-    hide_at = 0;
-    power_hide();
-  }
+  // Colour follows what is left, not what it is doing: at 8 % it is red
+  // whether or not something is plugged in.
+  lv_obj_set_style_bg_color(g_pwr_fill,
+                            pct > 50 ? COL_GREEN : pct > 20 ? COL_AMBER : COL_RED, 0);
+  if (charging && !absent) lv_obj_clear_flag(g_pwr_bolt, LV_OBJ_FLAG_HIDDEN);
+  else                     lv_obj_add_flag(g_pwr_bolt, LV_OBJ_FLAG_HIDDEN);
 
-  if (hide_at && (int32_t)(now - hide_at) >= 0) {
-    hide_at = 0;
-    power_hide();
+  // Animated only when this page is actually being looked at; setting a width
+  // on a hidden object every two seconds is just work nobody sees.
+  if (!lv_obj_has_flag(g_pwr_panel, LV_OBJ_FLAG_HIDDEN)) {
+    lv_anim_t fill;
+    lv_anim_init(&fill);
+    lv_anim_set_var(&fill, g_pwr_fill);
+    lv_anim_set_exec_cb(&fill, obj_set_w);
+    lv_anim_set_values(&fill, lv_obj_get_width(g_pwr_fill), (102 * pct) / 100);
+    lv_anim_set_time(&fill, 400);
+    lv_anim_set_path_cb(&fill, lv_anim_path_ease_out);
+    lv_anim_start(&fill);
   }
 }
 
@@ -1445,18 +1452,37 @@ static void view_slide_in_done(lv_anim_t *a) {
   g_sliding = false;
 }
 
-// Halfway: the body is off-screen, so this is the one moment where swapping
-// every value at once is invisible.
+// Every machine, then the board's own power page. One carousel, so there is a
+// single gesture to learn and no screen that can appear without being asked
+// for.
+static uint8_t page_count() {
+  return (uint8_t)(g_shown.n + 1);
+}
+
+static lv_obj_t *page_obj(uint8_t page) {
+  return (page >= g_shown.n) ? g_pwr_panel : g_body;
+}
+
+// Halfway: the outgoing page is off-screen, so this is the one moment where
+// swapping pages and values at once is invisible.
 static void view_slide_swap(lv_anim_t *a) {
   (void)a;
+  lv_obj_t *from = page_obj(g_view);
+  lv_obj_t *to   = page_obj(g_view_pending);
   g_view = g_view_pending;
-  lv_obj_set_x(g_body, g_slide_dir * SCREEN_W);
+
+  if (from != to) {
+    lv_obj_add_flag(from, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_x(from, 0);            // park it where it belongs for next time
+    lv_obj_clear_flag(to, LV_OBJ_FLAG_HIDDEN);
+  }
+  lv_obj_set_x(to, g_slide_dir * SCREEN_W);
   render_selected();
 
   lv_anim_t in;
   lv_anim_init(&in);
-  lv_anim_set_var(&in, g_body);
-  lv_anim_set_exec_cb(&in, (lv_anim_exec_xcb_t)lv_obj_set_x);
+  lv_anim_set_var(&in, to);
+  lv_anim_set_exec_cb(&in, obj_set_x);
   lv_anim_set_values(&in, g_slide_dir * SCREEN_W, 0);
   lv_anim_set_time(&in, 190);
   lv_anim_set_path_cb(&in, lv_anim_path_ease_out);
@@ -1467,17 +1493,21 @@ static void view_slide_swap(lv_anim_t *a) {
 static void view_step(int8_t step) {
   // Ignoring a press mid-swipe rather than queueing it: a queued swipe arrives
   // after the animation people were already reading, which feels like a lag
-  // rather than a second step.
-  if (g_sliding || g_shown.n < 2) return;
+  // rather than a second step. And nothing swipes underneath the pairing
+  // overlay, which is covering all of it anyway.
+  if (g_sliding || pairing_showing()) return;
 
-  g_view_pending = (uint8_t)((g_view + g_shown.n + step) % g_shown.n);
+  const uint8_t pages = page_count();
+  if (pages < 2) return;
+
+  g_view_pending = (uint8_t)((g_view + pages + step) % pages);
   g_slide_dir    = step;
   g_sliding      = true;
 
   lv_anim_t out;
   lv_anim_init(&out);
-  lv_anim_set_var(&out, g_body);
-  lv_anim_set_exec_cb(&out, (lv_anim_exec_xcb_t)lv_obj_set_x);
+  lv_anim_set_var(&out, page_obj(g_view));
+  lv_anim_set_exec_cb(&out, obj_set_x);
   lv_anim_set_values(&out, 0, -g_slide_dir * SCREEN_W);
   lv_anim_set_time(&out, 150);
   lv_anim_set_path_cb(&out, lv_anim_path_ease_in);
@@ -1556,6 +1586,10 @@ static void parse_one(JsonObjectConst o, Telemetry &out) {
   out.storage_total_gb = o["storage_total_gb"] | 0.0f;
   out.storage_free_gb  = o["storage_free_gb"]  | 0.0f;
   out.cpu_temp_c       = o["cpu_temp_c"]       | -1.0f;
+  out.battery_percent  = o["battery_percent"]  | -1;
+  out.battery_minutes  = o["battery_minutes"]  | -1;
+  out.battery_charging = o["battery_charging"] | false;
+  out.battery_ac       = o["battery_ac"]       | false;
   out.rx_kbps          = o["net_rx_kbps"]      | 0.0f;
   out.tx_kbps          = o["net_tx_kbps"]      | 0.0f;
   out.uptime_seconds   = o["uptime_seconds"]   | 0u;
@@ -2025,6 +2059,13 @@ void setup() {
   delay(100);
   Serial.println("\n[peek] booting");
 
+  // Waking from deep sleep is a fresh boot, so without this there is no way to
+  // tell "it woke up" from "it reset" - which is exactly the distinction you
+  // need when a board is not coming back from sleep.
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+    Serial.println("[peek] woke from sleep (right button)");
+  }
+
   // The divider that brings the cell out to GPIO34 is behind a MOSFET. Left
   // low, the pin reads a floating node - which looks like a flat battery
   // rather than like a measurement that never happened.
@@ -2036,8 +2077,11 @@ void setup() {
   // Most ESP32s carry a measured reference in eFuse; the ones that do not are
   // out by up to 10 %, which on a battery is the difference between "20 %" and
   // "flat". Using the real figure where it exists costs one call at boot.
+  // ADC_ATTEN_DB_12, not DB_11: on core 2.0.17 the 11 dB name is a deprecated
+  // alias for exactly this value, and #ifdef cannot guard it because both are
+  // enumerators rather than macros.
   esp_adc_cal_characteristics_t adc_chars;
-  if (esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12,
+  if (esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_12, ADC_WIDTH_BIT_12,
                                1100, &adc_chars) == ESP_ADC_CAL_VAL_EFUSE_VREF) {
     g_vref_scale = adc_chars.vref / 1100.0f;
     Serial.printf("[power] eFuse Vref %u mV\n", (unsigned)adc_chars.vref);
@@ -2149,7 +2193,7 @@ void setup() {
 // driving a dark screen at full current, which is most of what there is to
 // save on a board with no other peripherals.
 static void enter_sleep() {
-  Serial.println("[peek] sleeping - press the left button to wake");
+  Serial.println("[peek] sleeping - press the right button to wake");
   Serial.flush();
 
   backlight_set(0);
@@ -2157,13 +2201,27 @@ static void enter_sleep() {
   tft.writecommand(0x10);          // SLPIN
   delay(120);                      // the ST7789 wants ~120 ms to settle
 
-  // ext0 wakes on a level rather than an edge, so the left button has to be
-  // released before this returns - otherwise a hold that overlapped both
-  // buttons would wake the board on the same press that slept it. The right
-  // button cannot do this job: it is the one being held right now.
-  while (digitalRead(PIN_BTN_L) == LOW) delay(10);
+  // The wake pin is GPIO35, not the labelled BOOT button, and that is not a
+  // preference - GPIO0 cannot do this job at all.
+  //
+  // GPIO0 is a strapping pin. Deep-sleep wake is a reset, and the chip latches
+  // the strapping pins on that reset: held low across it, the ESP32 comes up
+  // in the serial bootloader instead of running this sketch. The symptom is a
+  // board that sleeps and then will not come back - a dark screen, no boot,
+  // apparently dead until it is power-cycled. Pressing the button harder or
+  // for longer makes it worse, because holding it low is the trigger.
+  //
+  // GPIO35 is RTC-capable, is not a strapping pin, and the board pulls it up
+  // externally - which it has to, since GPIO34-39 have no internal pulls at
+  // all. So the button that puts the board to sleep is also the one that
+  // wakes it, which is easier to remember anyway.
+  //
+  // Wait for it to be released first: ext0 wakes on a level, so arming it
+  // while the button is still down wakes the board on the press that slept it.
+  while (digitalRead(PIN_BTN_R) == LOW) delay(10);
+  delay(60);                       // let the contact stop bouncing
 
-  esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_35, 0);
   esp_deep_sleep_start();          // never returns; waking is a fresh boot
 }
 
@@ -2189,13 +2247,10 @@ void loop() {
     }
   } else {
     if (left_down && !left_fired && now - left_down > 30) {
-      // Swiping costs nothing - the poll already carried every machine. Asking
-      // the relay again on each tap would multiply the request budget by how
-      // restless someone is feeling, so a refresh is only what the tap means
-      // when there is nothing to swipe to.
-      if      (g_pwr_visible)      g_pwr_dismiss = true;
-      else if (g_device_count > 1) g_view_step   = 1;
-      else                         g_force       = true;
+      // Swiping costs nothing - the poll already carried every machine, and
+      // the power page is local. Asking the relay again on each tap would
+      // multiply the request budget by how restless someone is feeling.
+      g_view_step = 1;
     }
     left_down = 0;
   }

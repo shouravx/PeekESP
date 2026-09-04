@@ -104,12 +104,13 @@ display with four is ~86k and is close to the edge. A display costs the same
 whether it shows one machine or six — one poll returns all of them. Raising the
 interval to 15 s divides everything by three.
 
-**Temperature on Windows needs LibreHardwareMonitor.** Windows has no API for
-it — the value sits behind a kernel driver that reads the chip's MSRs. The agent
-reads LibreHardwareMonitor's web server if it is running, falls back to a WMI
-thermal zone (admin only, and most desktop boards don't implement it), and
-otherwise reports `-1` so the display shows `--` rather than a confident wrong
-number. Linux needs none of this; `/sys/class/thermal` is enough.
+**Temperature on Windows is an ACPI zone unless you install something.** A CPU
+die temperature sits behind a kernel driver that reads the chip's MSRs, so the
+only way to get one is LibreHardwareMonitor with its web server on. Without it
+the agent falls back to the thermal-zone performance counter, which needs no
+driver and no administrator but reports wherever the board vendor put a sensor —
+usually well below the CPU. It is a real reading of a real place; it just isn't
+the die. Linux needs none of this; `/sys/class/thermal` is enough.
 
 **2.4 GHz only, WPA2.** An ESP32 has no 5 GHz radio. A network that does not
 appear in the scan list is usually 5 GHz-only or WPA3-only rather than a fault.

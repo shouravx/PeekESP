@@ -219,6 +219,49 @@ def _cpu_temp_c():
     return -1.0                          # the sketch renders "--" for this
 
 
+def _sysfs(path):
+    try:
+        with open(path, "r") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _battery():
+    """(percent, charging, on_ac, minutes_left) for this machine.
+
+    A Pi has neither a battery nor a mains supply that announces itself, so
+    this reports -1 and the display simply leaves it out. On a laptop it is all
+    in /sys/class/power_supply.
+    """
+    on_ac = any(_sysfs(p) == "1"
+                for pat in ("AC*/online", "ADP*/online", "ACAD/online")
+                for p in glob.glob("/sys/class/power_supply/" + pat))
+
+    bats = sorted(glob.glob("/sys/class/power_supply/BAT*"))
+    if not bats:
+        return -1, False, on_ac, -1
+
+    b = bats[0]
+    cap = _sysfs(b + "/capacity")
+    if not cap.isdigit():
+        return -1, False, on_ac, -1
+
+    charging = _sysfs(b + "/status").lower() == "charging"
+
+    # Energy pairs with power (µWh over µW) and charge pairs with current
+    # (µAh over µA). Crossing them - energy over current - is dimensionally
+    # nonsense and produces a confident, wrong number of hours.
+    minutes = -1
+    for amount, rate in (("energy_now", "power_now"), ("charge_now", "current_now")):
+        a, r = _sysfs(b + "/" + amount), _sysfs(b + "/" + rate)
+        if a.isdigit() and r.isdigit() and int(r) > 0:
+            minutes = int(int(a) * 60 // int(r))
+            break
+
+    return min(100, int(cap)), charging, on_ac, minutes
+
+
 def _uptime_seconds():
     with open("/proc/uptime", "r") as fh:
         return int(float(fh.readline().split()[0]))
@@ -228,6 +271,7 @@ def snapshot():
     with _lock:
         rolling = dict(_state)
     used_pct, total, free = _storage()
+    bat_pct, bat_charging, bat_ac, bat_minutes = _battery()
     return {
         "host": socket.gethostname()[:19],       # the sketch stores 20 bytes
         "cpu_percent": round(rolling["cpu_percent"], 1),
@@ -236,6 +280,10 @@ def snapshot():
         "storage_total_gb": round(total / (1024 ** 3), 1),
         "storage_free_gb": round(free / (1024 ** 3), 1),
         "cpu_temp_c": round(_cpu_temp_c(), 1),
+        "battery_percent": bat_pct,          # -1 on a machine with no battery
+        "battery_charging": bat_charging,
+        "battery_ac": bat_ac,
+        "battery_minutes": bat_minutes,      # -1 when the rate is unknown
         "uptime_seconds": _uptime_seconds(),
         "net_rx_kbps": round(rolling["net_rx_kbps"], 1),
         "net_tx_kbps": round(rolling["net_tx_kbps"], 1),
