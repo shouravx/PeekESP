@@ -169,13 +169,34 @@ sketch without build flags the Arduino IDE has no way to set.
 
 ### 1. On the host — the telemetry agent
 
-**Linux:**
+**Linux / DietPi — one line.** Flash the device first so it has a code to show
+you, then:
 
 ```bash
-sudo install -m 755 dietpi/peek-agent.py /usr/local/bin/peek-agent
+curl -fsSL https://raw.githubusercontent.com/shouravx/PeekESP/main/dietpi/install.sh | sudo sh
 ```
 
-**Windows** — same JSON, same flags, standard library only. See
+It asks for the pairing code and derives everything else — relay URL, stream,
+push token — locally. Then it installs a hardened systemd service, starts it,
+and waits to confirm the machine is actually pushing before it says it worked.
+Full detail in [dietpi/](dietpi/).
+
+To skip the prompt, or to run it from a script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shouravx/PeekESP/main/dietpi/install.sh | sudo sh -s -- K7M2-P4QX-9R
+```
+
+Piping a script from the internet into a root shell means trusting whatever is
+at that URL. Read it first if you would rather — that is the honest advice, not
+a formality:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/shouravx/PeekESP/main/dietpi/install.sh
+less install.sh && sudo sh install.sh
+```
+
+**Windows** — same JSON, same fields, standard library only. See
 [windows/](windows/):
 
 ```bash
@@ -189,8 +210,7 @@ foreground and, from another shell:
 curl http://localhost:8080/telemetry
 ```
 
-You should get real numbers. The systemd unit comes after pairing, because the
-push URL contains the stream the code produced.
+You should get real numbers.
 
 ### 2. Deploy the relay
 
@@ -233,29 +253,14 @@ That is the entire configuration. The relay URL, the stream and both tokens are
 derived from the code on both sides; dashes and case are ignored. The device
 stops showing the code as soon as the first reading arrives.
 
-Make the agent permanent afterwards:
+On Linux the one-liner in step 1 already took the code and installed the
+service, so there is nothing to do here. On Windows the tray app's **Start
+automatically when I sign in** does the same with no service to install.
 
-```bash
-sudo tee /etc/systemd/system/peek-agent.service >/dev/null <<'EOF'
-[Unit]
-Description=PeekESP telemetry agent
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Environment=PEEK_PUSH_TOKEN=YOUR_PUSH_TOKEN
-ExecStart=/usr/bin/python3 /usr/local/bin/peek-agent --push https://peek-relay.YOU.workers.dev/ingest/STREAM
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-sudo systemctl daemon-reload && sudo systemctl enable --now peek-agent
-```
-
-On Windows the tray app's **Start automatically when I sign in** does the same
-thing with no service to install.
+**Run the same command on every machine you want to watch, with the same code.**
+A pairing code identifies you, not a machine: a Windows box, a Mac and a DietPi
+sharing one code all appear on the display, and the left button swipes between
+them. Six per code.
 
 ### 4. Flashing the ESP32
 

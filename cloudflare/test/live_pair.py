@@ -4,6 +4,7 @@ Plays both roles: the PC pushing to /ingest/<stream> and the device polling
 /telemetry/<stream>, using only values derived from a freshly generated
 pairing code. Nothing is configured on the Worker beforehand.
 """
+import importlib.util
 import json
 import sys
 import urllib.error
@@ -48,6 +49,21 @@ code = pair.new_code()
 d = pair.derive(code)
 u = pair.urls(BASE, d["stream"])
 print(f"pairing code {pair.format_code(code)}   stream {d['stream']}\n")
+
+# There are four implementations of the derivation now - C++ on the device,
+# Python here, Python again in the Linux agent, and JavaScript in the Worker.
+# worker.test.mjs pins the first three against openssl vectors; nothing pinned
+# the Linux agent, and a drift there would have a DietPi pushing to a stream
+# the device never reads, with every request looking valid from both ends.
+_spec = importlib.util.spec_from_file_location(
+    "peek_agent_linux", r"D:\GITHUB\PeekESP\dietpi\peek-agent.py")
+_linux = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_linux)
+_ld = _linux.pair_derive(pair.format_code(code))
+res.append(("the Linux agent derives the same stream and push token",
+            _ld["stream"] == d["stream"] and _ld["push"] == d["push"]))
+res.append((f"the Linux agent's default relay is this one  -> {_linux.RELAY_BASE}",
+            _linux.RELAY_BASE.rstrip("/") == BASE.rstrip("/")))
 
 s, b = call("GET", f"{BASE}/health")
 check("worker healthy", s, 200, str(b))

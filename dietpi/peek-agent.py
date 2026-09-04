@@ -8,16 +8,23 @@ install on a DietPi.
 
     { "host": "dietpi", "cpu_percent": 12.5, "ram_percent": 43.2,
       "storage_percent": 61.0, "storage_total_gb": 117.9,
-      "storage_free_gb": 46.0, "cpu_temp_c": 48.3, "uptime_seconds": 271830,
-      "net_rx_kbps": 128.4, "net_tx_kbps": 12.9 }
+      "storage_free_gb": 46.0, "cpu_temp_c": 48.3, "battery_percent": 78,
+      "battery_charging": true, "battery_ac": true, "battery_minutes": 134,
+      "uptime_seconds": 271830, "net_rx_kbps": 128.4, "net_tx_kbps": 12.9 }
 
-Run it:      python3 peek-agent.py
-Install it:  see the systemd unit in the repository README.
+Install it:  curl -fsSL https://raw.githubusercontent.com/shouravx/PeekESP/\\
+             main/dietpi/install.sh | sudo sh
+Pair it:     python3 peek-agent.py --pair-code K7M2-P4QX-9R --no-serve
+Serve it:    python3 peek-agent.py          # JSON on :8080, for a LAN device
+
+See dietpi/README.md for the rest.
 """
 
 import glob
+import hashlib
 import json
 import os
+import re
 import socket
 import threading
 import time
@@ -46,6 +53,46 @@ CPU_ZONE_HINTS = ("x86_pkg_temp", "coretemp", "cpu-thermal", "cpu_thermal",
 # opaque 403 that no amount of checking tokens would explain. Identify
 # ourselves properly instead.
 USER_AGENT = "PeekESP-agent/1.0 (+https://github.com/shouravx/PeekESP)"
+
+# The same relay the firmware ships pointing at, so a pairing code alone is
+# enough on both sides and there is no URL to copy anywhere.
+RELAY_BASE = "https://peek-relay.peekesp.workers.dev"
+
+
+# --------------------------------------------------------------------------
+#  Pairing: the device shows a code, you type it here, and both ends derive
+#  the same stream and tokens locally. Nothing but the code ever moves between
+#  them, and the relay never sees it - which is why this needs no secrets
+#  configured on the Worker at all.
+#
+#      stream = SHA-256("peek-stream:" + CODE)  first 16 hex
+#      push   = SHA-256("peek-push:"   + CODE)  first 48 hex
+#
+#  Kept byte-identical to windows/peek_pair.py, cloudflare/src/index.js and the
+#  firmware's C++. A drift in any one of them would have this machine pushing
+#  to a stream the device never reads, with every request looking perfectly
+#  valid from both ends.
+# --------------------------------------------------------------------------
+PAIR_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+PAIR_CODE_LEN = 10
+
+
+def pair_normalise(code):
+    """Dashes and case are decoration: "k7m2-p4qx-9r" is "K7M2P4QX9R"."""
+    return re.sub(r"[^A-Z0-9]", "", (code or "").upper())
+
+
+def pair_derive(code):
+    c = pair_normalise(code)
+    if len(c) != PAIR_CODE_LEN or any(ch not in PAIR_ALPHABET for ch in c):
+        raise ValueError(
+            "pairing code must be %d characters from %s "
+            "(dashes and case are ignored)" % (PAIR_CODE_LEN, PAIR_ALPHABET))
+
+    def h(prefix, n):
+        return hashlib.sha256((prefix + c).encode("ascii")).hexdigest()[:n]
+
+    return {"code": c, "stream": h("peek-stream:", 16), "push": h("peek-push:", 48)}
 
 
 # --------------------------------------------------------------------------
@@ -357,6 +404,12 @@ def main():
     import argparse
 
     ap = argparse.ArgumentParser(description="PeekESP telemetry agent")
+    ap.add_argument("--pair-code", metavar="CODE",
+                    default=os.environ.get("PEEK_PAIR_CODE", ""),
+                    help="the code shown on the device; derives everything else "
+                         "(or set PEEK_PAIR_CODE)")
+    ap.add_argument("--relay-base", metavar="URL", default=RELAY_BASE,
+                    help="relay to pair against (default: %s)" % RELAY_BASE)
     ap.add_argument("--push", metavar="URL",
                     help="POST telemetry to this Cloudflare Worker /ingest URL")
     ap.add_argument("--token", default=os.environ.get("PEEK_PUSH_TOKEN", ""),
@@ -365,7 +418,31 @@ def main():
                     help="seconds between pushes (default: 5)")
     ap.add_argument("--no-serve", action="store_true",
                     help="do not listen on :%d, push only" % PORT)
+    ap.add_argument("--verify", action="store_true",
+                    help="check the pairing code, print the stream it derives, "
+                         "and exit without pushing anything")
     args = ap.parse_args()
+
+    if args.verify:
+        if not args.pair_code:
+            ap.error("--verify needs --pair-code")
+        try:
+            print(pair_derive(args.pair_code)["stream"])
+        except ValueError as e:
+            ap.error(str(e))
+        return
+
+    if args.pair_code:
+        try:
+            d = pair_derive(args.pair_code)
+        except ValueError as e:
+            ap.error(str(e))
+        args.push = "%s/ingest/%s" % (args.relay_base.rstrip("/"), d["stream"])
+        args.token = d["push"]
+        # The stream, not the code: the code is the secret and the journal is
+        # not a secret. The stream id is what you compare against the device's
+        # own "[pair] code X -> stream Y" line when they will not meet.
+        print("paired to stream %s" % d["stream"], flush=True)
 
     if args.push and not args.token:
         ap.error("--push needs --token (or the PEEK_PUSH_TOKEN environment variable)")
