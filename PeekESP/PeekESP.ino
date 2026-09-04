@@ -210,6 +210,7 @@ static volatile bool     g_busy     = false;       // an HTTP GET is in flight
 static volatile uint32_t g_seq      = 0;           // bumped on every good parse
 static volatile uint32_t g_latency  = 0;           // ms for the last GET
 static volatile bool     g_force    = false;       // button-triggered refresh
+static volatile bool     g_wifi_failed = false;    // gave up joining the network
 static volatile uint32_t g_reboot_at = 0;          // 0 = not scheduled
 
 static bool     g_setup_mode = false;
@@ -410,6 +411,32 @@ static void request_setup_mode() {
   prefs.putBool("forcecfg", true);
   prefs.end();
   g_reboot_at = millis() + 300;
+}
+
+// Remembers that these credentials have worked at least once. The difference
+// matters: credentials that have NEVER worked are almost certainly wrong and
+// setup is the useful answer, while credentials that worked yesterday and fail
+// today mean the router is down - and dropping into an access point then would
+// strand the device exactly when it should be patiently reconnecting.
+static bool wifi_known_good() {
+  prefs.begin("peek", true);
+  const bool ok = prefs.getBool("wifiok", false);
+  prefs.end();
+  return ok;
+}
+
+static void mark_wifi_good() {
+  if (wifi_known_good()) return;          // avoid a flash write every boot
+  prefs.begin("peek", false);
+  prefs.putBool("wifiok", true);
+  prefs.end();
+}
+
+// Saving new settings makes the stored credentials unproven again.
+static void forget_wifi_good() {
+  prefs.begin("peek", false);
+  prefs.putBool("wifiok", false);
+  prefs.end();
 }
 
 static bool consume_setup_request() {
@@ -804,6 +831,43 @@ static void build_splash(lv_obj_t *scr) {
   lv_anim_start(&a);
 }
 
+// The pairing overlay covers the dashboard, including the status line in its
+// corner - so while it is up, it has to carry that status itself. Otherwise a
+// device stuck on WiFi cheerfully reads "waiting for the app...", which sends
+// you looking at the app.
+static void pair_progress(NetState st) {
+  if (!g_pair_panel || !g_lbl_pair_hint) return;
+  if (lv_obj_has_flag(g_pair_panel, LV_OBJ_FLAG_HIDDEN)) return;
+
+  char buf[64];
+  lv_color_t col = COL_TEXT_DIM;
+
+  if (g_wifi_failed) {
+    snprintf(buf, sizeof buf, "cannot join %s", cfg.wifi_ssid);
+    col = COL_RED;
+  } else {
+    switch (st) {
+      case NET_WIFI:
+        snprintf(buf, sizeof buf, "joining %s...", cfg.wifi_ssid);
+        col = COL_AMBER;
+        break;
+      case NET_TIME:
+        snprintf(buf, sizeof buf, "getting the time...");
+        col = COL_AMBER;
+        break;
+      case NET_ERROR:
+        snprintf(buf, sizeof buf, "relay unreachable - retrying");
+        col = COL_RED;
+        break;
+      default:
+        snprintf(buf, sizeof buf, "waiting for the app...");
+        break;
+    }
+  }
+  lv_label_set_text(g_lbl_pair_hint, buf);
+  lv_obj_set_style_text_color(g_lbl_pair_hint, col, 0);
+}
+
 static void pairing_done() {
   if (g_pair_panel && !lv_obj_has_flag(g_pair_panel, LV_OBJ_FLAG_HIDDEN)) {
     lv_obj_add_flag(g_pair_panel, LV_OBJ_FLAG_HIDDEN);
@@ -860,9 +924,12 @@ static void ui_sync_cb(lv_timer_t *t) {
   static uint32_t busy_until = 0;
 
   const NetState st = g_state;
-  if (st != last_state) {
+  static bool last_failed = false;
+  if (st != last_state || g_wifi_failed != last_failed) {
     apply_state(st);
+    pair_progress(st);
     last_state = st;
+    last_failed = g_wifi_failed;
   }
 
   // Keep the spinner up for a beat after a fast reply, otherwise a 30 ms
@@ -955,6 +1022,7 @@ static bool wifi_connect(uint32_t timeout_ms) {
     vTaskDelay(pdMS_TO_TICKS(250));
   }
   Serial.printf("[net] wifi ok, %s rssi %d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  mark_wifi_good();
   return true;
 }
 
@@ -1055,9 +1123,28 @@ static bool fetch(Telemetry &out, uint32_t &latency_ms) {
 static void netTask(void *arg) {
   (void)arg;
 
-  while (!wifi_connect(30000)) {
+  // Two honest attempts, then hand it back rather than retrying a wrong
+  // password until the heat death of the universe. A device that cannot join
+  // the network has exactly one useful next step, and it is reconfiguration -
+  // so it goes there itself instead of waiting for someone to know about the
+  // button.
+  for (uint8_t tries = 1; !wifi_connect(25000); tries++) {
     g_state = NET_ERROR;
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    Serial.printf("[net] attempt %u to join '%s' failed\n", tries, cfg.wifi_ssid);
+    // Only bail out to setup if this network has never worked. If it has,
+    // the router is the likelier problem and the device keeps trying.
+    if (tries >= 2 && !wifi_known_good()) {
+      g_wifi_failed = true;
+      Serial.println("[net] never connected with these credentials - reopening setup");
+      vTaskDelay(pdMS_TO_TICKS(4000));    // long enough to read the screen
+      request_setup_mode();
+      vTaskDelay(pdMS_TO_TICKS(300));
+      esp_restart();
+    }
+    if (tries >= 2) {
+      Serial.println("[net] this network has worked before - staying and retrying");
+    }
+    vTaskDelay(pdMS_TO_TICKS(1500));
   }
   // TLS validates certificate dates, so the clock has to be real before the
   // first request. A device stuck at epoch 0 fails the handshake, silently.
@@ -1288,6 +1375,7 @@ static void handle_save() {
   if (cfg.poll_s > 600) cfg.poll_s = 600;
 
   config_save();
+  forget_wifi_good();          // new credentials are unproven until they work
 
   String p = FPSTR(PAGE_CSS);
   p += F("<main><h1>Saved</h1><p class=sub>Rebooting into the dashboard. This"
