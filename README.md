@@ -308,8 +308,10 @@ point and the screen shows a QR code.
    phone joins the AP directly. No typing the generated password off a 1.14"
    panel.
 2. The captive portal opens the form (or browse to `192.168.4.1`).
-3. Fill in your WiFi. The SSID field is a dropdown populated by a live scan.
-   Everything else is already set if you paired from the app.
+3. Pick your WiFi from the dropdown — the device scans and lists what it can
+   see, strongest first, with a `*` on the ones needing a password. **Scan
+   again** re-runs it, and *Other / hidden network* lets you type a name the
+   scan cannot see. Everything else is already filled in.
 4. **Save & Reboot** — settings go to NVS and survive reflashing the sketch.
 
 To change something later, hold the **left button for 1.5 s**; the device

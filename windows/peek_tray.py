@@ -403,7 +403,12 @@ def open_settings(runner):
     # the PUSH token and /ingest. Keeping the pair visible in one place is the
     # difference between a two-minute setup and hunting for a value you wrote
     # down somewhere during the Cloudflare step.
-    label(body, "ON THE DEVICE, AFTER FLASHING", DIM, 8).pack(anchor="w", pady=(16, 4))
+    # This panel predates pairing. When a code is set the device has already
+    # derived both of these itself and there is genuinely nothing to enter, so
+    # presenting them as a to-do just invents a step. It stays visible - seeing
+    # the stream is useful - but says which of the two situations you are in.
+    dev_head = label(body, "ON THE DEVICE", DIM, 8)
+    dev_head.pack(anchor="w", pady=(16, 4))
 
     dev = card(body)
     dev.pack(fill="x")
@@ -441,23 +446,43 @@ def open_settings(runner):
         root.update()
         set_status(GREEN, "device settings copied to clipboard")
 
-    tk.Button(devrow, text="New", command=gen_device_token, bg=EDGE, fg=TEXT,
-              activebackground=CYAN, activeforeground=BG, relief="flat", bd=0,
-              font=("Segoe UI", 8), padx=8, pady=3,
-              cursor="hand2").pack(side="left", padx=(6, 0))
-    tk.Button(devrow, text="Copy", command=copy_device, bg=EDGE, fg=TEXT,
-              activebackground=CYAN, activeforeground=BG, relief="flat", bd=0,
-              font=("Segoe UI", 8), padx=8, pady=3,
-              cursor="hand2").pack(side="left", padx=(4, 0))
+    btn_new = tk.Button(devrow, text="New", command=gen_device_token, bg=EDGE, fg=TEXT,
+                        activebackground=CYAN, activeforeground=BG, relief="flat", bd=0,
+                        font=("Segoe UI", 8), padx=8, pady=3, cursor="hand2")
+    btn_copy = tk.Button(devrow, text="Copy", command=copy_device, bg=EDGE, fg=TEXT,
+                         activebackground=CYAN, activeforeground=BG, relief="flat", bd=0,
+                         font=("Segoe UI", 8), padx=8, pady=3, cursor="hand2")
+    btn_new.pack(side="left", padx=(6, 0))
+    btn_copy.pack(side="left", padx=(4, 0))
 
-    label(inner, "Enter these in the device's setup portal (192.168.4.1).",
-          DIM, 8).pack(anchor="w", pady=(8, 0))
+    dev_note = label(inner, "", DIM, 8)
+    dev_note.pack(anchor="w", pady=(8, 0))
 
-    # Keep the device URL in step with the ingest URL as it is typed.
-    def sync_device_url(*_):
+    def refresh_device_panel(*_):
+        """Paired means the device worked both values out from the code on its
+        own screen; there is nothing to type and no token to invent."""
+        paired = pair.is_valid(v_code.get())
         v_devurl.set(cfgmod.device_url(v_url.get()) or "—")
-    v_url.trace_add("write", sync_device_url)
-    sync_device_url()
+        if paired:
+            dev_head.config(text="ON THE DEVICE  (already set)")
+            dev_note.config(
+                text="Nothing to do - the device derived these from its own code.\n"
+                     "Shown so you can check it matches the screen.",
+                fg=GREEN)
+            dev_tok.config(state="readonly", readonlybackground=BG)
+            btn_new.pack_forget()
+        else:
+            dev_head.config(text="ON THE DEVICE")
+            dev_note.config(
+                text="Enter these in the device's setup portal (192.168.4.1).\n"
+                     "Only needed for a named or private stream - pairing fills them in.",
+                fg=DIM)
+            dev_tok.config(state="normal")
+            btn_new.pack(side="left", padx=(6, 0), before=btn_copy)
+
+    v_url.trace_add("write", refresh_device_panel)
+    v_code.trace_add("write", refresh_device_panel)
+    refresh_device_panel()
 
     tk.Checkbutton(body, text="Start automatically when I sign in",
                    variable=v_auto, bg=BG, fg=TEXT, selectcolor=CARD,

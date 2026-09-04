@@ -1165,16 +1165,68 @@ static void handle_root() {
          " sketch.</p><form method=POST action=/save>");
 
   p += F("<fieldset><legend>WIFI</legend>");
-  p += F("<label><span>Network (SSID)</span><input type=text name=ssid list=nets value=\"");
-  p += cfg.wifi_ssid;
-  p += F("\"><datalist id=nets>");
+
+  // scanComplete(): -1 still running, -2 failed/not started, else a count.
   const int n = WiFi.scanComplete();
-  for (int i = 0; i < n && i < 20; i++) {
-    p += F("<option value=\"");
-    p += WiFi.SSID(i);
-    p += F("\">");
+
+  if (n == WIFI_SCAN_RUNNING) {
+    // Reload rather than render an empty list. A picker that silently shows
+    // nothing is indistinguishable from a device that cannot see any networks.
+    p += F("<p class=hint>Scanning for networks...</p>"
+           "<meta http-equiv=refresh content=2>");
+  } else if (n <= 0) {
+    p += F("<p class=hint>No networks found. "
+           "<a href=/rescan>Scan again</a></p>");
+  } else {
+    p += F("<label><span>Network</span><select name=ssid id=ssid "
+           "onchange=\"m.hidden=this.value!=''\">");
+
+    // Strongest first, and only once each: a mesh or an extender puts the same
+    // SSID in the list several times, which makes the menu look broken.
+    bool used[24] = {false};
+    const int shown = n > 24 ? 24 : n;
+    for (int slot = 0; slot < shown; slot++) {
+      int best = -1;
+      for (int i = 0; i < shown; i++) {
+        if (used[i] || WiFi.SSID(i).length() == 0) continue;
+        if (best == -1 || WiFi.RSSI(i) > WiFi.RSSI(best)) best = i;
+      }
+      if (best == -1) break;
+      used[best] = true;
+
+      const String ssid = WiFi.SSID(best);
+      for (int i = 0; i < shown; i++) {          // suppress duplicates
+        if (!used[i] && WiFi.SSID(i) == ssid) used[i] = true;
+      }
+
+      const int rssi = WiFi.RSSI(best);
+      const char *bars = rssi > -55 ? "||||" : rssi > -65 ? "|||-"
+                       : rssi > -75 ? "||--" : "|---";
+
+      p += F("<option value=\"");
+      p += ssid;
+      p += F("\"");
+      if (ssid == cfg.wifi_ssid) p += F(" selected");
+      p += F(">");
+      p += ssid;
+      p += F("  ");
+      p += bars;
+      if (WiFi.encryptionType(best) != WIFI_AUTH_OPEN) p += F(" *");
+      p += F("</option>");
+    }
+    // Empty string as the sentinel: a zero-length SSID is not valid, so it
+    // cannot collide with a real network, and it survives a form POST intact
+    // where a control character would not.
+    p += F("<option value=\"\">Other / hidden network...</option>"
+           "</select></label>");
+
+    // Revealed only when "Other" is picked, so a hidden SSID is still possible
+    // without putting a second confusing text box in front of everyone.
+    p += F("<label id=m hidden><span>Network name</span>"
+           "<input type=text name=ssid_manual value=\"\"></label>");
+    p += F("<p class=hint>* needs a password. <a href=/rescan>Scan again</a></p>");
   }
-  p += F("</datalist></label>");
+
   p += field("Password", "pass", cfg.wifi_pass, "password");
   p += F("</fieldset>");
 
@@ -1208,7 +1260,12 @@ static void copy_arg(const char *name, char *dst, size_t n) {
 }
 
 static void handle_save() {
-  copy_arg("ssid",   cfg.wifi_ssid,   sizeof cfg.wifi_ssid);
+  // "Other / hidden" puts a sentinel in the dropdown and the real name in a
+  // second field, so the manual value wins when it is present.
+  if (server.hasArg("ssid_manual") && server.arg("ssid_manual").length())
+    copy_arg("ssid_manual", cfg.wifi_ssid, sizeof cfg.wifi_ssid);
+  else if (server.arg("ssid").length())
+    copy_arg("ssid",   cfg.wifi_ssid,   sizeof cfg.wifi_ssid);
   copy_arg("pass",   cfg.wifi_pass,   sizeof cfg.wifi_pass);
   copy_arg("rurl",   cfg.relay_url,   sizeof cfg.relay_url);
   copy_arg("rtok",   cfg.relay_token, sizeof cfg.relay_token);
@@ -1229,6 +1286,15 @@ static void handle_save() {
 
   // Restart from the task loop, not here: the response still has to drain.
   g_reboot_at = millis() + 1200;
+}
+
+static void handle_rescan() {
+  // Async: the redirect lands on "/" which renders the scanning state and
+  // refreshes itself, so the page is never blocked on the radio.
+  WiFi.scanDelete();
+  WiFi.scanNetworks(true);
+  server.sendHeader("Location", "/");
+  server.send(302, "text/plain", "");
 }
 
 static void handle_reset() {
@@ -1256,6 +1322,7 @@ static void setupTask(void *arg) {
   server.on("/", handle_root);
   server.on("/save", HTTP_POST, handle_save);
   server.on("/reset", handle_reset);
+  server.on("/rescan", handle_rescan);
   server.onNotFound(handle_root);          // any URL lands on the form
   server.begin();
 
