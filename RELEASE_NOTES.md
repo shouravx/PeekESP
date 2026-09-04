@@ -8,6 +8,35 @@ By [shouravx](https://github.com/shouravx) · MIT
 
 ---
 
+## Downloads
+
+```powershell
+winget install shouravx.PeekESP
+```
+
+Or take what you need directly:
+
+| File | What it is |
+|---|---|
+| `PeekESP.exe` | The tray app. Double-click it — this is the one most people want |
+| `peek-agent.exe` | Headless, for a service or scheduled task |
+| `PeekESP-1.1.0-win-x64.zip` | Both of the above plus the licence. This is what winget installs |
+| `PeekESP-merged.bin` | Firmware for the board — `python tools/flash.py` |
+| `winget-manifests-1.1.0.zip` | Only needed to submit this version to winget |
+
+Linux, one line:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shouravx/PeekESP/main/dietpi/install.sh | sudo sh
+```
+
+The Windows executables are **unsigned**, so SmartScreen warns the first time:
+*More info → Run anyway*. The `.sha256` beside the zip lets you check the file
+is the one that was built. [Why it is unsigned, and what fixing it
+costs.](windows/SIGNING.md)
+
+---
+
 ## New in 1.1.0
 
 ### One code, several machines

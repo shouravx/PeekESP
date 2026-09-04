@@ -98,26 +98,54 @@ jobs:
           # gh, not a marketplace action: it is preinstalled on the runner, it
           # authenticates with the token this job already has, and it is one
           # less third party with write access to the release.
-          $files = @(
-            (Get-ChildItem windows/dist/*.zip),
-            (Get-ChildItem windows/dist/*.sha256),
-            (Get-Item firmware/PeekESP-merged.bin)
-          ) | ForEach-Object { $_.FullName }
+          $v = (Get-Content VERSION -Raw).Trim()
 
-          # Exactly four: the app zip, the manifests zip, the checksum and the
-          # firmware image. A release that is quietly missing one is worse than
-          # a failed build, because it looks finished.
-          if ($files.Count -ne 4) {
-            Write-Error "expected 4 assets (app zip, manifests zip, checksum, firmware); found $($files.Count)"
-            $files | ForEach-Object { Write-Output "  $_" }
+          # Named, not counted. The bare executables are here because winget is
+          # not the only way people get this: the zip is what winget installs,
+          # and someone who just wants the tray app should not have to download
+          # 27 MB and unpack it to reach one file.
+          $expected = [ordered]@{
+            "app zip"       = "windows/dist/PeekESP-$v-win-x64.zip"
+            "app checksum"  = "windows/dist/PeekESP-$v-win-x64.zip.sha256"
+            "manifests"     = "windows/dist/winget-manifests-$v.zip"
+            "tray app"      = "windows/dist/PeekESP.exe"
+            "headless agent"= "windows/dist/peek-agent.exe"
+            "firmware"      = "firmware/PeekESP-merged.bin"
+          }
+
+          $files = @()
+          $missing = @()
+          foreach ($k in $expected.Keys) {
+            if (Test-Path $expected[$k]) {
+              $files += (Resolve-Path $expected[$k]).Path
+              Write-Output "attaching  $k -> $($expected[$k])"
+            } else {
+              $missing += "$k ($($expected[$k]))"
+            }
+          }
+          # A release quietly missing an asset is worse than a failed build,
+          # because it looks finished. Naming them says which one went astray.
+          if ($missing.Count) {
+            Write-Error ("missing assets: " + ($missing -join ", "))
             exit 1
           }
-          $files | ForEach-Object { Write-Output "attaching $_" }
 
-          gh release create "${{ github.ref_name }}" $files `
-            --draft `
-            --title "PeekESP ${{ github.ref_name }}" `
-            --notes-file RELEASE_NOTES.md
+          # Idempotent: re-running against a tag whose release already exists
+          # replaces the assets instead of failing, so a bad release can be
+          # rebuilt without deleting anything by hand.
+          $exists = $false
+          gh release view "${{ github.ref_name }}" > $null 2>&1
+          if ($LASTEXITCODE -eq 0) { $exists = $true }
+
+          if ($exists) {
+            Write-Output "release exists - replacing its assets"
+            gh release upload "${{ github.ref_name }}" $files --clobber
+          } else {
+            gh release create "${{ github.ref_name }}" $files `
+              --draft `
+              --title "PeekESP ${{ github.ref_name }}" `
+              --notes-file RELEASE_NOTES.md
+          }
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: What happens next
