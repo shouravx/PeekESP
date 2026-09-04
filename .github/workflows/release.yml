@@ -71,6 +71,24 @@ jobs:
             windows/dist/*.sha256
             packaging/winget/*/*.yaml
 
+      - name: Collect the manifests that match THIS build
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          # The manifests committed to the repository were generated beside a
+          # zip built on someone's laptop. A PyInstaller exe is not
+          # reproducible - it embeds build paths and timestamps - so the zip
+          # built here has a different hash, and the committed manifest does
+          # not describe it. The ones that do are the ones package.py just
+          # wrote, so they travel with the release rather than being left
+          # behind in the workspace.
+          $v = (Get-Content VERSION -Raw).Trim()
+          New-Item -ItemType Directory -Force -Path release-manifests | Out-Null
+          Copy-Item "packaging/winget/$v/*.yaml" release-manifests/
+          Compress-Archive -Path release-manifests/* `
+            -DestinationPath "windows/dist/winget-manifests-$v.zip" -Force
+          Get-ChildItem release-manifests | ForEach-Object { Write-Output $_.Name }
+
       - name: Draft the release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2

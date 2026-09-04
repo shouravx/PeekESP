@@ -78,6 +78,22 @@ def build():
         sys.exit("build failed - nothing packaged")
 
 
+# A zip records each entry's modification time, so packing the same bytes twice
+# produces two different files and two different hashes. That is how a manifest
+# quietly stops describing the artefact it was written for: rebuild the zip for
+# any reason after the manifest is committed, and the hash no longer matches
+# anything. Fixing the timestamp makes the archive a pure function of its
+# contents.
+ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+
+
+def _add(z, name, data):
+    info = zipfile.ZipInfo(name, date_time=ZIP_EPOCH)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = 0o644 << 16
+    z.writestr(info, data)
+
+
 def make_zip(version):
     name = f"PeekESP-{version}-win-x64.zip"
     out = DIST / name
@@ -92,10 +108,11 @@ def make_zip(version):
     print(f"\n=== packing {name} ===")
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for exe, _alias in PAYLOAD:
-            z.write(DIST / exe, exe)
+            _add(z, exe, (DIST / exe).read_bytes())
             print(f"   {exe}  {(DIST / exe).stat().st_size / 1048576:.1f} MB")
-        z.write(REPO / "LICENSE", "LICENSE")
-        z.writestr("README.txt", READ_ME.format(version=version, repo=REPO_URL))
+        _add(z, "LICENSE", (REPO / "LICENSE").read_bytes())
+        _add(z, "README.txt",
+             READ_ME.format(version=version, repo=REPO_URL).encode("utf-8"))
 
     digest = sha256(out)
     # Written next to the zip so whoever uploads it can check the manifest
@@ -216,6 +233,39 @@ def write_manifests(version, zip_name, digest):
     return out, url
 
 
+def cross_check(version, zip_name, digest):
+    """Read the manifests back and check them against the zip on disk.
+
+    `winget validate` only checks the schema, and the install test that would
+    catch the rest needs administrator rights. What actually goes wrong is a
+    NestedInstallerFiles path that does not exist inside the archive, or a hash
+    written before the zip was rebuilt - both of which produce a schema-valid
+    manifest that installs nothing, and both of which are visible right here.
+    """
+    installer = (WINGET / version / f"{PACKAGE_ID}.installer.yaml").read_text(
+        encoding="utf-8")
+    names = set(zipfile.ZipFile(DIST / zip_name).namelist())
+
+    problems = []
+    declared = [ln.split(":", 1)[1].strip()
+                for ln in installer.splitlines() if "RelativeFilePath:" in ln]
+    for path in declared:
+        if path not in names:
+            problems.append(f"{path} is declared but not in the zip")
+    if not declared:
+        problems.append("no NestedInstallerFiles declared at all")
+
+    if f"InstallerSha256: {digest}" not in installer:
+        problems.append("the manifest hash is not the hash of this zip")
+
+    print("\n=== cross-checking the manifest against the zip ===")
+    for path in declared:
+        print(f"   {'ok ' if path in names else 'MISSING'}  {path}")
+    if problems:
+        sys.exit("\n".join("   !! " + p for p in problems))
+    print("   ok   hash matches")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Package PeekESP for release and winget")
     ap.add_argument("--version", help="override the VERSION file")
@@ -234,6 +284,7 @@ def main():
 
     zip_name, digest = make_zip(version)
     out, url = write_manifests(version, zip_name, digest)
+    cross_check(version, zip_name, digest)
 
     print(f"""
 {"=" * 68}
@@ -250,7 +301,12 @@ Next, in order - none of it has happened yet:
 
      curl -sIL {url} | findstr /i "HTTP content-length"
 
-3. Submit to winget. Fork microsoft/winget-pkgs, copy the manifests to
+3. Submit to winget - using the manifests attached to the release, not the
+   ones in the repository. A PyInstaller exe is not reproducible, so the zip
+   CI builds has a different hash from this one and only the manifests written
+   beside it describe it.
+
+   Fork microsoft/winget-pkgs, copy them to
    manifests/s/shouravx/PeekESP/{version}/ and open a pull request.
    Validate them first - this catches the schema mistakes that otherwise
    come back as a review comment days later:

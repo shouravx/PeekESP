@@ -86,6 +86,19 @@ winget uninstall shouravx.PeekESP
 
 ### 4. Submit
 
+> **Use the manifests attached to the release, not the ones committed here.**
+>
+> A PyInstaller exe is not reproducible — it embeds build paths and timestamps —
+> so the zip built by CI has a different hash from one built on a laptop, and
+> the committed manifest does not describe it. The release carries
+> `winget-manifests-<version>.zip`, written beside the exact zip that was
+> uploaded. The copies in this directory are a record of what was generated,
+> useful for reading and diffing, and wrong to submit on their own.
+>
+> The zip itself *is* reproducible from a given pair of exes — entry timestamps
+> are fixed — so re-running `package.py` without rebuilding will not silently
+> change the hash under you.
+
 Fork <https://github.com/microsoft/winget-pkgs>, then:
 
 ```
