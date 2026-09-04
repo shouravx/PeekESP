@@ -214,8 +214,14 @@ Deploys can run themselves: add a `CLOUDFLARE_API_TOKEN` secret and the
 
 > Free-tier note: this uses a **Durable Object**, not Workers KV. KV's free tier
 > allows 1,000 writes/day and a 5-second push interval is 17,280 — it would fail
-> partway through day one. A paired set costs ~35k requests/day against a
-> 100k/day allowance, so **one deployment covers two devices**.
+> partway through day one.
+>
+> Requests are what you actually budget. At a 5-second interval each agent costs
+> 17,280 pushes/day and each display costs 17,280 polls/day, against a 100k/day
+> allowance. So **one display plus two machines fits; one display plus four does
+> not.** A display polls once no matter how many machines it shows — the cost is
+> per *agent*, not per screen you swipe to. Raising the interval to 15 s divides
+> everything by three.
 
 ### 3. Pair the device
 
@@ -379,6 +385,37 @@ getting it wrong is swapped red and blue, not an error.
 Every field is optional on the wire — a missing key falls back to a default
 rather than failing the parse. `cpu_temp_c` below zero renders as `--`, which is
 what hosts with no thermal zone report.
+
+### Several machines, one code
+
+A pairing code identifies *you*, not a machine. Run the agent on a Windows box,
+a Mac and a DietPi with the same code and all three appear on the display; the
+buttons swipe between them. Nothing extra to configure — each agent already
+reports its `host`, and the relay keeps a slot per host instead of letting them
+overwrite each other.
+
+The relay's reply carries them all, so the device gets everything in one poll:
+
+```json
+{
+  "host": "windows-pc", "cpu_percent": 3.4, "age_s": 1,
+  "device_count": 3,
+  "devices": [
+    { "host": "dietpi",     "cpu_percent": 12.5, "age_s": 3 },
+    { "host": "macbook",    "cpu_percent": 8.1,  "age_s": 2 },
+    { "host": "windows-pc", "cpu_percent": 3.4,  "age_s": 1 }
+  ]
+}
+```
+
+The freshest machine is repeated at the top level so a device flashed before
+this existed keeps working untouched. `devices` is sorted by name rather than by
+recency — the display swipes through this array, and an order that reshuffled
+whenever a push landed would move a machine out from under your thumb.
+
+Six machines per code. A host silent for 24 hours drops off the list; anything
+still listed carries its own `age_s`, so the display can say how stale it is
+rather than pretending it is live.
 
 Storage covers **every fixed disk**, not just the system one: a machine with a
 full 240 GB SSD and an empty 2 TB drive is mostly empty, and reporting only the

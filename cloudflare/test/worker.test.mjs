@@ -2,6 +2,11 @@ import worker, { TelemetryStore, deriveToken, derivePairing } from "../src/index
 import { deriveTokenNode } from "../mint.mjs";
 
 // --- stub the Durable Object runtime ---------------------------------------
+// Deliberately shaped like the real DurableObjectStorage rather than like the
+// three calls the Worker happened to make first: list() returns a Map in sorted
+// key order, and delete() takes either one key or an array. A stub that only
+// implements what is currently called turns the next feature into a crash
+// during the test run instead of a failing assertion.
 class FakeStorage {
   constructor() { this.map = new Map(); }
   async put(a, b) {
@@ -9,6 +14,17 @@ class FakeStorage {
     else this.map.set(a, b);
   }
   async get(k) { return this.map.get(k); }
+  async delete(k) {
+    const keys = Array.isArray(k) ? k : [k];
+    let n = 0;
+    for (const key of keys) if (this.map.delete(key)) n++;
+    return Array.isArray(k) ? n : n > 0;
+  }
+  async list({ prefix = "" } = {}) {
+    return new Map([...this.map]
+      .filter(([key]) => key.startsWith(prefix))
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
+  }
 }
 
 // One store per Durable Object name, so cross-stream isolation is actually
@@ -241,6 +257,122 @@ await check("one code's token is refused on another code's CLAIMED stream",
 // or the two namespaces would overlap and a paired stream would be rejected.
 await check("paired streams still work when MASTER_SECRET is configured",
   await worker.fetch(req(`/telemetry/${d.stream}`, { token: d.read }), env), 200);
+
+// ===========================================================================
+//  Several machines behind one pairing code
+// ===========================================================================
+const multi = await derivePairing("MULTI2DEV34");
+
+// Paired streams live in a Durable Object named "pair:<stream>", so reaching
+// the right fake storage means using the same name the Worker does.
+const multiStore = storeFor("pair:" + multi.stream).state.storage;
+
+const pushHost = (host, extra = {}) =>
+  worker.fetch(req("/ingest/" + multi.stream, {
+    method: "POST",
+    token: multi.push,
+    body: JSON.stringify({ host, cpu_percent: 1, ...extra }),
+  }), env);
+
+const readMulti = () =>
+  worker.fetch(req("/telemetry/" + multi.stream, { token: multi.read }), env);
+
+// Timestamps are written by Date.now(), so several pushes in one tick are
+// indistinguishable. Ageing a slot by hand is what makes "the freshest host"
+// and "expired" testable at all rather than dependent on how fast this runs.
+function ageHost(name, ms) {
+  const key = "dev_" + name;
+  const row = multiStore.map.get(key);
+  if (!row) return false;
+  multiStore.map.set(key, { ...row, at: row.at - ms });
+  return true;
+}
+
+await check("first host pushes", await pushHost("windows-pc"), 200);
+await check("second host pushes to the same stream", await pushHost("dietpi"), 200);
+await check("third host, a Mac", await pushHost("macbook"), 200);
+
+await check("all three come back in one response", await readMulti(), 200,
+  (j) => j.device_count === 3 && j.devices.length === 3);
+
+await check("the array is sorted by name, not by arrival",
+  await readMulti(), 200,
+  (j) => j.devices.map((d) => d.host).join(",") === "dietpi,macbook,windows-pc");
+
+await check("every device carries its own age",
+  await readMulti(), 200,
+  (j) => j.devices.every((d) => typeof d.age_s === "number"));
+
+// The whole point of the top-level copy: a device flashed before any of this
+// existed reads these fields and never looks at the array. Alphabetically
+// "dietpi" sorts first, so ageing the other two proves the top level follows
+// recency rather than array order.
+assert("two hosts can be aged for the freshness test",
+  ageHost("dietpi", 60_000) && ageHost("macbook", 30_000));
+await check("the freshest host is mirrored at the top level for old firmware",
+  await readMulti(), 200,
+  (j) => j.host === "windows-pc" && j.age_s === 0);
+await check("...and the stale ones report their real age in the array",
+  await readMulti(), 200,
+  (j) => j.devices.find((d) => d.host === "dietpi").age_s === 60);
+
+await check("re-pushing a host updates its slot rather than adding one",
+  await pushHost("dietpi", { cpu_percent: 99 }), 200);
+await check("...so the count is unchanged and the value is the new one",
+  await readMulti(), 200,
+  (j) => j.device_count === 3 &&
+         j.devices.find((d) => d.host === "dietpi").cpu_percent === 99);
+
+// A host string is attacker-influenced in the sense that it arrives on the wire
+// and is used as a storage key.
+await check("a control character in the host name is stripped",
+  await pushHost("bad" + String.fromCharCode(7) + "name  "), 200);
+await check("...and it lands under a clean, trimmed key",
+  await readMulti(), 200,
+  (j) => j.devices.some((d) => d.host === "badname"));
+
+await check("an agent that reports no host at all still gets a slot",
+  await worker.fetch(req("/ingest/" + multi.stream, {
+    method: "POST", token: multi.push, body: JSON.stringify({ cpu_percent: 5 }),
+  }), env), 200);
+await check("...named so the display has something to show",
+  await readMulti(), 200, (j) => j.devices.some((d) => d.host === "host"));
+
+// --- the cap ---------------------------------------------------------------
+// Five slots exist by now; three more takes it past the cap of six.
+for (const name of ["h1", "h2", "h3"]) await pushHost(name);
+await check("the store caps how many machines one code can hold",
+  await readMulti(), 200, (j) => j.device_count === 6);
+await check("...and it is the stalest that gets dropped, not the newest",
+  await readMulti(), 200,
+  (j) => j.devices.some((d) => d.host === "h3") &&
+         !j.devices.some((d) => d.host === "windows-pc"));
+
+// --- the TTL ---------------------------------------------------------------
+assert("a host can be aged past the 24 h TTL", ageHost("h1", 25 * 60 * 60 * 1000));
+await check("a host silent for over a day is not listed",
+  await readMulti(), 200, (j) => !j.devices.some((d) => d.host === "h1"));
+await check("...and the next push actually deletes it rather than just hiding it",
+  await pushHost("h2"), 200);
+assert("the expired slot is gone from storage", !multiStore.map.has("dev_h1"));
+
+// --- upgrading a store written by the previous Worker ----------------------
+const legacyStore = new TelemetryStore({ storage: new FakeStorage() });
+await legacyStore.state.storage.put({
+  latest: { host: "olddata", cpu_percent: 7 }, at: Date.now() - 3000,
+});
+await check("a store holding only the old single 'latest' still serves it",
+  await legacyStore.fetch(new Request("https://relay.example/")), 200,
+  (j) => j.host === "olddata" && j.device_count === 1 && j.devices.length === 1);
+
+await legacyStore.fetch(new Request("https://relay.example/", {
+  method: "POST", body: JSON.stringify({ host: "newdata", cpu_percent: 8 }),
+}));
+await check("...and the first new push replaces it rather than sitting beside it",
+  await legacyStore.fetch(new Request("https://relay.example/")), 200,
+  (j) => j.device_count === 1 && j.devices[0].host === "newdata");
+assert("the legacy keys are gone once a per-host slot exists",
+  !legacyStore.state.storage.map.has("latest"));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

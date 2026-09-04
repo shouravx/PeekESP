@@ -56,6 +56,39 @@ const PAIR_RE = /^[0-9a-f]{16}$/;
 
 const TOKEN_HEX_LEN = 48;
 
+// ---------------------------------------------------------------------------
+//  Several machines, one pairing code
+// ---------------------------------------------------------------------------
+// A pairing code identifies a person, not a machine. Someone with a desktop, a
+// laptop and a Pi wants all three on the one display, so the store keeps a slot
+// per reported host instead of a single "latest" that they would overwrite in
+// turn - which is what happened before, and looked exactly like a flapping
+// agent.
+const DEVICE_PREFIX = "dev_";
+
+// Enough for a plausible household. The cap exists so a misconfigured fleet
+// cannot grow this object without bound, and so the response stays inside what
+// an ESP32 can parse.
+const MAX_DEVICES = 6;
+
+// A laptop that is shut overnight is still something you monitor, so this is
+// deliberately generous: it is here to stop a renamed or retired host lingering
+// forever, not to hide one that is merely asleep. Anything still listed carries
+// age_s, so the display can say how stale it is rather than pretending.
+const DEVICE_TTL_MS = 24 * 60 * 60 * 1000;
+
+// The host name arrives from the wire and becomes a storage key. Keys are only
+// ever compared against keys we wrote ourselves, but a control character or a
+// 4 KB name still has no business in storage, and a name that renders as
+// nothing would give the display a blank tab to swipe to.
+function deviceKey(name) {
+  const clean = String(name ?? "")
+    .replace(/[^\x20-\x7E]/g, "")
+    .trim()
+    .slice(0, 32);
+  return DEVICE_PREFIX + (clean || "host");
+}
+
 function json(body, status = 200, extra = {}) {
   return new Response(JSON.stringify(body), {
     status,
@@ -177,23 +210,84 @@ export class TelemetryStore {
       } catch {
         return json({ error: "body is not valid JSON" }, 400);
       }
-      await this.state.storage.put({ latest: parsed, at: Date.now() });
+      const now = Date.now();
+      await this.state.storage.put(deviceKey(parsed.host), { payload: parsed, at: now });
+      // Written by a Worker older than per-host slots. Once any host has its
+      // own slot the single "latest" is stale by definition, and leaving it
+      // would resurrect one machine's numbers if every slot later expired.
+      await this.state.storage.delete(["latest", "at"]);
+      await this.prune(now);
       return json({ ok: true });
     }
 
-    const [latest, at] = await Promise.all([
-      this.state.storage.get("latest"),
-      this.state.storage.get("at"),
-    ]);
+    const now = Date.now();
+    const { list: devices, newest } = await this.devices(now);
 
-    if (!latest) {
-      return json({ error: "no telemetry received yet" }, 503);
+    if (!devices.length) {
+      // An object last written by the previous Worker still holds "latest" and
+      // nothing under dev_. Serving it means an upgrade does not blank the
+      // display for the few seconds until the next push arrives.
+      const [latest, at] = await Promise.all([
+        this.state.storage.get("latest"),
+        this.state.storage.get("at"),
+      ]);
+      if (!latest) {
+        return json({ error: "no telemetry received yet" }, 503);
+      }
+      const legacy = { ...latest, age_s: Math.round((now - (at || 0)) / 1000) };
+      return json({ ...legacy, devices: [legacy], device_count: 1 });
     }
+
+    // The freshest host is repeated at the top level so that a device flashed
+    // before any of this existed keeps working: it reads the fields it knows
+    // and never looks at the array.
+    const freshest = devices.find((d) => d.host === newest) || devices[0];
 
     // age_s lets the display distinguish "the host stopped reporting" from
     // "the network is down" - without it a dead agent looks like fresh data
     // forever, which is the worst possible failure for a monitor.
-    return json({ ...latest, age_s: Math.round((Date.now() - (at || 0)) / 1000) });
+    return json({ ...freshest, devices, device_count: devices.length });
+  }
+
+  /** { list, newest } - live slots in a stable order, plus which one is current. */
+  async devices(now) {
+    const rows = [...(await this.state.storage.list({ prefix: DEVICE_PREFIX }))]
+      .filter(([, v]) => v && now - (v.at || 0) <= DEVICE_TTL_MS)
+      .sort((a, b) => (b[1].at || 0) - (a[1].at || 0))
+      .slice(0, MAX_DEVICES);
+
+    // Recency is decided on the stored millisecond rather than on age_s, which
+    // is rounded to a whole second: three agents pushing on the same tick would
+    // tie, and "the freshest host" would quietly become "whichever sorted
+    // first alphabetically".
+    const newest = rows.length ? rows[0][0].slice(DEVICE_PREFIX.length) : null;
+
+    const list = rows
+      .map(([key, v]) => ({
+        ...v.payload,
+        host: key.slice(DEVICE_PREFIX.length),
+        age_s: Math.round((now - (v.at || 0)) / 1000),
+      }))
+      // Sorted by name for the response, not by recency: the display swipes
+      // through this array, and an order that reshuffles whenever a push lands
+      // would move a machine out from under someone's thumb.
+      .sort((a, b) => (a.host < b.host ? -1 : a.host > b.host ? 1 : 0));
+
+    return { list, newest };
+  }
+
+  /** Drop expired slots, then the stalest of whatever is over the cap. */
+  async prune(now) {
+    const rows = [...(await this.state.storage.list({ prefix: DEVICE_PREFIX }))];
+    const expired = rows.filter(([, v]) => !v || now - (v.at || 0) > DEVICE_TTL_MS);
+    const live = rows
+      .filter(([, v]) => v && now - (v.at || 0) <= DEVICE_TTL_MS)
+      .sort((a, b) => (b[1].at || 0) - (a[1].at || 0));
+
+    const doomed = [...expired, ...live.slice(MAX_DEVICES)].map(([k]) => k);
+    if (doomed.length) {
+      await this.state.storage.delete(doomed);
+    }
   }
 }
 

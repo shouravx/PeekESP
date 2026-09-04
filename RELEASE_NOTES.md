@@ -97,10 +97,12 @@ device-side code compiles and the parts that have run, worked — but this is a
 
 ## Known limits
 
-**Two paired devices per Worker.** Cloudflare's free tier allows 100,000
-requests/day; a paired set costs about 35,000. A third pair exceeds it for
-everyone on that deployment. Raising the poll interval from 5 s to 15 s gets
-you six.
+**The free tier is a request budget, not a device count.** Cloudflare allows
+100,000 requests/day. At a 5-second interval each agent costs 17,280 and each
+display costs 17,280, so a display with two machines is ~52k and fits, while a
+display with four is ~86k and is close to the edge. A display costs the same
+whether it shows one machine or six — one poll returns all of them. Raising the
+interval to 15 s divides everything by three.
 
 **Temperature on Windows needs LibreHardwareMonitor.** Windows has no API for
 it — the value sits behind a kernel driver that reads the chip's MSRs. The agent

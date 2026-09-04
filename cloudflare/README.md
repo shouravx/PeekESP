@@ -160,8 +160,11 @@ Workers KV's free tier allows **1,000 writes/day**. A 5-second push interval is
 no such per-day write cap, and the free plan covers the SQLite-backed ones this
 uses.
 
-Request volume is ~35k/day (both ends, every 5 s) against a 100k/day free
-allowance, so the whole thing fits comfortably in the free tier.
+Request volume at a 5-second interval is 17,280/day per agent plus 17,280/day
+per display, against a 100k/day free allowance. One display and two machines is
+~52k and fits comfortably; one display and four machines is ~86k and is getting
+close. A display costs the same whether it shows one machine or six, because a
+single poll returns all of them — the budget is per agent, not per screen.
 
 If `wrangler deploy` says Durable Objects aren't available on your account,
 that's the thing to check — the `new_sqlite_classes` migration in
