@@ -12,7 +12,7 @@ NestedInstallerFiles:
 Installers:
   - Architecture: x64
     InstallerUrl: https://github.com/shouravx/PeekESP/releases/download/v1.1.0/PeekESP-1.1.0-win-x64.zip
-    InstallerSha256: 73A87FA767BC2692D272C6C38ED8552DA1B29AAFDBBAE8AD6C8F136B4A8A16DE
+    InstallerSha256: 9B07AE759BA979E4E05F5720396CC67DD1EE0BF10543466C57E9894B06DBFA66
 ReleaseDate: 2026-09-04
 ManifestType: installer
 ManifestVersion: 1.6.0
