@@ -935,7 +935,17 @@ static bool wifi_connect(uint32_t timeout_ms) {
 
   g_state = NET_WIFI;
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);              // modem sleep adds ~100 ms of jitter
+  // Modem sleep ON. It was off to remove ~100 ms of latency jitter, which was
+  // a poor trade: this device talks for a fraction of a second every 5 s, and
+  // keeping the radio receiver powered the rest of the time costs roughly
+  // 60-80 mA continuously. On a board whose 3.3 V comes from a linear
+  // regulator, that current is also heat - (5.0-3.3) x I, burned in a SOT-223
+  // package - which is most of why the board runs warm. The animations hide
+  // the extra latency entirely.
+  //
+  // Only reached from netTask, so the access point in setup mode is
+  // unaffected; a sleeping radio there could drop clients mid-configuration.
+  WiFi.setSleep(true);
   WiFi.setAutoReconnect(true);
   WiFi.begin(cfg.wifi_ssid, cfg.wifi_pass);
 
@@ -1419,6 +1429,25 @@ void setup() {
     delay(8);
   }
   backlight_set(level);
+
+  // Core 0 is the core that is ALLOWED to block - that is the whole point of
+  // the split - so the idle-task watchdog on it is fundamentally at odds with
+  // this design and has to go:
+  //
+  //   WebServer::handleClient() waits up to HTTP_MAX_DATA_WAIT (5 s) for a
+  //   client that connected and did not finish its request. Captive-portal
+  //   probes do exactly that the moment a phone joins the access point.
+  //   HTTPClient over TLS waits up to HTTP_TIMEOUT_MS (8 s) for a slow relay.
+  //
+  //   Either blocks INSIDE the call, so no amount of vTaskDelay() between
+  //   loop iterations helps; IDLE0 simply never runs, the watchdog fires at
+  //   5 s, and the device reboots in a loop that looks like a crash.
+  //
+  // Core 1's watchdog stays on, and that is the one worth having: nothing on
+  // the UI core is ever allowed to block, so if IDLE1 starves it is a genuine
+  // bug rather than a network call doing its job. The network side keeps its
+  // own liveness check - MAX_CONSECUTIVE_FAILURES still forces a restart.
+  disableCore0WDT();
 
   // Core 0: everything that can block. Core 1: everything that must not.
   // 16 KB rather than 10: an mbedTLS handshake for the relay transport is
