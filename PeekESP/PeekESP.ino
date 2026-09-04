@@ -817,7 +817,14 @@ static void build_splash(lv_obj_t *scr) {
   lv_label_set_text(sub, "dashboard");
   lv_obj_set_style_text_font(sub, F_SM, 0);
   lv_obj_set_style_text_color(sub, COL_TEXT_DIM, 0);
-  lv_obj_set_pos(sub, 136, 74);
+  lv_obj_set_pos(sub, 136, 72);
+
+  lv_obj_t *by = lv_label_create(sp);
+  lv_label_set_text(by, "by shouravx");
+  lv_obj_set_style_text_font(by, F_SM, 0);
+  lv_obj_set_style_text_color(by, COL_CYAN, 0);
+  lv_obj_set_style_text_opa(by, LV_OPA_70, 0);
+  lv_obj_set_pos(by, 136, 90);
 
   lv_anim_t a;
   lv_anim_init(&a);
@@ -1239,6 +1246,8 @@ static const char PAGE_CSS[] PROGMEM =
   "color:#05070E;font:600 15px/1 inherit;letter-spacing:.04em;cursor:pointer}"
   "a.reset{display:block;text-align:center;margin-top:14px;color:#FF4D6D;font-size:13px}"
   "p.hint{margin:-4px 0 12px;font-size:12px;line-height:1.45;color:#5C6B82}"
+  "p.by{text-align:center;margin:22px 0 0;font-size:12px;color:#5C6B82}"
+  "p.by a{color:#00E5FF;text-decoration:none}"
   "</style>";
 
 /**
@@ -1380,7 +1389,10 @@ static void handle_root() {
          "connection interceptable.</p></fieldset>");
 
   p += F("<button type=submit>SAVE &amp; REBOOT</button></form>"
-         "<a class=reset href=/reset>erase all settings</a></main>");
+         "<a class=reset href=/reset>erase all settings</a>"
+         "<p class=by>PeekESP by <a href=\"https://github.com/shouravx\">shouravx</a>"
+         " &middot; <a href=\"https://github.com/shouravx/PeekESP\">source</a></p>"
+         "</main>");
 
   server.send(200, "text/html", p);
 }

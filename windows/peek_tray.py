@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 from pathlib import Path
 
 import peek_agent_win as agent
@@ -551,6 +552,14 @@ def open_settings(runner):
 
     hint = label(body, f"config file: {cfgmod.config_path()}", DIM, 8)
     hint.pack(anchor="w", pady=(6, 0))
+
+    by = tk.Label(body, text="PeekESP by shouravx  ·  github.com/shouravx/PeekESP",
+                  bg=BG, fg=DIM, font=("Segoe UI", 8), cursor="hand2")
+    by.pack(anchor="w", pady=(4, 0))
+    by.bind("<Button-1>",
+            lambda _e: webbrowser.open("https://github.com/shouravx/PeekESP"))
+    by.bind("<Enter>", lambda _e: by.config(fg=CYAN))
+    by.bind("<Leave>", lambda _e: by.config(fg=DIM))
 
     # ---- buttons ----
     def button(parent, text, cmd, accent=False):
