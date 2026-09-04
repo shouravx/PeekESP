@@ -117,8 +117,13 @@
 
 // Expected JSON (see dietpi/peek-agent.py):
 //   { "host":"dietpi", "cpu_percent":12.5, "ram_percent":43.2,
-//     "storage_percent":61.0, "cpu_temp_c":48.3, "uptime_seconds":271830,
+//     "storage_percent":61.0, "storage_total_gb":117.9, "storage_free_gb":46.0,
+//     "cpu_temp_c":48.3, "uptime_seconds":271830,
 //     "net_rx_kbps":128.4, "net_tx_kbps":12.9 }
+//
+// The two storage_*_gb fields arrived after 1.0.0. An older agent simply omits
+// them, and the display falls back to the percentage alone rather than showing
+// "0 GB free" - which would read as a full disk instead of a missing field.
 
 // ============================================================================
 //  Palette + geometry
@@ -160,6 +165,8 @@ struct Telemetry {
   float    cpu_percent     = 0;
   float    ram_percent     = 0;
   float    storage_percent = 0;
+  float    storage_total_gb = 0;      // 0 = host is older than these fields
+  float    storage_free_gb  = 0;
   float    cpu_temp_c      = -1;      // <0 = host did not report one
   float    rx_kbps         = 0;
   float    tx_kbps         = 0;
@@ -453,6 +460,7 @@ static bool consume_setup_request() {
 static Gauge     g_cpu, g_ram;
 static lv_obj_t *g_bar       = nullptr;
 static lv_obj_t *g_bar_value = nullptr;
+static lv_obj_t *g_lbl_store = nullptr;
 static int32_t   g_bar_shown = 0;
 static lv_obj_t *g_dot       = nullptr;
 static lv_obj_t *g_spinner   = nullptr;
@@ -572,6 +580,16 @@ static void apply_state(NetState st) {
 static void fmt_rate(char *out, size_t n, float kbps) {
   if (kbps >= 1000.0f) snprintf(out, n, "%.1fM", kbps / 1024.0f);
   else                 snprintf(out, n, "%.0fK", kbps);
+}
+
+// Storage crosses three orders of magnitude across the machines this runs
+// against - a 4 GB DietPi card and a 12 TB array both have to fit in the same
+// 150 px. Drop to one decimal only where it carries information: "1.8T" says
+// something "1T" does not, "906G" and "906.4G" say the same thing.
+static void fmt_capacity(char *out, size_t n, float gb) {
+  if      (gb >= 1024.0f) snprintf(out, n, "%.1fT", gb / 1024.0f);
+  else if (gb >= 10.0f)   snprintf(out, n, "%.0fG", gb);
+  else                    snprintf(out, n, "%.1fG", gb);
 }
 
 static void fmt_uptime(char *out, size_t n, uint32_t s) {
@@ -704,7 +722,16 @@ static void build_dashboard_ui() {
                           LV_SYMBOL_DOWN " --  " LV_SYMBOL_UP " --");
 
   // ---- storage ----
-  make_label(scr, F_SM, COL_TEXT_DIM, 8, 92, "STORAGE");
+  // Not a static caption any more: once the host reports capacity this becomes
+  // "STORAGE  906G FREE", which is the number people actually want. It stays
+  // left of x=162 so it cannot collide with the percentage.
+  g_lbl_store = make_label(scr, F_SM, COL_TEXT_DIM, 8, 92, "STORAGE");
+  // Bounded rather than measured: the default long mode wraps, which would put
+  // a second line straight through the bar at y=108, and an unbounded label on
+  // a 12 TB array would reach the percentage. Clipping does neither.
+  lv_obj_set_width(g_lbl_store, 150);
+  lv_label_set_long_mode(g_lbl_store, LV_LABEL_LONG_CLIP);
+
   g_bar_value = make_label(scr, F_SM, COL_TEXT, 162, 92, "0%");
   lv_obj_set_width(g_bar_value, 70);
   lv_obj_set_style_text_align(g_bar_value, LV_TEXT_ALIGN_RIGHT, 0);
@@ -966,6 +993,14 @@ static void ui_sync_cb(lv_timer_t *t) {
 
   char buf[48], a[12], b[12];
 
+  if (snap.storage_total_gb > 0) {
+    fmt_capacity(a, sizeof a, snap.storage_free_gb);
+    snprintf(buf, sizeof buf, "STORAGE  %s FREE", a);
+  } else {
+    snprintf(buf, sizeof buf, "STORAGE");
+  }
+  lv_label_set_text(g_lbl_store, buf);
+
   if (snap.cpu_temp_c >= 0) snprintf(buf, sizeof buf, "%.0f\xC2\xB0", snap.cpu_temp_c);
   else                      snprintf(buf, sizeof buf, "--");
   lv_label_set_text(g_lbl_temp, buf);
@@ -1053,7 +1088,7 @@ static bool parse_payload(const String &payload, Telemetry &out) {
 #if ARDUINOJSON_VERSION_MAJOR >= 7
   JsonDocument doc;
 #else
-  StaticJsonDocument<640> doc;
+  StaticJsonDocument<768> doc;   // two storage_*_gb fields wider than 1.0.0
 #endif
   const DeserializationError err = deserializeJson(doc, payload);
   if (err) {
@@ -1063,8 +1098,10 @@ static bool parse_payload(const String &payload, Telemetry &out) {
 
   out.cpu_percent     = doc["cpu_percent"]     | 0.0f;
   out.ram_percent     = doc["ram_percent"]     | 0.0f;
-  out.storage_percent = doc["storage_percent"] | 0.0f;
-  out.cpu_temp_c      = doc["cpu_temp_c"]      | -1.0f;
+  out.storage_percent  = doc["storage_percent"]  | 0.0f;
+  out.storage_total_gb = doc["storage_total_gb"] | 0.0f;
+  out.storage_free_gb  = doc["storage_free_gb"]  | 0.0f;
+  out.cpu_temp_c       = doc["cpu_temp_c"]       | -1.0f;
   out.rx_kbps         = doc["net_rx_kbps"]     | 0.0f;
   out.tx_kbps         = doc["net_tx_kbps"]     | 0.0f;
   out.uptime_seconds  = doc["uptime_seconds"]  | 0u;

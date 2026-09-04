@@ -161,15 +161,33 @@ next size up.
 |---|---|
 | `cpu_percent` | `GetSystemTimes`, idle vs total delta |
 | `ram_percent` | `GlobalMemoryStatusEx` |
-| `storage_percent` | `GetDiskFreeSpaceExW` on `%SystemDrive%` |
+| `storage_percent` | `GetDiskFreeSpaceExW`, summed over every fixed drive |
+| `storage_total_gb` / `storage_free_gb` | the same call, as bytes |
 | `uptime_seconds` | `GetTickCount64` |
 | `net_rx_kbps` / `net_tx_kbps` | `GetIfTable`, deduplicated |
-| `cpu_temp_c` | always `-1` — see below |
+| `cpu_temp_c` | LibreHardwareMonitor, else WMI, else `-1` — see below |
 
-**No temperature.** Windows exposes none without a vendor driver;
-`MSAcpi_ThermalZoneTemperature` needs admin and most desktops don't implement
-it. Reporting `-1` makes the display show `--` rather than a confident wrong
-number.
+**Storage is every fixed disk.** `GetLogicalDrives` gives the mask,
+`GetDriveTypeW` filters it to `DRIVE_FIXED`, so removable, optical and mapped
+network drives don't inflate the total. Reporting `%SystemDrive%` alone said 95 %
+on a machine that was 57 % full, because the data lived on two other disks.
+
+**Temperature needs help on Windows.** There is no API for it: the value lives
+behind a kernel driver that reads the chip's MSRs, and nothing in user space can
+get at it. The agent tries, in order:
+
+1. **[LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)**
+   (or OpenHardwareMonitor) with its web server enabled — *Options → Remote Web
+   Server → Run*, port 8085. This is the one that actually works. The agent
+   reads `/data.json` and prefers the CPU *package* sensor over the individual
+   cores, since the package is what a thermal readout normally means.
+2. **WMI** `MSAcpi_ThermalZoneTemperature` via PowerShell. Needs administrator,
+   and most desktop boards don't implement the class at all — it usually returns
+   *Access denied* or nothing.
+3. `-1`, which the display renders as `--` rather than a confident wrong number.
+
+Results are cached for 20 s and the agent remembers which source worked, so a
+machine with neither doesn't spawn PowerShell every 20 seconds forever.
 
 **Network counters need deduplicating.** `GetIfTable` lists every NDIS *filter*
 bound to an adapter as its own row: one Realtek NIC typically appears four times

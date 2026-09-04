@@ -7,7 +7,8 @@ Pure standard library, reads /proc directly - no psutil, no pip, nothing to
 install on a DietPi.
 
     { "host": "dietpi", "cpu_percent": 12.5, "ram_percent": 43.2,
-      "storage_percent": 61.0, "cpu_temp_c": 48.3, "uptime_seconds": 271830,
+      "storage_percent": 61.0, "storage_total_gb": 117.9,
+      "storage_free_gb": 46.0, "cpu_temp_c": 48.3, "uptime_seconds": 271830,
       "net_rx_kbps": 128.4, "net_tx_kbps": 12.9 }
 
 Run it:      python3 peek-agent.py
@@ -25,8 +26,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 BIND = "0.0.0.0"          # must NOT be 127.0.0.1, or the tunnel cannot reach it
 PORT = 8080
 PATH = "/telemetry"
-DISK_MOUNT = "/"
 SAMPLE_SECONDS = 2.0      # how often the background sampler takes a reading
+
+# Mounted over the network. The bytes are real, but they are not this machine's
+# storage, and an unreachable server makes statvfs() hang rather than fail.
+NET_FSTYPES = frozenset((
+    "nfs", "nfs4", "cifs", "smbfs", "smb3", "sshfs", "ncpfs", "afs", "9p",
+))
+
+# A thermal zone is whatever the board vendor decided to expose: on a Pi it is
+# the SoC, on a laptop it can be the battery bay or the wifi card. Prefer the
+# zones that are actually a CPU before falling back to "the first one that
+# reads above zero".
+CPU_ZONE_HINTS = ("x86_pkg_temp", "coretemp", "cpu-thermal", "cpu_thermal",
+                  "soc_thermal", "k10temp", "acpitz")
 
 # Cloudflare's edge bans the default "Python-urllib/3.x" user agent outright
 # with error 1010, before the Worker ever runs - so a push would fail with an
@@ -115,22 +128,94 @@ def _ram_percent():
     return 100.0 * (total - available) / total
 
 
-def _storage_percent():
-    st = os.statvfs(DISK_MOUNT)
-    used = st.f_blocks - st.f_bfree
-    total = used + st.f_bavail          # matches what `df` reports
-    return 100.0 * used / total if total else 0.0
+def _storage():
+    """(used_percent, total_bytes, free_bytes) across every real filesystem.
+
+    Reporting only `/` understates a machine whose data lives on a second disk
+    - a DietPi with a USB drive would show a nearly full 4 GB card and never
+    mention the 2 TB attached to it.
+
+    The numbers follow `df`: capacity is what a normal user can occupy, so the
+    5 % reserved for root is excluded from both the total and the free figure.
+    That keeps the percentage, the total and the free space agreeing with each
+    other, and with the tool anyone would check them against.
+    """
+    total = free = 0
+    seen = set()
+    try:
+        with open("/proc/mounts", "r") as fh:
+            mounts = fh.readlines()
+    except OSError:
+        return 0.0, 0, 0
+
+    for line in mounts:
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        device, mount, fstype = fields[0], fields[1], fields[2]
+        # A real filesystem is backed by a block device. Everything else is
+        # RAM (tmpfs), a kernel view (proc, sysfs), or another filesystem seen
+        # a second time (overlay) - counting those would invent capacity that
+        # does not exist.
+        if not device.startswith("/dev/") or fstype in NET_FSTYPES:
+            continue
+        # A bind mount and its source share a device. Counting both would
+        # double the disk.
+        if device in seen:
+            continue
+        seen.add(device)
+        # /proc/mounts octal-escapes the characters that would otherwise break
+        # its own field separation - a mount point named "My Drive" arrives as
+        # "My\040Drive" and would not exist under that name. unicode_escape
+        # decodes exactly the octal form the kernel writes.
+        try:
+            mount = mount.encode("latin-1", "backslashreplace").decode("unicode_escape")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            pass
+        try:
+            st = os.statvfs(mount)
+        except OSError:
+            continue                     # unmounted underneath us, or no perms
+        used = st.f_blocks - st.f_bfree
+        avail = st.f_bavail
+        total += (used + avail) * st.f_frsize
+        free += avail * st.f_frsize
+
+    if not total:
+        return 0.0, 0, 0
+    return 100.0 * (total - free) / total, total, free
+
+
+def _read_zone(path):
+    try:
+        with open(path, "r") as fh:
+            milli = float(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+    # Some zones sit at 0 until something enables them, and a few report a
+    # sentinel far outside anything a chip survives.
+    return milli / 1000.0 if 0 < milli < 150000 else None
 
 
 def _cpu_temp_c():
-    for path in sorted(glob.glob("/sys/class/thermal/thermal_zone*/temp")):
-        try:
-            with open(path, "r") as fh:
-                milli = float(fh.read().strip())
-            if milli > 0:
-                return milli / 1000.0
-        except (OSError, ValueError):
+    fallback = None
+
+    for zone in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
+        value = _read_zone(zone + "/temp")
+        if value is None:
             continue
+        if fallback is None:
+            fallback = value
+        try:
+            with open(zone + "/type", "r") as fh:
+                kind = fh.read().strip().lower()
+        except OSError:
+            continue
+        if any(hint in kind for hint in CPU_ZONE_HINTS):
+            return value
+
+    if fallback is not None:
+        return fallback
     return -1.0                          # the sketch renders "--" for this
 
 
@@ -142,11 +227,14 @@ def _uptime_seconds():
 def snapshot():
     with _lock:
         rolling = dict(_state)
+    used_pct, total, free = _storage()
     return {
         "host": socket.gethostname()[:19],       # the sketch stores 20 bytes
         "cpu_percent": round(rolling["cpu_percent"], 1),
         "ram_percent": round(_ram_percent(), 1),
-        "storage_percent": round(_storage_percent(), 1),
+        "storage_percent": round(used_pct, 1),
+        "storage_total_gb": round(total / (1024 ** 3), 1),
+        "storage_free_gb": round(free / (1024 ** 3), 1),
         "cpu_temp_c": round(_cpu_temp_c(), 1),
         "uptime_seconds": _uptime_seconds(),
         "net_rx_kbps": round(rolling["net_rx_kbps"], 1),

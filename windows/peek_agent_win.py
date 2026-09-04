@@ -204,25 +204,127 @@ def _ram_percent():
     return 100.0 * (m.ullTotalPhys - m.ullAvailPhys) / m.ullTotalPhys
 
 
-def _storage_percent():
-    free_to_caller = ctypes.c_ulonglong(0)
-    total = ctypes.c_ulonglong(0)
-    total_free = ctypes.c_ulonglong(0)
-    if not kernel32.GetDiskFreeSpaceExW(ctypes.c_wchar_p(DISK),
-                                        ctypes.byref(free_to_caller),
-                                        ctypes.byref(total),
-                                        ctypes.byref(total_free)):
-        return 0.0
-    if not total.value:
-        return 0.0
-    return 100.0 * (total.value - total_free.value) / total.value
+DRIVE_FIXED = 3
+
+
+def _storage():
+    """
+    (used_percent, total_bytes, free_bytes) across every fixed drive.
+
+    Reporting only %SystemDrive% was wrong on any machine with more than one
+    disk: a full 240 GB C: read as "95% full" while 1.3 TB sat free next to it.
+    Removable drives, network shares and optical drives are excluded - a USB
+    stick appearing and disappearing should not move the gauge.
+    """
+    total = free = 0
+    mask = kernel32.GetLogicalDrives()
+    for i in range(26):
+        if not (mask >> i) & 1:
+            continue
+        root = f"{chr(ord('A') + i)}:\\"
+        if kernel32.GetDriveTypeW(ctypes.c_wchar_p(root)) != DRIVE_FIXED:
+            continue
+        avail = ctypes.c_ulonglong(0)
+        cap = ctypes.c_ulonglong(0)
+        cap_free = ctypes.c_ulonglong(0)
+        if kernel32.GetDiskFreeSpaceExW(ctypes.c_wchar_p(root),
+                                        ctypes.byref(avail),
+                                        ctypes.byref(cap),
+                                        ctypes.byref(cap_free)):
+            total += cap.value
+            free += cap_free.value
+    if not total:
+        return 0.0, 0, 0
+    return 100.0 * (total - free) / total, total, free
+
+
+# Temperature is cached: the sources below are an HTTP request or a process
+# launch, neither of which belongs in a 2-second sampler.
+_temp = {"value": -1.0, "at": 0.0, "source": None}
+TEMP_TTL = 20.0
+LHM_PORTS = (8085, 8086)
+
+
+def _temp_from_hardware_monitor():
+    """
+    LibreHardwareMonitor / OpenHardwareMonitor, if one is running with its web
+    server enabled. They ship a kernel driver, which is the only way anything
+    on Windows reads a CPU temperature reliably - there is no OS API for it.
+    """
+    import json as _json
+    import urllib.request as _u
+
+    def walk(node, out):
+        text = str(node.get("Text", ""))
+        value = str(node.get("Value", ""))
+        if "°C" in value or value.endswith("C"):
+            try:
+                out.append((text, float(value.split()[0].replace(",", "."))))
+            except (ValueError, IndexError):
+                pass
+        for kid in node.get("Children", []):
+            walk(kid, out)
+
+    for port in LHM_PORTS:
+        try:
+            with _u.urlopen(f"http://127.0.0.1:{port}/data.json", timeout=1.5) as r:
+                data = _json.loads(r.read())
+        except Exception:
+            continue
+        found = []
+        walk(data, found)
+        if not found:
+            continue
+        # Prefer a package/average sensor over an individual core.
+        for want in ("package", "cpu average", "core average", "tctl", "cpu"):
+            for text, val in found:
+                if want in text.lower() and 0 < val < 125:
+                    return val
+        for _text, val in found:
+            if 0 < val < 125:
+                return val
+    return None
+
+
+def _temp_from_wmi():
+    """ACPI thermal zone. Needs administrator, and most desktops do not
+    implement the class at all - it is common on laptops and rare elsewhere."""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance -Namespace root/wmi -ClassName "
+             "MSAcpi_ThermalZoneTemperature -ErrorAction Stop | "
+             "Select-Object -First 1).CurrentTemperature"],
+            capture_output=True, text=True, timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        raw = r.stdout.strip()
+        if raw.isdigit():
+            c = int(raw) / 10.0 - 273.15
+            if 0 < c < 125:
+                return c
+    except Exception:
+        pass
+    return None
 
 
 def _cpu_temp_c():
-    # Windows exposes no reliable temperature without a vendor driver -
-    # MSAcpi_ThermalZoneTemperature needs admin and most desktops do not
-    # implement it. -1 makes the display show "--" rather than a wrong number.
-    return -1.0
+    now = time.monotonic()
+    if now - _temp["at"] < TEMP_TTL:
+        return _temp["value"]
+    _temp["at"] = now
+
+    val = _temp_from_hardware_monitor()
+    src = "hwmonitor"
+    if val is None and _temp["source"] in (None, "wmi"):
+        # Only ever retried if WMI has worked before, or has not been tried:
+        # a desktop where the class does not exist should not launch a
+        # PowerShell process every 20 seconds forever.
+        val = _temp_from_wmi()
+        src = "wmi"
+
+    _temp["value"] = val if val is not None else -1.0
+    _temp["source"] = src if val is not None else _temp["source"]
+    return _temp["value"]
 
 
 def _uptime_seconds():
@@ -233,11 +335,14 @@ def _uptime_seconds():
 def snapshot():
     with _lock:
         rolling = dict(_state)
+    pct, total, free = _storage()
     return {
         "host": socket.gethostname()[:19],       # the sketch stores 20 bytes
         "cpu_percent": round(rolling["cpu_percent"], 1),
         "ram_percent": round(_ram_percent(), 1),
-        "storage_percent": round(_storage_percent(), 1),
+        "storage_percent": round(pct, 1),
+        "storage_total_gb": round(total / (1024 ** 3), 1),
+        "storage_free_gb": round(free / (1024 ** 3), 1),
         "cpu_temp_c": round(_cpu_temp_c(), 1),
         "uptime_seconds": _uptime_seconds(),
         "net_rx_kbps": round(rolling["net_rx_kbps"], 1),

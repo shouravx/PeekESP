@@ -367,6 +367,8 @@ getting it wrong is swapped red and blue, not an error.
   "cpu_percent": 12.5,
   "ram_percent": 43.2,
   "storage_percent": 61.0,
+  "storage_total_gb": 117.9,
+  "storage_free_gb": 46.0,
   "cpu_temp_c": 48.3,
   "uptime_seconds": 271830,
   "net_rx_kbps": 128.4,
@@ -377,6 +379,18 @@ getting it wrong is swapped red and blue, not an error.
 Every field is optional on the wire — a missing key falls back to a default
 rather than failing the parse. `cpu_temp_c` below zero renders as `--`, which is
 what hosts with no thermal zone report.
+
+Storage covers **every fixed disk**, not just the system one: a machine with a
+full 240 GB SSD and an empty 2 TB drive is mostly empty, and reporting only the
+first would say the opposite. The two `_gb` fields arrived after 1.0.0; an agent
+that predates them omits both, and the device shows the percentage alone rather
+than `0 GB free`, which would read as a full disk instead of a missing field.
+
+Windows counts each `DRIVE_FIXED` volume, so removable, optical and network
+drives are excluded. Linux counts each filesystem backed by a block device,
+deduplicated so a bind mount is not billed twice, and follows `df` — capacity is
+what a normal user can occupy, with root's reserved 5 % excluded from both the
+total and the free figure.
 
 ## Troubleshooting
 

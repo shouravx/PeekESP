@@ -102,9 +102,12 @@ requests/day; a paired set costs about 35,000. A third pair exceeds it for
 everyone on that deployment. Raising the poll interval from 5 s to 15 s gets
 you six.
 
-**No temperature on Windows.** Windows exposes none without a vendor driver, so
-the agent reports `-1` and the display shows `--` rather than a confident wrong
-number.
+**Temperature on Windows needs LibreHardwareMonitor.** Windows has no API for
+it — the value sits behind a kernel driver that reads the chip's MSRs. The agent
+reads LibreHardwareMonitor's web server if it is running, falls back to a WMI
+thermal zone (admin only, and most desktop boards don't implement it), and
+otherwise reports `-1` so the display shows `--` rather than a confident wrong
+number. Linux needs none of this; `/sys/class/thermal` is enough.
 
 **2.4 GHz only, WPA2.** An ESP32 has no 5 GHz radio. A network that does not
 appear in the scan list is usually 5 GHz-only or WPA3-only rather than a fault.
