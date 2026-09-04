@@ -5,6 +5,10 @@
 # that caused it, because there it still works.
 *.sh text eol=lf
 
+# Same hazard, no extension to match on: this one is a shell script fetched and
+# run on Linux, and is also installed to /usr/local/bin as the peekesp command.
+dietpi/peekesp text eol=lf
+
 # Firmware images and icons must never be line-ending "corrected".
 *.bin binary
 *.ico binary
