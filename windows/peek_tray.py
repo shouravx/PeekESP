@@ -277,6 +277,7 @@ def open_settings(runner):
     status_text = label(status_card, "starting", TEXT, 9)
     status_text.pack(side="left", pady=10)
 
+    status_hold = [0.0]        # deadline; see tick() at the bottom
     cfg = dict(runner.cfg)
     v_mode = tk.StringVar(value=cfg["mode"])
     v_url = tk.StringVar(value=cfg["relay_url"])
@@ -286,8 +287,9 @@ def open_settings(runner):
     v_auto = tk.BooleanVar(value=autostart_enabled())
     v_show = tk.BooleanVar(value=False)
 
+    btns = tk.Frame(root, bg=BG)      # packed to the bottom further down
     body = tk.Frame(root, bg=BG)
-    body.pack(fill="x", **pad)
+    body.pack(fill="both", expand=True, **pad)
 
     # ---- pairing: the only thing most people ever touch --------------------
     # Everything below this is derived from the code, so it is deliberately
@@ -360,8 +362,65 @@ def open_settings(runner):
           DIM, 8).pack(anchor="w", pady=(7, 0))
 
     # ---- mode ----
-    label(body, "HOW THIS PC REPORTS", DIM, 8).pack(anchor="w", pady=(14, 4))
-    modes = tk.Frame(body, bg=BG)
+    # Everything below is derived from the pairing code, so it is folded away
+    # by default. Unfolded, the window grew taller than the screen and pushed
+    # Save off the bottom edge of a fixed-size window - unreachable, with
+    # nothing to scroll or drag.
+    adv_open = [False]
+    adv_btn = tk.Button(body, text="▸  Advanced settings", anchor="w",
+                        bg=BG, fg=DIM, activebackground=BG, activeforeground=CYAN,
+                        relief="flat", bd=0, font=("Segoe UI", 9), cursor="hand2")
+    adv_btn.pack(anchor="w", fill="x", pady=(14, 2))
+
+    # Expanded, this content wants ~900px on an 864px screen, so it scrolls
+    # inside a capped viewport. Letting the window grow instead is what put
+    # Save under the bottom edge, and a fixed-size window gives you no way to
+    # get it back.
+    # The viewport height is measured, not guessed: the first time this opens
+    # it takes the window's actual collapsed height and gives the advanced
+    # panel whatever is left, minus room for the title bar and the taskbar.
+    # A hardcoded value left 6px of headroom on this screen, which the taskbar
+    # would have eaten.
+    adv_wrap = tk.Frame(body, bg=BG)
+    adv_canvas = tk.Canvas(adv_wrap, bg=BG, highlightthickness=0, height=200,
+                           borderwidth=0)
+    adv_scroll = tk.Scrollbar(adv_wrap, orient="vertical",
+                              command=adv_canvas.yview, width=10)
+    adv = tk.Frame(adv_canvas, bg=BG)
+    adv_win = adv_canvas.create_window((0, 0), window=adv, anchor="nw")
+    adv_canvas.configure(yscrollcommand=adv_scroll.set)
+
+    def _adv_resized(_=None):
+        adv_canvas.configure(scrollregion=adv_canvas.bbox("all"))
+        adv_canvas.itemconfig(adv_win, width=adv_canvas.winfo_width())
+    adv.bind("<Configure>", _adv_resized)
+    adv_canvas.bind("<Configure>", _adv_resized)
+
+    def _wheel(e):
+        adv_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+
+    def toggle_adv():
+        adv_open[0] = not adv_open[0]
+        adv_btn.config(text=("▾  Advanced settings" if adv_open[0]
+                             else "▸  Advanced settings"))
+        if adv_open[0]:
+            root.update_idletasks()
+            base = root.winfo_reqheight()          # the collapsed window
+            room = root.winfo_screenheight() - base - 120
+            adv_canvas.config(height=max(180, min(440, room)))
+            adv_wrap.pack(fill="x")
+            adv_canvas.pack(side="left", fill="both", expand=True)
+            adv_scroll.pack(side="right", fill="y")
+            root.bind_all("<MouseWheel>", _wheel)
+        else:
+            root.unbind_all("<MouseWheel>")
+            adv_wrap.pack_forget()
+        root.update_idletasks()
+
+    adv_btn.config(command=toggle_adv)
+
+    label(adv, "HOW THIS PC REPORTS", DIM, 8).pack(anchor="w", pady=(14, 4))
+    modes = tk.Frame(adv, bg=BG)
     modes.pack(anchor="w", fill="x")
     for val, txt in (("push", "Push to relay"),
                      ("serve", "Serve on LAN"),
@@ -371,12 +430,12 @@ def open_settings(runner):
                        activeforeground=CYAN, font=("Segoe UI", 9),
                        highlightthickness=0, bd=0).pack(side="left", padx=(0, 14))
 
-    label(body, "RELAY  (set by pairing - edit only if you know why)", DIM, 8).pack(anchor="w", pady=(12, 4))
-    label(body, "Ingest URL", DIM, 8).pack(anchor="w")
-    entry(body, v_url).pack(anchor="w", fill="x", pady=(2, 6), ipady=4)
+    label(adv, "RELAY  (set by pairing - edit only if you know why)", DIM, 8).pack(anchor="w", pady=(12, 4))
+    label(adv, "Ingest URL", DIM, 8).pack(anchor="w")
+    entry(adv, v_url).pack(anchor="w", fill="x", pady=(2, 6), ipady=4)
 
-    label(body, "Push token", DIM, 8).pack(anchor="w")
-    tok_row = tk.Frame(body, bg=BG)
+    label(adv, "Push token", DIM, 8).pack(anchor="w")
+    tok_row = tk.Frame(adv, bg=BG)
     tok_row.pack(anchor="w", fill="x", pady=(2, 6))
     tok = entry(tok_row, v_token, show="•")
     tok.pack(side="left", fill="x", expand=True, ipady=4)
@@ -389,7 +448,7 @@ def open_settings(runner):
                    activeforeground=CYAN, font=("Segoe UI", 8),
                    highlightthickness=0, bd=0).pack(side="left", padx=(8, 0))
 
-    nums = tk.Frame(body, bg=BG)
+    nums = tk.Frame(adv, bg=BG)
     nums.pack(anchor="w", fill="x", pady=(4, 0))
     left = tk.Frame(nums, bg=BG); left.pack(side="left")
     label(left, "Interval (s)", DIM, 8).pack(anchor="w")
@@ -407,10 +466,10 @@ def open_settings(runner):
     # derived both of these itself and there is genuinely nothing to enter, so
     # presenting them as a to-do just invents a step. It stays visible - seeing
     # the stream is useful - but says which of the two situations you are in.
-    dev_head = label(body, "ON THE DEVICE", DIM, 8)
+    dev_head = label(adv, "ON THE DEVICE", DIM, 8)
     dev_head.pack(anchor="w", pady=(16, 4))
 
-    dev = card(body)
+    dev = card(adv)
     dev.pack(fill="x")
     inner = tk.Frame(dev, bg=CARD)
     inner.pack(fill="x", padx=12, pady=10)
@@ -515,9 +574,12 @@ def open_settings(runner):
                   "serve_port": v_port.get(), "autostart": v_auto.get()})
         return cfgmod.validate(c)
 
-    def set_status(color, text):
+    def set_status(color, text, hold=6.0):
+        """hold = seconds this message survives the runner's own polling."""
         status_dot.config(fg=color)
         status_text.config(text=text)
+        if hold:
+            status_hold[0] = time.time() + hold
 
     def do_test():
         c = collect()
@@ -553,8 +615,11 @@ def open_settings(runner):
         d.mkdir(parents=True, exist_ok=True)
         os.startfile(str(d))
 
-    btns = tk.Frame(root, bg=BG)
-    btns.pack(fill="x", pady=(14, 18), **pad)
+    # The footer is packed to the BOTTOM, and packed before the scrolling body
+    # claims what is left. Packed in source order it ended up below content
+    # taller than the window, which put Save off the bottom edge where nobody
+    # could reach it - the window is fixed-size, so there was nothing to drag.
+    btns.pack(side="bottom", fill="x", pady=(10, 14), **pad)
     button(btns, "Save", do_save, accent=True).pack(side="right")
     button(btns, "Test connection", do_test).pack(side="right", padx=(0, 8))
     button(btns, "Open config folder", do_open_folder).pack(side="left")
@@ -563,10 +628,17 @@ def open_settings(runner):
     def tick():
         colors = {"pushing": GREEN, "serving": GREEN, "idle": DIM,
                   "stopped": DIM, "error": RED, "not configured": AMBER}
-        if status_text.cget("text") in ("starting",) or runner.status in colors:
+        # Anything the user just did stays put for a few seconds. Without this
+        # the poll below overwrote "paired - press Save" a second later with
+        # the runner's own state, which is still the OLD settings and so reads
+        # "not configured: relay url is empty" immediately after pairing
+        # succeeded. Accurate about the runner, and completely misleading.
+        if time.time() < status_hold[0]:
+            root.after(500, tick)
+            return
+        if runner.status in colors:
             txt = runner.status + (f" - {runner.detail}" if runner.detail else "")
-            if not getattr(root, "_sticky", False):
-                set_status(colors.get(runner.status, DIM), txt)
+            set_status(colors.get(runner.status, DIM), txt, hold=0)
         root.after(1000, tick)
 
     tick()
