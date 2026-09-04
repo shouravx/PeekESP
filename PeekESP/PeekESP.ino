@@ -69,6 +69,7 @@
 #include <time.h>
 #include <math.h>
 #include <esp_system.h>
+#include <esp_adc_cal.h>
 #include <mbedtls/sha256.h>
 
 #include "ca_certs.h"
@@ -254,6 +255,16 @@ static volatile uint8_t  g_device_count = 0;
 // leaves a step here and the UI timer picks it up on its next tick.
 static volatile int8_t   g_view_step = 0;
 
+// Set once at boot from the eFuse if the chip was calibrated at the factory.
+// Uncalibrated parts are out by up to 10 %, which on a battery reading is the
+// difference between "20 %" and "flat".
+static float             g_vref_scale = 1.0f;
+
+// Written by the UI task, read by the button loop: while the power panel is up
+// the left button dismisses it rather than swiping to the next machine.
+static volatile bool     g_pwr_visible = false;
+static volatile bool     g_pwr_dismiss = false;
+
 // Core 1 only: which machine is on screen, and the state of the swipe.
 static DeviceSet         g_shown;
 static uint8_t           g_view         = 0;
@@ -299,6 +310,32 @@ static const int PIN_BL      = 4;
 //                        hold - deep sleep, woken by the left button
 static const int PIN_BTN_L   = 0;
 static const int PIN_BTN_R   = 35;
+
+// The T-Display brings the cell out through a 1:2 divider on GPIO34, gated by
+// a MOSFET on GPIO14. Without raising ADC_EN the pin reads a floating node,
+// which looks like a flat battery rather than like a divider that is switched
+// off - the failure that makes people think the board has a dead cell.
+static const int PIN_ADC_EN  = 14;
+static const int PIN_ADC_BAT = 34;
+
+// This board exposes no charge-status pin, so power state is inferred from the
+// one thing that can be measured. A Li-ion cell off charge never sits above
+// 4.2 V, so anything holding the node higher is a charger.
+//
+// The honest limit: a cell being topped up at 3.9 V reads exactly like one
+// discharging at 3.9 V. "CHARGING" here means "something external is holding
+// this up", not "current is flowing into the cell". If your board reads
+// differently, this is the single number to move.
+#define VOLTS_CHARGING   4.32f
+
+// Below this nothing is connected, or ADC_EN never went high. Reporting 0 %
+// would be a confident wrong answer about a battery that is not there.
+#define VOLTS_ABSENT     1.00f
+
+// Long enough to read three numbers, short enough that a desk gadget which
+// lives on USB is not permanently showing its own battery instead of the
+// machine you asked it to watch.
+#define POWER_SHOW_MS    6000
 static const int BL_CHANNEL  = 0;
 
 static const uint8_t BL_LEVELS[] = { 255, 150, 70, 20 };
@@ -531,6 +568,12 @@ static lv_obj_t *g_lbl_ping  = nullptr;
 static lv_obj_t *g_lbl_host  = nullptr;
 static lv_obj_t *g_lbl_foot  = nullptr;
 static lv_obj_t *g_lbl_state = nullptr;
+static lv_obj_t *g_pwr_panel   = nullptr;
+static lv_obj_t *g_pwr_fill    = nullptr;
+static lv_obj_t *g_pwr_bolt    = nullptr;
+static lv_obj_t *g_pwr_pct     = nullptr;
+static lv_obj_t *g_pwr_volts   = nullptr;
+static lv_obj_t *g_pwr_state   = nullptr;
 static lv_obj_t *g_pair_panel   = nullptr;
 static lv_obj_t *g_lbl_code     = nullptr;
 static lv_obj_t *g_lbl_pair_hint = nullptr;
@@ -651,6 +694,41 @@ static void fmt_capacity(char *out, size_t n, float gb) {
   if      (gb >= 1024.0f) snprintf(out, n, "%.1fT", gb / 1024.0f);
   else if (gb >= 10.0f)   snprintf(out, n, "%.0fG", gb);
   else                    snprintf(out, n, "%.1fG", gb);
+}
+
+// A Li-ion discharge curve is flat in the middle and steep at both ends, so a
+// straight line from 3.0 to 4.2 V spends most of its life reading "60 %" and
+// then falls off a cliff. These are the usual breakpoints, interpolated.
+static uint8_t battery_percent(float v) {
+  static const float VOLTS[]   = {3.00f, 3.45f, 3.68f, 3.74f, 3.77f, 3.79f,
+                                  3.82f, 3.87f, 3.95f, 4.00f, 4.10f, 4.20f};
+  static const uint8_t PCT[]   = {0,     5,     10,    20,    30,    40,
+                                  50,    60,    70,    80,    90,    100};
+  const uint8_t n = sizeof(PCT) / sizeof(PCT[0]);
+
+  if (v <= VOLTS[0])     return 0;
+  if (v >= VOLTS[n - 1]) return 100;
+  for (uint8_t i = 1; i < n; i++) {
+    if (v < VOLTS[i]) {
+      const float span = VOLTS[i] - VOLTS[i - 1];
+      const float frac = (v - VOLTS[i - 1]) / span;
+      return (uint8_t)(PCT[i - 1] + frac * (PCT[i] - PCT[i - 1]) + 0.5f);
+    }
+  }
+  return 100;
+}
+
+static float battery_volts() {
+  // Averaged because a single ADC sample on this chip is noisy enough to swing
+  // the reading by a few percent, which on screen looks like a battery that
+  // cannot make its mind up.
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < 16; i++) sum += analogRead(PIN_ADC_BAT);
+  const float raw = sum / 16.0f;
+
+  // 2.0 undoes the divider; 3.3 is the reference the ADC is characterised
+  // against at 11 dB attenuation.
+  return (raw / 4095.0f) * 2.0f * 3.3f * g_vref_scale;
 }
 
 static void fmt_uptime(char *out, size_t n, uint32_t s) {
@@ -842,6 +920,81 @@ static void build_dashboard_ui() {
 }
 
 // ---------------------------------------------------------------------------
+//  Power overlay - the board's own battery, not the monitored machine's.
+//
+//  Shown for a few seconds when power is plugged in or pulled out, then it
+//  fades away again. Not a mode you can get stuck in: a desk gadget lives on
+//  USB, and a panel that took over the display whenever a charger was present
+//  would simply be the display.
+// ---------------------------------------------------------------------------
+static void build_power_panel(lv_obj_t *scr) {
+  g_pwr_panel = lv_obj_create(scr);
+  lv_obj_remove_style_all(g_pwr_panel);
+  lv_obj_set_size(g_pwr_panel, SCREEN_W, SCREEN_H);
+  lv_obj_set_pos(g_pwr_panel, 0, 0);
+  lv_obj_set_style_bg_color(g_pwr_panel, COL_BG, 0);
+  lv_obj_set_style_bg_opa(g_pwr_panel, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(g_pwr_panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(g_pwr_panel, LV_OBJ_FLAG_HIDDEN);
+
+  make_label(g_pwr_panel, F_SM, COL_CYAN, 8, 6, "PEEK");
+  make_label(g_pwr_panel, F_SM, COL_TEXT_DIM, 44, 6, "// POWER");
+
+  lv_obj_t *rule = lv_obj_create(g_pwr_panel);
+  lv_obj_remove_style_all(rule);
+  lv_obj_set_size(rule, 224, 1);
+  lv_obj_set_pos(rule, 8, 22);
+  lv_obj_set_style_bg_color(rule, COL_CYAN, 0);
+  lv_obj_set_style_bg_opa(rule, LV_OPA_30, 0);
+
+  // ---- the cell ----
+  lv_obj_t *shell = lv_obj_create(g_pwr_panel);
+  lv_obj_remove_style_all(shell);
+  lv_obj_set_size(shell, 110, 50);
+  lv_obj_set_pos(shell, 12, 40);
+  lv_obj_set_style_radius(shell, 6, 0);
+  lv_obj_set_style_border_width(shell, 2, 0);
+  lv_obj_set_style_border_color(shell, COL_TEXT_DIM, 0);
+  lv_obj_set_style_bg_opa(shell, LV_OPA_TRANSP, 0);
+  lv_obj_clear_flag(shell, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *nub = lv_obj_create(g_pwr_panel);
+  lv_obj_remove_style_all(nub);
+  lv_obj_set_size(nub, 5, 18);
+  lv_obj_set_pos(nub, 122, 56);
+  lv_obj_set_style_radius(nub, 2, 0);
+  lv_obj_set_style_bg_opa(nub, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(nub, COL_TEXT_DIM, 0);
+
+  // Width is animated rather than set, so the cell fills up when the panel
+  // appears instead of arriving already full.
+  g_pwr_fill = lv_obj_create(g_pwr_panel);
+  lv_obj_remove_style_all(g_pwr_fill);
+  lv_obj_set_size(g_pwr_fill, 0, 40);
+  lv_obj_set_pos(g_pwr_fill, 17, 45);
+  lv_obj_set_style_radius(g_pwr_fill, 3, 0);
+  lv_obj_set_style_bg_opa(g_pwr_fill, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(g_pwr_fill, COL_GREEN, 0);
+
+  // Centred on the shell, in the bright text colour rather than the background
+  // one: at 15 % the fill does not reach here, and a dark glyph would vanish
+  // into the empty part of the cell at exactly the moment it matters most.
+  // Light reads against both the fill and the gap.
+  g_pwr_bolt = make_label(g_pwr_panel, F_BIG, COL_TEXT, 59, 52, LV_SYMBOL_CHARGE);
+  lv_obj_add_flag(g_pwr_bolt, LV_OBJ_FLAG_HIDDEN);
+
+  // ---- the numbers ----
+  g_pwr_pct   = make_label(g_pwr_panel, F_BIG, COL_TEXT,     140, 38, "--");
+  g_pwr_volts = make_label(g_pwr_panel, F_SM,  COL_TEXT_DIM, 140, 64, "-- V");
+  g_pwr_state = make_label(g_pwr_panel, F_SM,  COL_AMBER,    140, 80, "");
+  lv_obj_set_width(g_pwr_state, 94);
+  lv_label_set_long_mode(g_pwr_state, LV_LABEL_LONG_CLIP);
+
+  make_label(g_pwr_panel, F_SM, COL_TEXT_DIM, 8, 116,
+             "tap L: back   hold R: sleep");
+}
+
+// ---------------------------------------------------------------------------
 //  Pairing overlay - covers the dashboard until the first reading arrives.
 //
 //  An overlay rather than a second screen so there is one object tree and one
@@ -988,6 +1141,10 @@ static void pair_progress(NetState st) {
   lv_obj_set_style_text_color(g_lbl_pair_hint, col, 0);
 }
 
+static bool pairing_showing() {
+  return g_pair_panel && !lv_obj_has_flag(g_pair_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void pairing_done() {
   if (g_pair_panel && !lv_obj_has_flag(g_pair_panel, LV_OBJ_FLAG_HIDDEN)) {
     lv_obj_add_flag(g_pair_panel, LV_OBJ_FLAG_HIDDEN);
@@ -1062,6 +1219,8 @@ static void ui_sync_cb(lv_timer_t *t) {
     if (show) lv_obj_clear_flag(g_spinner, LV_OBJ_FLAG_HIDDEN);
     else      lv_obj_add_flag(g_spinner, LV_OBJ_FLAG_HIDDEN);
   }
+
+  power_tick();
 
   // A button press is a reason to redraw even when no new data has arrived.
   const int8_t step = g_view_step;
@@ -1147,6 +1306,127 @@ static void render_selected() {
   if (ms < 1000) snprintf(buf, sizeof buf, "%u ms", (unsigned)ms);
   else           snprintf(buf, sizeof buf, "%.1f s", ms / 1000.0f);
   lv_label_set_text(g_lbl_ping, buf);
+}
+
+// ---------------------------------------------------------------------------
+//  Power panel: appears on a change of power source, then gets out of the way.
+// ---------------------------------------------------------------------------
+static void obj_set_opa(void *obj, int32_t v) {
+  lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)v, 0);
+}
+
+static void obj_set_w(void *obj, int32_t v) {
+  lv_obj_set_width((lv_obj_t *)obj, v);
+}
+
+static void power_hidden(lv_anim_t *a) {
+  (void)a;
+  lv_obj_add_flag(g_pwr_panel, LV_OBJ_FLAG_HIDDEN);
+  g_pwr_visible = false;
+}
+
+static void power_hide() {
+  if (!g_pwr_visible) return;
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, g_pwr_panel);
+  lv_anim_set_exec_cb(&a, obj_set_opa);
+  lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
+  lv_anim_set_time(&a, 260);
+  lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
+  lv_anim_set_ready_cb(&a, power_hidden);
+  lv_anim_start(&a);
+}
+
+static void power_show(uint8_t pct) {
+  lv_obj_set_style_opa(g_pwr_panel, LV_OPA_TRANSP, 0);
+  lv_obj_clear_flag(g_pwr_panel, LV_OBJ_FLAG_HIDDEN);
+  g_pwr_visible = true;
+
+  lv_anim_t fade;
+  lv_anim_init(&fade);
+  lv_anim_set_var(&fade, g_pwr_panel);
+  lv_anim_set_exec_cb(&fade, obj_set_opa);
+  lv_anim_set_values(&fade, LV_OPA_TRANSP, LV_OPA_COVER);
+  lv_anim_set_time(&fade, 220);
+  lv_anim_set_path_cb(&fade, lv_anim_path_ease_out);
+  lv_anim_start(&fade);
+
+  // The cell fills up as the panel arrives. 102 px is the inside of the shell.
+  lv_anim_t fill;
+  lv_anim_init(&fill);
+  lv_anim_set_var(&fill, g_pwr_fill);
+  lv_anim_set_exec_cb(&fill, obj_set_w);
+  lv_anim_set_values(&fill, 0, (102 * pct) / 100);
+  lv_anim_set_time(&fill, 620);
+  lv_anim_set_delay(&fill, 120);
+  lv_anim_set_path_cb(&fill, lv_anim_path_ease_out);
+  lv_anim_start(&fill);
+}
+
+static void power_tick() {
+  static uint32_t next_sample = 0;
+  static uint32_t hide_at     = 0;
+  static bool     known       = false;
+  static bool     was_charged = false;
+  static uint8_t  pct         = 0;
+
+  const uint32_t now = millis();
+
+  if ((int32_t)(now - next_sample) >= 0) {
+    next_sample = now + 2000;
+
+    const float volts    = battery_volts();
+    const bool  absent   = volts < VOLTS_ABSENT;
+    const bool  charging = volts >= VOLTS_CHARGING;
+    pct = absent ? 0 : battery_percent(volts);
+
+    char buf[24];
+    if (absent) {
+      lv_label_set_text(g_pwr_pct, "--");
+      lv_label_set_text(g_pwr_volts, "no reading");
+      lv_label_set_text(g_pwr_state, "NO BATTERY");
+      lv_obj_set_style_text_color(g_pwr_state, COL_TEXT_DIM, 0);
+    } else {
+      lv_label_set_text_fmt(g_pwr_pct, "%u%%", (unsigned)pct);
+      snprintf(buf, sizeof buf, "%.2f V", volts);
+      lv_label_set_text(g_pwr_volts, buf);
+      lv_label_set_text(g_pwr_state, charging ? "CHARGING" : "ON BATTERY");
+      lv_obj_set_style_text_color(g_pwr_state, charging ? COL_GREEN : COL_AMBER, 0);
+    }
+
+    // Colour follows what is left, not what it is doing: at 8 % it is red
+    // whether or not something is plugged in.
+    lv_obj_set_style_bg_color(g_pwr_fill,
+                              pct > 50 ? COL_GREEN : pct > 20 ? COL_AMBER : COL_RED, 0);
+    if (charging && !absent) lv_obj_clear_flag(g_pwr_bolt, LV_OBJ_FLAG_HIDDEN);
+    else                     lv_obj_add_flag(g_pwr_bolt, LV_OBJ_FLAG_HIDDEN);
+    if (g_pwr_visible) lv_obj_set_width(g_pwr_fill, (102 * pct) / 100);
+
+    // The first sample only establishes what normal is. Announcing it would
+    // mean every boot opens on the power screen, over the top of pairing.
+    if (!known) {
+      known = true;
+      was_charged = charging;
+    } else if (charging != was_charged) {
+      was_charged = charging;
+      if (!pairing_showing()) {
+        power_show(pct);
+        hide_at = now + POWER_SHOW_MS;
+      }
+    }
+  }
+
+  if (g_pwr_dismiss) {
+    g_pwr_dismiss = false;
+    hide_at = 0;
+    power_hide();
+  }
+
+  if (hide_at && (int32_t)(now - hide_at) >= 0) {
+    hide_at = 0;
+    power_hide();
+  }
 }
 
 static void view_slide_in_done(lv_anim_t *a) {
@@ -1734,6 +2014,24 @@ void setup() {
   delay(100);
   Serial.println("\n[peek] booting");
 
+  // The divider that brings the cell out to GPIO34 is behind a MOSFET. Left
+  // low, the pin reads a floating node - which looks like a flat battery
+  // rather than like a measurement that never happened.
+  pinMode(PIN_ADC_EN, OUTPUT);
+  digitalWrite(PIN_ADC_EN, HIGH);
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_ADC_BAT, ADC_11db);
+
+  // Most ESP32s carry a measured reference in eFuse; the ones that do not are
+  // out by up to 10 %, which on a battery is the difference between "20 %" and
+  // "flat". Using the real figure where it exists costs one call at boot.
+  esp_adc_cal_characteristics_t adc_chars;
+  if (esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12,
+                               1100, &adc_chars) == ESP_ADC_CAL_VAL_EFUSE_VREF) {
+    g_vref_scale = adc_chars.vref / 1100.0f;
+    Serial.printf("[power] eFuse Vref %u mV\n", (unsigned)adc_chars.vref);
+  }
+
   pinMode(PIN_BTN_L, INPUT_PULLUP);
   pinMode(PIN_BTN_R, INPUT);      // GPIO35 is input-only; the board pulls it up
 
@@ -1784,6 +2082,9 @@ void setup() {
     }
 
     build_dashboard_ui();
+    // Before the pairing overlay, so pairing wins at boot: a device that has
+    // never been paired has something more useful to say than its own voltage.
+    build_power_panel(lv_scr_act());
     // The overlay sits on top until the first reading arrives, so a freshly
     // flashed device shows its code rather than a dashboard full of zeroes.
     if (cfg.transport == TRANSPORT_PAIRED) build_pair_overlay(lv_scr_act());
@@ -1881,8 +2182,9 @@ void loop() {
       // the relay again on each tap would multiply the request budget by how
       // restless someone is feeling, so a refresh is only what the tap means
       // when there is nothing to swipe to.
-      if (g_device_count > 1) g_view_step = 1;
-      else                    g_force     = true;
+      if      (g_pwr_visible)      g_pwr_dismiss = true;
+      else if (g_device_count > 1) g_view_step   = 1;
+      else                         g_force       = true;
     }
     left_down = 0;
   }

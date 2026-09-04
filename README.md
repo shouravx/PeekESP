@@ -370,6 +370,35 @@ Both buttons do two things, chosen by how long you hold them.
 Swiping costs nothing: one poll already carried every machine, so the device
 makes the same number of requests whether you look at one or at six.
 
+## Power screen
+
+Plug a charger in or pull it out and the device shows its **own** battery for
+six seconds — charge level, voltage, and whether something is holding it up —
+then fades back to the dashboard. Tap the left button to dismiss it sooner.
+
+It is deliberately not a mode you can get stuck in. A desk gadget lives on USB,
+and a panel that took over whenever a charger was present would simply *be* the
+display.
+
+This is the ESP32's own cell on the JST connector, not the monitored machine's
+battery. The board reads it through a 1:2 divider on GPIO 34, behind a MOSFET
+gated by GPIO 14 — a detail worth knowing, because leaving that pin low reads a
+floating node, which looks like a flat battery rather than like a measurement
+that never happened.
+
+**What it can and cannot tell you.** The T-Display exposes no charge-status
+pin, so the state is inferred from voltage. A Li-ion cell off charge never sits
+above 4.2 V, so anything holding the node above **4.32 V** is a charger. The
+honest limit: a cell being topped up at 3.9 V reads exactly like one
+discharging at 3.9 V. `CHARGING` here means *something external is holding this
+up*, not *current is flowing into the cell*.
+
+The percentage interpolates a Li-ion discharge curve rather than drawing a
+straight line from 3.0 to 4.2 V — a linear reading spends most of the cell's
+life saying "60 %" and then falls off a cliff. Voltage is shown alongside it,
+so if your board reads differently, `VOLTS_CHARGING` in the sketch is the one
+number to move.
+
 ## Telemetry contract
 
 `GET http://<host>:8080/telemetry` → `200 application/json`
