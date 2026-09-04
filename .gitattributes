@@ -1,0 +1,12 @@
+# Shell scripts run on Linux, and dietpi/install.sh is fetched straight from
+# raw.githubusercontent.com and piped into sh. If a Windows checkout ever
+# committed it back with CRLF endings, that one-liner would fail for everyone
+# with "bad interpreter: /bin/sh^M" - and it would be invisible on the machine
+# that caused it, because there it still works.
+*.sh text eol=lf
+
+# Firmware images and icons must never be line-ending "corrected".
+*.bin binary
+*.ico binary
+*.png binary
+*.jpg binary

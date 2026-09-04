@@ -48,6 +48,20 @@ command -v systemctl >/dev/null 2>&1 \
        Run the agent by hand instead:
          python3 peek-agent.py --pair-code YOUR-CODE --no-serve"
 
+# Before the python3 and curl checks: removing this should still work on a
+# machine where one of them has since been uninstalled.
+if [ "${1:-}" = "--uninstall" ]; then
+    step "Removing the PeekESP agent"
+    systemctl disable --now peek-agent.service 2>/dev/null || true
+    rm -f "$UNIT"
+    systemctl daemon-reload
+    rm -rf "$PREFIX" "$CONF_DIR"
+    userdel "$SVC_USER" 2>/dev/null || true
+    say "Removed. The relay keeps this machine's last reading for 24 hours,"
+    say "then drops it from the device on its own."
+    exit 0
+fi
+
 PY=$(command -v python3 || true)
 [ -n "$PY" ] || die "python3 is not installed.  sudo apt install -y python3"
 
@@ -62,22 +76,6 @@ elif command -v wget >/dev/null 2>&1; then
     fetch() { wget -q --https-only -O "$2" "$1"; }
 else
     die "neither curl nor wget is installed.  sudo apt install -y curl"
-fi
-
-
-# ---------------------------------------------------------------------------
-#  Uninstall
-# ---------------------------------------------------------------------------
-if [ "${1:-}" = "--uninstall" ]; then
-    step "Removing the PeekESP agent"
-    systemctl disable --now peek-agent.service 2>/dev/null || true
-    rm -f "$UNIT"
-    systemctl daemon-reload
-    rm -rf "$PREFIX" "$CONF_DIR"
-    userdel "$SVC_USER" 2>/dev/null || true
-    say "Removed. The relay keeps this machine's last reading for 24 hours,"
-    say "then drops it from the device on its own."
-    exit 0
 fi
 
 
