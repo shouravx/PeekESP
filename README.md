@@ -348,10 +348,10 @@ point and the screen shows a QR code.
    phone joins the AP directly. No typing the generated password off a 1.14"
    panel.
 2. The captive portal opens the form (or browse to `192.168.4.1`).
-3. Pick your WiFi from the dropdown — the device scans and lists what it can
-   see, strongest first, with a `*` on the ones needing a password. **Scan
-   again** re-runs it, and *Other / hidden network* lets you type a name the
-   scan cannot see. Everything else is already filled in.
+3. Type your WiFi into **Network 1**. The box autocompletes from a live scan,
+   strongest first, with signal strength and a padlock — but it only *suggests*,
+   so a hidden network is just a name you type rather than a separate box and
+   the JavaScript to reveal it. **Scan again** re-runs the scan.
 4. **Save & Reboot** — settings go to NVS and survive reflashing the sketch.
 
 To change something later, hold the **left button for 1.5 s**; the device
@@ -359,11 +359,58 @@ reboots into setup mode. Holding it during power-on does the same, which is the
 way back in if you typo the WiFi password. "Erase all settings" at the bottom of
 the form returns the device to factory defaults.
 
+### What else is on that page
+
+**Five networks.** The device scans on boot and joins whichever of the five it
+can actually hear, strongest first, splitting its connect budget across the
+candidates — so a wrong password in slot 1 cannot starve the others. A spare
+costs nothing until the day you move the device.
+
+**Time zone and location label.** Stored in *minutes* east of UTC, because
+Kathmandu is +5:45 and Adelaide is +9:30 and an hours-only field silently
+cannot express either. The label is what the clock page prints above the time
+and changes nothing else. There's a 24-hour toggle beside it.
+
+**New pairing code.** Generates a fresh one and reboots so the device can show
+it. It also clears the derived URL and token, since a new code means a new
+stream and the old ones now point somewhere nothing will ever push. It asks for
+confirmation, because every machine already paired stops reaching the device
+until you retype the new code into each of them.
+
+**Settings page on my network** — off by default. With it on, this same page is
+reachable at the device's address on your WiFi. See below.
+
 > The portal serves plain HTTP over its own WPA2 link — your WiFi passphrase
 > crosses that link unencrypted. TLS would need a certificate no phone would
 > trust, and the alternative is entering a 48-character token with two
 > buttons. The AP is only up while you are configuring it, and its password is
 > derived per-device from the MAC.
+
+### The settings page on your network
+
+Off by default, and worth understanding before turning it on.
+
+With it enabled the device serves the same settings form at its address on your
+WiFi, permanently — so you can change things without holding a button and
+rejoining an access point. It asks for a password: user **peek**, the setup
+password shown on the device's screen.
+
+That is HTTP Basic over plain HTTP. It stops the other devices on your network
+and the neighbour on your guest WiFi. It does **not** stop anyone who can watch
+the traffic. Saying so plainly matters, because a control whose limits are not
+stated gets trusted past them.
+
+Two things the page never renders, whether it is on the AP or on your LAN:
+
+- **WiFi passwords.** A `type=password` input still carries its value in the
+  page source, so echoing the saved one back would hand it to anything that can
+  fetch the page. The field shows `unchanged` as a placeholder and blank means
+  "leave the saved one alone".
+- **The read token**, for the same reason — it is what lets someone read your
+  machine's telemetry.
+
+The pairing code is never in the page at all. It exists on the device's screen
+and nowhere else.
 
 ## Changing the boot logo
 

@@ -75,7 +75,14 @@ static lv_obj_t *g_clk_bar   = nullptr;
 
 static void build_clock_dated(lv_obj_t *scr) {
   g_clk_panel = clock_page(scr);
-  clock_header(g_clk_panel, "// DHAKA");
+  // The label is whatever the settings page was told; the header just prints
+  // it. Defaults to DHAKA because that is where the first one of these lives.
+  {
+    static char title[20];
+    snprintf(title, sizeof title, "// %s",
+             cfg.tz_label[0] ? cfg.tz_label : "LOCAL");
+    clock_header(g_clk_panel, title);
+  }
 
   // Aligned rather than positioned: a 44 px face is wide enough that a
   // hardcoded x would need recomputing the moment the format changes, and
@@ -140,17 +147,22 @@ static void render_clock_dated() {
     return;
   }
 
-  // tm_hour is 0-23. Midnight and noon are the two that catch everyone out:
-  // 0 and 12 both map to 12, one AM and one PM, so a plain % 12 would print
-  // "0:15 AM" at a quarter past midnight.
-  int hour12 = t.tm_hour % 12;
-  if (hour12 == 0) hour12 = 12;
+  if (cfg.clock_24h) {
+    lv_label_set_text_fmt(g_clk_time, "%02d:%02d", t.tm_hour, t.tm_min);
+    lv_label_set_text(g_clk_ampm, "");
+  } else {
+    // tm_hour is 0-23. Midnight and noon are the two that catch everyone out:
+    // 0 and 12 both map to 12, one AM and one PM, so a plain % 12 would print
+    // "0:15 AM" at a quarter past midnight.
+    int hour12 = t.tm_hour % 12;
+    if (hour12 == 0) hour12 = 12;
 
-  // No leading zero on the hour. Twelve-hour clocks are not written "02:32",
-  // and dropping it buys back a whole 27 px digit at this size.
-  lv_label_set_text_fmt(g_clk_time, "%d:%02d", hour12, t.tm_min);
+    // No leading zero on the hour. Twelve-hour clocks are not written "02:32",
+    // and dropping it buys back a whole 27 px digit at this size.
+    lv_label_set_text_fmt(g_clk_time, "%d:%02d", hour12, t.tm_min);
+    lv_label_set_text(g_clk_ampm, t.tm_hour < 12 ? "AM" : "PM");
+  }
   lv_label_set_text_fmt(g_clk_secs, "%02d", t.tm_sec);
-  lv_label_set_text(g_clk_ampm, t.tm_hour < 12 ? "AM" : "PM");
 
   // The big label changes width between "9:05" and "12:05", and the marker and
   // the seconds are positioned relative to it - so they have to be told again

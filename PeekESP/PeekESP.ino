@@ -249,9 +249,16 @@ struct Gauge {
 
 // Everything the setup portal can change. Sizes are the protocol maxima:
 // an SSID is 32 bytes and a WPA2 passphrase 63.
+// Five, because a device that moves between a desk and a bag sees a handful of
+// networks and no more - and every slot is 98 bytes of RAM plus a row of form
+// whether or not anyone fills it in.
+#define WIFI_SLOTS 5
+
 struct Config {
-  char     wifi_ssid[33]   = WIFI_SSID;
-  char     wifi_pass[64]   = WIFI_PASSWORD;
+  // Slot 0 is what the old single-network config becomes on upgrade, so a
+  // device that was already working keeps working without being reconfigured.
+  char     wifi_ssid[WIFI_SLOTS][33] = { WIFI_SSID };
+  char     wifi_pass[WIFI_SLOTS][64] = { WIFI_PASSWORD };
 
   uint8_t  transport       = TRANSPORT_PAIRED;
   char     relay_url[128]  = "";      // https://<name>.workers.dev/telemetry
@@ -262,6 +269,20 @@ struct Config {
 
   uint16_t poll_s          = 5;
   uint8_t  bl_idx          = 0;
+
+  // Minutes east of UTC. Minutes rather than hours because Kathmandu is +5:45
+  // and Adelaide is +9:30, and an hours-only field silently cannot express
+  // either. No daylight-saving field: the places this is likely to sit do not
+  // observe it, and a half-implemented DST rule is worse than none.
+  int16_t  tz_offset_min   = 360;              // +06:00, Dhaka
+  char     tz_label[13]    = "DHAKA";          // shown on the clock page
+  bool     clock_24h       = false;            // 12-hour with AM/PM by default
+
+  // A configuration page on the ordinary network, not just on the setup AP.
+  // Off unless asked for: it is reachable by anything on the same LAN, and the
+  // things it can change - the pairing, the relay - are worth more than the
+  // convenience of not having to hold a button.
+  bool     web_ui          = false;
 };
 
 // ============================================================================
@@ -280,6 +301,13 @@ static volatile uint8_t  g_device_count = 0;
 // core 1, and the whole point of it is that the display can keep ageing data
 // while polls are failing - see device_age_s().
 static volatile uint32_t g_data_at = 0;
+
+// The network currently being attempted, for the setup screen to name. With
+// five slots, "cannot join <slot 0>" would be wrong four times out of five.
+// Written a byte at a time by core 0 and read by core 1: a torn read shows a
+// garbled name for one frame, which is the entire cost of not locking a string
+// that exists only to be looked at.
+static char              g_wifi_try[33] = "";
 
 // Buttons run on core 1 beside the UI task but must never touch LVGL, so a tap
 // leaves a step here and the UI timer picks it up on its next tick.
@@ -419,8 +447,20 @@ static void disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *c
 // ============================================================================
 static void config_load() {
   prefs.begin("peek", true);            // read-only
-  prefs.getString("ssid",   cfg.wifi_ssid,   sizeof cfg.wifi_ssid);
-  prefs.getString("pass",   cfg.wifi_pass,   sizeof cfg.wifi_pass);
+  // Upgrade path: a device configured before there were slots has "ssid" and
+  // "pass" and no "ssid0". Read the old keys into slot 0 first, then let the
+  // new keys overwrite if they exist. Costs one read and removes any need for
+  // a version number in NVS.
+  prefs.getString("ssid", cfg.wifi_ssid[0], sizeof cfg.wifi_ssid[0]);
+  prefs.getString("pass", cfg.wifi_pass[0], sizeof cfg.wifi_pass[0]);
+
+  char key[8];
+  for (uint8_t i = 0; i < WIFI_SLOTS; i++) {
+    snprintf(key, sizeof key, "ssid%u", i);
+    prefs.getString(key, cfg.wifi_ssid[i], sizeof cfg.wifi_ssid[i]);
+    snprintf(key, sizeof key, "pass%u", i);
+    prefs.getString(key, cfg.wifi_pass[i], sizeof cfg.wifi_pass[i]);
+  }
   prefs.getString("rurl",   cfg.relay_url,   sizeof cfg.relay_url);
   prefs.getString("rtok",   cfg.relay_token, sizeof cfg.relay_token);
   prefs.getString("rbase",  cfg.relay_base,  sizeof cfg.relay_base);
@@ -429,6 +469,10 @@ static void config_load() {
   cfg.tls_verify = prefs.getBool("tlsv",   cfg.tls_verify);
   cfg.poll_s     = prefs.getUShort("poll",   cfg.poll_s);
   cfg.bl_idx     = prefs.getUChar("bl",      cfg.bl_idx);
+  cfg.tz_offset_min = prefs.getShort("tzmin", cfg.tz_offset_min);
+  cfg.clock_24h  = prefs.getBool("clk24",  cfg.clock_24h);
+  cfg.web_ui     = prefs.getBool("webui",  cfg.web_ui);
+  prefs.getString("tzlab", cfg.tz_label, sizeof cfg.tz_label);
   prefs.end();
 
   if (cfg.bl_idx >= BL_LEVEL_COUNT) cfg.bl_idx = 0;
@@ -438,8 +482,17 @@ static void config_load() {
 
 static void config_save() {
   prefs.begin("peek", false);
-  prefs.putString("ssid",   cfg.wifi_ssid);
-  prefs.putString("pass",   cfg.wifi_pass);
+  char key[8];
+  for (uint8_t i = 0; i < WIFI_SLOTS; i++) {
+    snprintf(key, sizeof key, "ssid%u", i);
+    prefs.putString(key, cfg.wifi_ssid[i]);
+    snprintf(key, sizeof key, "pass%u", i);
+    prefs.putString(key, cfg.wifi_pass[i]);
+  }
+  // The pre-slot keys are removed rather than left to rot: leaving them means
+  // a later downgrade silently resurrects a network the user deleted.
+  prefs.remove("ssid");
+  prefs.remove("pass");
   prefs.putString("rurl",   cfg.relay_url);
   prefs.putString("rtok",   cfg.relay_token);
   prefs.putString("rbase",  cfg.relay_base);
@@ -448,6 +501,10 @@ static void config_save() {
   prefs.putBool  ("tlsv",   cfg.tls_verify);
   prefs.putUShort("poll",   cfg.poll_s);
   prefs.putUChar ("bl",     cfg.bl_idx);
+  prefs.putShort ("tzmin",  cfg.tz_offset_min);
+  prefs.putBool  ("clk24",  cfg.clock_24h);
+  prefs.putBool  ("webui",  cfg.web_ui);
+  prefs.putString("tzlab",  cfg.tz_label);
   prefs.end();
 }
 
@@ -547,7 +604,14 @@ static void pair_apply(Config &c) {
 // "YOUR_WIFI_SSID" is non-empty, and without this check the device would
 // consider itself configured and never offer the setup portal at all.
 static bool config_usable() {
-  return cfg.wifi_ssid[0] != '\0' && strcmp(cfg.wifi_ssid, "YOUR_WIFI_SSID") != 0;
+  // Any one usable slot is enough to try booting into the dashboard - the rest
+  // may be for places this device is not currently sitting.
+  for (uint8_t i = 0; i < WIFI_SLOTS; i++) {
+    if (cfg.wifi_ssid[i][0] == '\0') continue;
+    if (strcmp(cfg.wifi_ssid[i], "YOUR_WIFI_SSID") == 0) continue;
+    return true;
+  }
+  return false;
 }
 
 static void request_setup_mode() {
@@ -1262,12 +1326,12 @@ static void pair_progress(NetState st) {
   lv_color_t col = COL_TEXT_DIM;
 
   if (g_wifi_failed) {
-    snprintf(buf, sizeof buf, "cannot join %s", cfg.wifi_ssid);
+    snprintf(buf, sizeof buf, "cannot join %s", g_wifi_try);
     col = COL_RED;
   } else {
     switch (st) {
       case NET_WIFI:
-        snprintf(buf, sizeof buf, "joining %s...", cfg.wifi_ssid);
+        snprintf(buf, sizeof buf, "joining %s...", g_wifi_try);
         col = COL_AMBER;
         break;
       case NET_TIME:
@@ -1789,16 +1853,64 @@ static bool wifi_connect(uint32_t timeout_ms) {
   // unaffected; a sleeping radio there could drop clients mid-configuration.
   WiFi.setSleep(true);
   WiFi.setAutoReconnect(true);
-  WiFi.begin(cfg.wifi_ssid, cfg.wifi_pass);
 
-  const uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - start > timeout_ms) return false;
-    vTaskDelay(pdMS_TO_TICKS(250));
+  // Scan first, and try the configured networks in the order the radio can
+  // actually hear them. Trying slot 0 first regardless would spend the whole
+  // timeout on the home network while sitting in an office, which is the exact
+  // situation having five slots is meant to fix.
+  const int found = WiFi.scanNetworks(false, false, false, 200);
+  int8_t order[WIFI_SLOTS];
+  uint8_t count = 0;
+
+  for (int i = 0; i < found && count < WIFI_SLOTS; i++) {
+    for (uint8_t sl = 0; sl < WIFI_SLOTS; sl++) {
+      if (!cfg.wifi_ssid[sl][0]) continue;
+      if (WiFi.SSID(i) != cfg.wifi_ssid[sl]) continue;
+      bool already = false;
+      for (uint8_t k = 0; k < count; k++) already |= (order[k] == (int8_t)sl);
+      if (!already) order[count++] = (int8_t)sl;
+      break;
+    }
   }
-  Serial.printf("[net] wifi ok, %s rssi %d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
-  mark_wifi_good();
-  return true;
+
+  // Nothing recognised - which also covers a hidden network, since those do
+  // not appear in a scan at all. Fall back to trying every configured slot.
+  if (!count) {
+    for (uint8_t sl = 0; sl < WIFI_SLOTS; sl++) {
+      if (cfg.wifi_ssid[sl][0]) order[count++] = (int8_t)sl;
+    }
+  }
+  WiFi.scanDelete();
+
+  if (!count) {
+    Serial.println("[net] no networks configured");
+    return false;
+  }
+
+  // Split the budget across the candidates rather than giving the first one
+  // all of it, or a wrong password in slot 0 would starve the others.
+  const uint32_t per = timeout_ms / count;
+
+  for (uint8_t c = 0; c < count; c++) {
+    const uint8_t sl = (uint8_t)order[c];
+    Serial.printf("[net] trying '%s'\n", cfg.wifi_ssid[sl]);
+    strlcpy(g_wifi_try, cfg.wifi_ssid[sl], sizeof g_wifi_try);
+    WiFi.begin(cfg.wifi_ssid[sl], cfg.wifi_pass[sl]);
+
+    const uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+      if (millis() - start > per) break;
+      vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("[net] wifi ok, %s rssi %d\n",
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      mark_wifi_good();
+      return true;
+    }
+    WiFi.disconnect();
+  }
+  return false;
 }
 
 static bool time_sync(uint32_t timeout_ms) {
@@ -1806,10 +1918,12 @@ static bool time_sync(uint32_t timeout_ms) {
   // certificate validity dates, so a device with no clock cannot complete a
   // handshake - and fails it without saying why.
   g_state = NET_TIME;
-  // configTzTime rather than configTime: the epoch is the same either way and
-  // TLS only cares about that, but localtime() then gives Dhaka time without
-  // every caller having to remember to add six hours.
-  configTzTime(TZ_DHAKA, "pool.ntp.org", "time.google.com");
+  // configTime with a raw offset, not configTzTime with a POSIX string. The
+  // POSIX form inverts the sign - "<+06>-6" means UTC+6 - which is the single
+  // most common way to get a timezone exactly backwards, and building that
+  // string from a user-entered offset would mean writing the trap twice.
+  configTime((long)cfg.tz_offset_min * 60L, 0,
+             "pool.ntp.org", "time.google.com");
 
   const uint32_t start = millis();
   while (time(nullptr) < 1700000000) {          // ~Nov 2023, i.e. "plausible"
@@ -1937,7 +2051,9 @@ static void netTask(void *arg) {
   // button.
   for (uint8_t tries = 1; !wifi_connect(25000); tries++) {
     g_state = NET_ERROR;
-    Serial.printf("[net] attempt %u to join '%s' failed\n", tries, cfg.wifi_ssid);
+    // g_wifi_try, not a slot: wifi_connect walks every configured network, so
+    // naming one of them would report the wrong failure four times in five.
+    Serial.printf("[net] attempt %u failed (last tried '%s')\n", tries, g_wifi_try);
     // Only bail out to setup if this network has never worked. If it has,
     // the router is the likelier problem and the device keeps trying.
     if (tries >= 2 && !wifi_known_good()) {
@@ -1960,6 +2076,7 @@ static void netTask(void *arg) {
 
   uint8_t  failures = 0;
   uint32_t batt_at  = 0;      // next battery sample, owned by this core
+  bool     web_up   = false;  // the settings page, if it was asked for
 
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
@@ -2008,6 +2125,17 @@ static void netTask(void *arg) {
       esp_restart();
     }
 
+    // The settings page on the ordinary network, if it is switched on. Started
+    // here rather than in setup() because it needs an address, and torn down
+    // never - a device whose web UI vanished on a brief WiFi drop would be
+    // worse than one that simply keeps it.
+    if (cfg.web_ui && !web_up && WiFi.status() == WL_CONNECTED) {
+      server.begin();
+      web_up = true;
+      Serial.printf("[web] settings at http://%s/ (user peek)\n",
+                    WiFi.localIP().toString().c_str());
+    }
+
     // Sleep in slices so a button press can cut the wait short - and use the
     // slices. This core is otherwise idle between polls while core 1 is the
     // one that must never block, so the ADC sampling belongs here.
@@ -2018,6 +2146,10 @@ static void netTask(void *arg) {
         batt_at = millis() + 2000;
         battery_sample();
       }
+      // Serving from this core on purpose. handleClient() waits up to five
+      // seconds for a client that never finishes its request - which is what a
+      // captive-portal probe does - and this is the core allowed to block.
+      if (web_up) server.handleClient();
       vTaskDelay(pdMS_TO_TICKS(50));
     }
 
@@ -2070,6 +2202,8 @@ static const char PAGE_CSS[] PROGMEM =
   "label.chk span{margin:0;color:#E6EDF7;font-size:14px}"
   "button{width:100%;padding:12px;border:0;border-radius:6px;background:#00E5FF;"
   "color:#05070E;font:600 15px/1 inherit;letter-spacing:.04em;cursor:pointer}"
+  "button.alt{margin-top:12px;background:transparent;color:#FFB020;"
+  "border:1px solid #FFB020}"
   "a.reset{display:block;text-align:center;margin-top:14px;color:#FF4D6D;font-size:13px}"
   "p.hint{margin:-4px 0 12px;font-size:12px;line-height:1.45;color:#5C6B82}"
   "p.by{text-align:center;margin:22px 0 0;font-size:12px;color:#5C6B82}"
@@ -2118,13 +2252,18 @@ static String field(const char *label, const char *name, const char *value,
 }
 
 static void handle_root() {
+  if (!web_guard()) return;
+
   String p = FPSTR(PAGE_CSS);
   p += F("<main><h1>PeekESP</h1><p class=sub>");
   p += g_ap_ssid;
   p += F(" &middot; settings are saved to flash and survive a reflash of the"
          " sketch.</p><form method=POST action=/save>");
 
-  p += F("<fieldset><legend>WIFI</legend>");
+  p += F("<fieldset><legend>WIFI</legend>"
+         "<p class=hint>Up to five networks. The device scans on boot and joins "
+         "whichever of them it can actually hear, strongest first - so a spare "
+         "here costs nothing until the day you need it.</p>");
 
   // scanComplete(): -1 still running, -2 failed/not started, else a count.
   const int n = WiFi.scanComplete();
@@ -2138,8 +2277,12 @@ static void handle_root() {
     p += F("<p class=hint>No networks found. "
            "<a href=/rescan>Scan again</a></p>");
   } else {
-    p += F("<label><span>Network</span><select name=ssid id=ssid "
-           "onchange=\"m.hidden=this.value!=''\">");
+    // One datalist shared by all five inputs, instead of five <select>s each
+    // carrying a full copy of the scan. It is also what makes a hidden network
+    // work without a separate "Other..." box and the JavaScript to reveal it:
+    // a datalist suggests, it does not constrain, so you can simply type a
+    // name the scan cannot see.
+    p += F("<datalist id=nets>");
 
     // Strongest first, and only once each: a mesh or an extender puts the same
     // SSID in the list several times, which makes the menu look broken.
@@ -2166,34 +2309,41 @@ static void handle_root() {
       if (quality > 100) quality = 100;
       if (quality < 0) quality = 0;
 
-      const String safe = html_escape(ssid);
       p += F("<option value=\"");
-      p += safe;
-      p += F("\"");
-      if (ssid == cfg.wifi_ssid) p += F(" selected");
-      p += F(">");
-      p += safe;
-      p += F("  —  ");
+      p += html_escape(ssid);
+      p += F("\">");
       p += quality;
       p += F("%");
-      if (WiFi.encryptionType(best) != WIFI_AUTH_OPEN) p += F("  🔒");
-      else                                             p += F("  open");
+      if (WiFi.encryptionType(best) != WIFI_AUTH_OPEN) p += F(" &#128274;");
+      else                                             p += F(" open");
       p += F("</option>");
     }
-    // Empty string as the sentinel: a zero-length SSID is not valid, so it
-    // cannot collide with a real network, and it survives a form POST intact
-    // where a control character would not.
-    p += F("<option value=\"\">Other / hidden network...</option>"
-           "</select></label>");
-
-    // Revealed only when "Other" is picked, so a hidden SSID is still possible
-    // without putting a second confusing text box in front of everyone.
-    p += F("<label id=m hidden><span>Network name</span>"
-           "<input type=text name=ssid_manual value=\"\"></label>");
-    p += F("<p class=hint><a href=/rescan>Scan again</a></p>");
+    p += F("</datalist><p class=hint><a href=/rescan>Scan again</a></p>");
   }
 
-  p += field("Password", "pass", cfg.wifi_pass, "password");
+  for (uint8_t i = 0; i < WIFI_SLOTS; i++) {
+    char nm[10], lb[16];
+    snprintf(lb, sizeof lb, "Network %u", (unsigned)(i + 1));
+    snprintf(nm, sizeof nm, "ssid%u", i);
+    p += F("<label><span>");
+    p += lb;
+    p += F("</span><input type=text list=nets autocapitalize=none name=");
+    p += nm;
+    p += F(" value=\"");
+    p += html_escape(cfg.wifi_ssid[i]);     // stored, but it came from the air
+    p += F("\"></label>");
+
+    snprintf(nm, sizeof nm, "pass%u", i);
+    // Never rendered back. A type=password input still carries its value in the
+    // page source, so echoing the stored passphrase would hand it to anything
+    // that can fetch this page - which, with the web UI enabled, is everything
+    // on the network. Blank means "leave the saved one alone".
+    p += F("<label><span>Password</span><input type=password name=");
+    p += nm;
+    p += F(" placeholder=\"");
+    p += cfg.wifi_pass[i][0] ? F("unchanged") : F("none saved");
+    p += F("\" value=\"\"></label>");
+  }
   p += F("</fieldset>");
 
   // Pairing is the normal route and needs nothing here - the code on the
@@ -2203,7 +2353,14 @@ static void handle_root() {
          "<p class=hint>If you paired this device from the PeekESP app, these "
          "are already set and there is nothing to do here.</p>");
   p += field("Worker URL", "rurl", cfg.relay_url);
-  p += field("Read token", "rtok", cfg.relay_token);
+  // Blank, like the WiFi passwords, and for the same reason: with the web UI
+  // enabled this page is fetchable by anything on the network, and the read
+  // token is what lets a stranger read your machine's telemetry. Empty means
+  // "keep the saved one".
+  p += F("<label><span>Read token</span><input type=password name=rtok "
+         "placeholder=\"");
+  p += cfg.relay_token[0] ? F("unchanged") : F("none saved");
+  p += F("\" value=\"\"></label>");
   p += F("<label><span>Poll seconds</span><input type=number name=poll min=1 max=600 value=");
   p += cfg.poll_s;
   p += F("></label>");
@@ -2214,7 +2371,60 @@ static void handle_root() {
          "rotates to a CA that is not pinned in ca_certs.h - it makes the "
          "connection interceptable.</p></fieldset>");
 
+  // ---- clock ----
+  p += F("<fieldset><legend>CLOCK</legend>"
+         "<label><span>Time zone</span><select name=tzmin>");
+  {
+    // Every offset in current civil use, including the quarter-hour ones.
+    // Kathmandu is +5:45 and Chatham is +12:45, and an hours-only picker
+    // cannot express either - which is the reason this is stored in minutes.
+    static const int16_t OFFS[] = {
+      -720, -660, -600, -570, -540, -480, -420, -360, -300, -270, -240, -210,
+      -180, -120,  -60,    0,   60,  120,  180,  210,  240,  270,  300,  330,
+       345,  360,  390,  420,  480,  525,  540,  570,  600,  630,  660,  720,
+       765,  780,  840 };
+    for (uint8_t i = 0; i < sizeof(OFFS) / sizeof(OFFS[0]); i++) {
+      const int16_t o = OFFS[i];
+      const int a = o < 0 ? -o : o;
+      p += F("<option value=");
+      p += o;
+      if (o == cfg.tz_offset_min) p += F(" selected");
+      p += F(">UTC");
+      p += (o < 0) ? F("-") : F("+");
+      if (a / 60 < 10) p += F("0");
+      p += a / 60;
+      p += F(":");
+      if (a % 60 < 10) p += F("0");
+      p += a % 60;
+      p += F("</option>");
+    }
+  }
+  p += F("</select></label>");
+  p += field("Location label", "tzlab", cfg.tz_label);
+  p += F("<p class=hint>The label is what the clock page shows above the time. "
+         "It changes nothing else.</p>");
+  p += F("<label class=chk><input type=checkbox name=clk24 value=1 ");
+  if (cfg.clock_24h) p += F("checked");
+  p += F("><span>24-hour clock</span></label></fieldset>");
+
+  // ---- device ----
+  p += F("<fieldset><legend>DEVICE</legend>"
+         "<label class=chk><input type=checkbox name=webui value=1 ");
+  if (cfg.web_ui) p += F("checked");
+  p += F("><span>Settings page on my network</span></label>"
+         "<p class=hint>Off by default. With it on, this same page is reachable "
+         "at the device's address on your WiFi - convenient, and also reachable "
+         "by everything else on that network. It asks for a password (user "
+         "<b>peek</b>, the setup password shown on the screen), but that "
+         "crosses the network unencrypted, so leave it off unless you want it."
+         "</p></fieldset>");
+
   p += F("<button type=submit>SAVE &amp; REBOOT</button></form>"
+         "<form method=POST action=/newcode "
+         "onsubmit=\"return confirm('Generate a new pairing code? The app and "
+         "any other machines paired to this device will stop reaching it until "
+         "you type the new code into each of them.')\">"
+         "<button class=alt type=submit>NEW PAIRING CODE</button></form>"
          "<a class=reset href=/reset>erase all settings</a>"
          "<p class=by>PeekESP by <a href=\"https://github.com/shouravx\">shouravx</a>"
          " &middot; <a href=\"https://github.com/shouravx/PeekESP\">source</a></p>"
@@ -2231,15 +2441,40 @@ static void copy_arg(const char *name, char *dst, size_t n) {
 static void handle_save() {
   // "Other / hidden" puts a sentinel in the dropdown and the real name in a
   // second field, so the manual value wins when it is present.
-  if (server.hasArg("ssid_manual") && server.arg("ssid_manual").length())
-    copy_arg("ssid_manual", cfg.wifi_ssid, sizeof cfg.wifi_ssid);
-  else if (server.arg("ssid").length())
-    copy_arg("ssid",   cfg.wifi_ssid,   sizeof cfg.wifi_ssid);
-  copy_arg("pass",   cfg.wifi_pass,   sizeof cfg.wifi_pass);
+  if (!web_guard()) return;
+
+  char nm[10];
+  for (uint8_t i = 0; i < WIFI_SLOTS; i++) {
+    snprintf(nm, sizeof nm, "ssid%u", i);
+    copy_arg(nm, cfg.wifi_ssid[i], sizeof cfg.wifi_ssid[i]);
+
+    // A blank password means "keep what is saved", because the form never
+    // renders the stored one - so submitting the page unchanged must not wipe
+    // every passphrase on the device. Clearing the network name clears its
+    // password too, which is the only way left to actually forget one.
+    snprintf(nm, sizeof nm, "pass%u", i);
+    if (server.hasArg(nm) && server.arg(nm).length()) {
+      copy_arg(nm, cfg.wifi_pass[i], sizeof cfg.wifi_pass[i]);
+    }
+    if (!cfg.wifi_ssid[i][0]) cfg.wifi_pass[i][0] = '\0';
+  }
   copy_arg("rurl",   cfg.relay_url,   sizeof cfg.relay_url);
-  copy_arg("rtok",   cfg.relay_token, sizeof cfg.relay_token);
+  // Only when something was actually typed - the field renders blank, so an
+  // unchanged submit must not erase the token the device is running on.
+  if (server.hasArg("rtok") && server.arg("rtok").length())
+    copy_arg("rtok", cfg.relay_token, sizeof cfg.relay_token);
 
   cfg.tls_verify = server.hasArg("tlsv");
+  cfg.clock_24h  = server.hasArg("clk24");
+  cfg.web_ui     = server.hasArg("webui");
+  copy_arg("tzlab", cfg.tz_label, sizeof cfg.tz_label);
+  if (server.hasArg("tzmin")) {
+    const long t = server.arg("tzmin").toInt();
+    // Clamped to the range civil time actually uses. A number outside it is a
+    // crafted POST rather than a mistake, and would put the clock somewhere no
+    // country is.
+    if (t >= -720 && t <= 840) cfg.tz_offset_min = (int16_t)t;
+  }
   // A URL typed in here means a named or private stream, not a paired one.
   if (server.hasArg("rurl") && cfg.relay_url[0]) cfg.transport = TRANSPORT_RELAY;
   if (server.hasArg("poll"))   cfg.poll_s  = server.arg("poll").toInt();
@@ -2258,6 +2493,43 @@ static void handle_save() {
   g_reboot_at = millis() + 1200;
 }
 
+// The setup AP is gated by its own generated WPA2 password, so a client that
+// reached it has already proved something. The same pages served on the home
+// network have proved nothing, so they ask - user "peek", the setup password
+// printed on the device's screen.
+//
+// This is HTTP Basic over plain HTTP: it stops the other devices on the network
+// and the person borrowing your WiFi, and it does not stop anyone who can watch
+// the traffic. Said plainly on the page that offers the option, because a
+// security control whose limits are not stated gets trusted past them.
+static bool web_guard() {
+  if (g_setup_mode) return true;
+  if (server.authenticate("peek", g_ap_pass)) return true;
+  server.requestAuthentication();
+  return false;
+}
+
+static void handle_newcode() {
+  if (!web_guard()) return;
+
+  pair_new_code(cfg.pair_code, sizeof cfg.pair_code);
+  cfg.transport = TRANSPORT_PAIRED;
+  // A new code implies a new stream, so the URL and token derived from the old
+  // one are now pointing somewhere nothing will ever push. Clearing them stops
+  // the device quietly polling a dead stream forever.
+  cfg.relay_url[0] = 0;
+  cfg.relay_token[0] = 0;
+  config_save();
+  Serial.printf("[pair] new code %s\n", cfg.pair_code);
+
+  String p = FPSTR(PAGE_CSS);
+  p += F("<main><h1>New code</h1><p class=sub>Rebooting. The new code appears "
+         "on the device's screen - type it into the PeekESP app on every "
+         "machine you want it to watch.</p></main>");
+  server.send(200, "text/html", p);
+  g_reboot_at = millis() + 1200;
+}
+
 static void handle_rescan() {
   // Async: the redirect lands on "/" which renders the scanning state and
   // refreshes itself, so the page is never blocked on the radio.
@@ -2268,6 +2540,7 @@ static void handle_rescan() {
 }
 
 static void handle_reset() {
+  if (!web_guard()) return;
   config_erase();
   String p = FPSTR(PAGE_CSS);
   p += F("<main><h1>Erased</h1><p class=sub>Back to factory defaults."
@@ -2291,6 +2564,7 @@ static void setupTask(void *arg) {
 
   server.on("/", handle_root);
   server.on("/save", HTTP_POST, handle_save);
+  server.on("/newcode", HTTP_POST, handle_newcode);
   server.on("/reset", handle_reset);
   server.on("/rescan", handle_rescan);
   server.onNotFound(handle_root);          // any URL lands on the form
