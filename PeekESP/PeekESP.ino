@@ -853,8 +853,10 @@ static float battery_volts_raw() {
 // which is the one place on this device that must never block, because a frame
 // missed there is a visible stutter in an animation. Core 0 spends most of its
 // life asleep between polls, so it does the sampling and publishes the answer.
-static float    g_volts_filtered = 0.0f;   // core 0 only
-static bool     g_batt_charging_s = false; // core 0 only
+// Touched by battery_sample() and nothing else: once from setup(), before any
+// task exists, and thereafter only from core 0. Never concurrently.
+static float    g_volts_filtered = 0.0f;
+static bool     g_batt_charging_s = false;
 
 // Published to core 1. Each is a single aligned 32-bit or byte store, so the
 // worst a reader can see is the previous sample - two seconds stale, on a
@@ -2130,6 +2132,7 @@ static void netTask(void *arg) {
     // never - a device whose web UI vanished on a brief WiFi drop would be
     // worse than one that simply keeps it.
     if (cfg.web_ui && !web_up && WiFi.status() == WL_CONNECTED) {
+      register_routes();
       server.begin();
       web_up = true;
       Serial.printf("[web] settings at http://%s/ (user peek)\n",
@@ -2254,7 +2257,13 @@ static String field(const char *label, const char *name, const char *value,
 static void handle_root() {
   if (!web_guard()) return;
 
-  String p = FPSTR(PAGE_CSS);
+  // Reserved up front. This page grew a lot - five network rows, a scan
+  // datalist and thirty-nine timezone options - and String grows by
+  // reallocating, so building 12 KB an append at a time walks the heap through
+  // dozens of ever-larger allocations on a device with no memory to waste.
+  String p;
+  p.reserve(14000);
+  p += FPSTR(PAGE_CSS);
   p += F("<main><h1>PeekESP</h1><p class=sub>");
   p += g_ap_ssid;
   p += F(" &middot; settings are saved to flash and survive a reflash of the"
@@ -2531,6 +2540,11 @@ static void handle_newcode() {
 }
 
 static void handle_rescan() {
+  // Guarded like the rest. It changes no settings, but a scan briefly disturbs
+  // the station connection - so unauthenticated it is a way for anything on
+  // the network to keep interrupting the device's own WiFi.
+  if (!web_guard()) return;
+
   // Async: the redirect lands on "/" which renders the scanning state and
   // refreshes itself, so the page is never blocked on the radio.
   WiFi.scanDelete();
@@ -2549,6 +2563,20 @@ static void handle_reset() {
   g_reboot_at = millis() + 1200;
 }
 
+// Registering the handlers is separate from starting the server because there
+// are now two places that start one: the setup access point, and the optional
+// settings page on the ordinary network. When these lived inside setupTask the
+// second server came up with no routes at all and answered 404 to everything -
+// a page that was reachable, authenticated, and empty.
+static void register_routes() {
+  server.on("/", handle_root);
+  server.on("/save", HTTP_POST, handle_save);
+  server.on("/newcode", HTTP_POST, handle_newcode);
+  server.on("/reset", handle_reset);
+  server.on("/rescan", handle_rescan);
+  server.onNotFound(handle_root);          // any URL lands on the form
+}
+
 static void setupTask(void *arg) {
   (void)arg;
 
@@ -2562,12 +2590,7 @@ static void setupTask(void *arg) {
   dns.setErrorReplyCode(DNSReplyCode::NoError);
   dns.start(53, "*", WiFi.softAPIP());     // wildcard -> captive portal prompt
 
-  server.on("/", handle_root);
-  server.on("/save", HTTP_POST, handle_save);
-  server.on("/newcode", HTTP_POST, handle_newcode);
-  server.on("/reset", handle_reset);
-  server.on("/rescan", handle_rescan);
-  server.onNotFound(handle_root);          // any URL lands on the form
+  register_routes();
   server.begin();
 
   Serial.printf("[setup] AP %s / %s at %s\n",
