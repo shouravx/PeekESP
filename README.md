@@ -11,6 +11,10 @@
 ![ui](https://img.shields.io/badge/UI-LVGL_8.3-FF2E7E?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-5C6B82?style=flat-square)
 
+<img src="img/dashboard.jpeg" alt="PeekESP running on a TTGO T-Display, showing CPU, RAM, storage and network for a machine called Cryo-PC" width="720">
+
+<sub>Live CPU, RAM, storage and throughput for a machine on the other side of the internet.</sub>
+
 </div>
 
 An ESP32 (LilyGO TTGO T-Display) monitors a remote Linux or Windows machine,
@@ -38,20 +42,11 @@ sees it.
 Only planning to *change* the firmware? `python quickstart.py --dev` installs the
 Arduino toolchain and builds from source instead.
 
-```
-┌──────────────────────────────────────────────┐
-│ PEEK  // dietpi                42 ms      ◍  │
-│──────────────────────────────────────────────│
-│    ╭────╮      ╭────╮      ┌──────────────┐  │
-│    │ 12 │      │ 43 │      │ TEMP         │  │
-│    │CPU%│      │RAM%│      │ 48°          │  │
-│    ╰────╯      ╰────╯      │ ↓128K  ↑13K  │  │
-│                            └──────────────┘  │
-│ STORAGE                                 61%  │
-│ ████████████████████░░░░░░░░░░░░░░░░░░░░░░░  │
-│ up 3d 4h                            LINK OK  │
-└──────────────────────────────────────────────┘
-```
+<img src="img/dashboard-angle.jpeg" alt="The dashboard seen at an angle on the desk" width="640">
+
+Two arcs for CPU and RAM, a panel for temperature and throughput, a storage bar
+with the free space beside it, and a status line that names what the link is
+doing rather than leaving you to guess.
 
 ## What's in here
 
@@ -261,6 +256,12 @@ Flash the sketch, and the ESP32 shows a code like **`K7M2-P4QX-9R`**. Open the
 Windows app, right-click the tray icon → **Settings**, type the code into
 **Pair a device**, press **Pair** then **Save**.
 
+<img src="img/windows-app.png" alt="The PeekESP settings window: a status line reading pushing - last push OK, a field for the pairing code, and the relay URL filled in automatically" width="440">
+
+Everything below the code is filled in from it. The status line at the top says
+what the agent is actually doing, so "did it work" is answered on the same
+screen where you typed the code.
+
 That is the entire configuration. The relay URL, the stream and both tokens are
 derived from the code on both sides; dashes and case are ignored. The device
 stops showing the code as soon as the first reading arrives.
@@ -326,6 +327,8 @@ pio run -t upload -t monitor
 There is no compile-time setup. A freshly flashed device has no WiFi
 credentials, so it boots straight into **setup mode**: it raises its own access
 point and the screen shows a QR code.
+
+<img src="img/setup-mode.jpeg" alt="The device in setup mode, showing a QR code, the access point name and its generated password" width="640">
 
 1. Scan the QR with a phone camera — it encodes a `WIFI:` join string, so the
    phone joins the AP directly. No typing the generated password off a 1.14"
