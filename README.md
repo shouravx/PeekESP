@@ -532,6 +532,25 @@ Six machines per code. A host silent for 24 hours drops off the list; anything
 still listed carries its own `age_s`, so the display can say how stale it is
 rather than pretending it is live.
 
+### When a machine goes quiet
+
+After **five polls bring nothing newer** — 25 seconds at the default interval —
+the machine is shown as offline: the footer reads `offline 4m`, its readings go
+grey, and its name turns amber. Five *polls* rather than a fixed number of
+seconds, because "30 seconds" is six missed checks at the default interval and
+two at 15 s.
+
+The age is counted on the device's own clock, not just the relay's `age_s`.
+That field is only refreshed when a poll **succeeds**, so when the relay or the
+WiFi goes down it freezes at whatever it last said — and the machine's row goes
+on reporting `up 3d 4h` indefinitely, live-looking numbers sitting behind a
+`NO LINK` banner. Adding the time since the last successful fetch keeps the age
+honest whether the silence is the machine's or the display's own.
+
+Greying the numbers is the point of it. A footer line is easy to miss from
+across a desk; four dimmed readings are not, and they say *this is the last
+thing we heard* rather than *this is now*.
+
 Storage covers **every fixed disk**, not just the system one: a machine with a
 full 240 GB SSD and an empty 2 TB drive is mostly empty, and reporting only the
 first would say the opposite. The two `_gb` fields arrived after 1.0.0; an agent

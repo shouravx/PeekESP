@@ -104,7 +104,11 @@
 #define MAX_CONSECUTIVE_FAILURES 12    // ~60 s of nothing -> reboot the stack
 #define SETUP_HOLD_MS            1500  // left-button hold that forces setup mode
 #define SLEEP_HOLD_MS            1200  // right-button hold that sleeps the board
-#define STALE_AFTER_S            30    // relay data older than this reads as stale
+// A machine counts as offline after this many polls bring nothing newer.
+// Expressed in polls rather than seconds because a fixed "30 seconds" is six
+// missed checks at the default interval and two at 15 s - the same number
+// meaning very different things depending on a setting somewhere else.
+#define OFFLINE_AFTER_POLLS      5
 
 // How the device reaches its telemetry. Both go through a Cloudflare Worker
 // the host pushes to, so the device only ever dials OUT and needs no inbound
@@ -271,6 +275,11 @@ static DeviceSet         g_devset;                 // guarded by g_lock
 // Read by loop() so a tap knows whether there is anything to swipe to. Written
 // by core 0; a torn byte would at worst cost one press.
 static volatile uint8_t  g_device_count = 0;
+
+// millis() when the last successful fetch landed. Written by core 0, read by
+// core 1, and the whole point of it is that the display can keep ageing data
+// while polls are failing - see device_age_s().
+static volatile uint32_t g_data_at = 0;
 
 // Buttons run on core 1 beside the UI task but must never touch LVGL, so a tap
 // leaves a step here and the UI timer picks it up on its next tick.
@@ -822,6 +831,24 @@ static void battery_sample() {
   g_batt_volts    = volts;
 }
 
+static uint32_t offline_after_s() {
+  return (uint32_t)cfg.poll_s * OFFLINE_AFTER_POLLS;
+}
+
+// How old this machine's numbers really are, counted on our own clock.
+//
+// age_s arrives from the relay and is only refreshed when a poll SUCCEEDS. So
+// when the relay or the WiFi goes down it freezes at whatever it last said,
+// and the machine's row goes on reporting "up 3d 4h" indefinitely - live-
+// looking numbers behind a NO LINK banner. Adding the time since the last
+// successful fetch keeps the age honest whether the silence is the machine's
+// or ours.
+static uint32_t device_age_s(const Telemetry &t) {
+  const uint32_t at = g_data_at;
+  if (!at) return 0xFFFFFFFFu;              // nothing has ever arrived
+  return t.age_s + (millis() - at) / 1000u;
+}
+
 static void fmt_uptime(char *out, size_t n, uint32_t s) {
   const uint32_t d = s / 86400u, h = (s % 86400u) / 3600u, m = (s % 3600u) / 60u;
   if      (d) snprintf(out, n, "up %ud %uh", (unsigned)d, (unsigned)h);
@@ -1360,6 +1387,17 @@ static void ui_sync_cb(lv_timer_t *t) {
     view_step(step);
   }
 
+  // Before the early return below, because that return is taken exactly when
+  // no data is arriving - which is when the age is the only thing on screen
+  // that should still be changing.
+  {
+    static uint32_t fresh_next = 0;
+    if ((int32_t)(millis() - fresh_next) >= 0) {
+      fresh_next = millis() + 1000;
+      if (!g_sliding) render_freshness();
+    }
+  }
+
   const uint32_t seq = g_seq;
   if (seq == last_seq) return;
 
@@ -1426,6 +1464,39 @@ static void render_host_battery() {
   lv_label_set_text(g_pwr_host, buf);
 }
 
+// How old the numbers on screen are, and whether to still believe them.
+//
+// Separate from render_selected because it has to run when NOTHING is
+// arriving: the sync callback returns early when the sequence counter has not
+// moved, and "the sequence counter has not moved" is precisely the condition
+// this exists to display. Called on a timer as well as after a redraw.
+static void render_freshness() {
+  if (!g_shown.n || g_view >= g_shown.n) return;
+
+  const Telemetry &snap  = g_shown.d[g_view];
+  const uint32_t   age   = device_age_s(snap);
+  const bool     offline = age > offline_after_s();
+
+  char buf[48], a[16];
+  if (offline) {
+    fmt_ago(a, sizeof a, age);
+    snprintf(buf, sizeof buf, "offline %s", a);
+  } else {
+    fmt_uptime(buf, sizeof buf, snap.uptime_seconds);
+  }
+  lv_label_set_text(g_lbl_foot, buf);
+
+  // Dimming the numbers is the point of all of the above. A footer line is
+  // easy to miss from across a desk; four greyed-out readings are not, and
+  // they say "this is the last thing we heard" rather than "this is now".
+  const lv_color_t ink = offline ? COL_TEXT_DIM : COL_TEXT;
+  lv_obj_set_style_text_color(g_cpu.value,  ink, 0);
+  lv_obj_set_style_text_color(g_ram.value,  ink, 0);
+  lv_obj_set_style_text_color(g_bar_value,  ink, 0);
+  lv_obj_set_style_text_color(g_lbl_temp,   ink, 0);
+  lv_obj_set_style_text_color(g_lbl_host, offline ? COL_AMBER : COL_TEXT_DIM, 0);
+}
+
 static void render_selected() {
   // The last page belongs to the board rather than to any machine, so its
   // numbers come from the ADC sampler and only this line comes from telemetry.
@@ -1472,16 +1543,10 @@ static void render_selected() {
   // Per-machine staleness, not the link's. With several machines the relay can
   // be perfectly healthy while this particular one has been off for an hour,
   // and an uptime frozen at that moment would read as live.
-  if (snap.age_s > STALE_AFTER_S) {
-    fmt_ago(a, sizeof a, snap.age_s);
-    snprintf(buf, sizeof buf, "silent %s", a);
-  } else {
-    fmt_uptime(buf, sizeof buf, snap.uptime_seconds);
-  }
-  lv_label_set_text(g_lbl_foot, buf);
-
   snprintf(buf, sizeof buf, "// %s", snap.host);
   lv_label_set_text(g_lbl_host, buf);
+
+  render_freshness();
 
   // A TLS handshake over a weak signal runs to several seconds, and "4213 ms"
   // is both wider than the space and harder to read than "4.2 s".
@@ -1916,6 +1981,7 @@ static void netTask(void *arg) {
         g_devset = fresh;
         xSemaphoreGive(g_lock);
         g_latency      = latency;
+        g_data_at      = millis();
         g_device_count = fresh.n;
         g_seq++;                 // publish last: the UI polls on this
       }
@@ -1926,7 +1992,7 @@ static void netTask(void *arg) {
       // With several machines this asks about the freshest: one of them being
       // switched off is that machine's business, and the dashboard says so on
       // its own row rather than condemning the whole link.
-      g_state  = (fresh.freshest_age_s() > STALE_AFTER_S) ? NET_STALE : NET_ONLINE;
+      g_state  = (fresh.freshest_age_s() > offline_after_s()) ? NET_STALE : NET_ONLINE;
       failures = 0;
     } else {
       g_state = NET_ERROR;
