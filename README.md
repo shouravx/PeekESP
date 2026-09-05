@@ -423,9 +423,9 @@ at one screen or at seven.
 
 ## Clock
 
-Dhaka time (UTC+6, no daylight saving), swiped to like any other page: time,
-seconds, weekday and full date, with a bar that fills across the minute so the
-page never looks frozen. It lives in
+Dhaka time (UTC+6, no daylight saving), swiped to like any other page: a
+12-hour clock with seconds, an AM/PM marker, the weekday and the full date, and
+a bar that fills across the minute so the page never looks frozen. It lives in
 [`PeekESP/clock_faces.h`](PeekESP/clock_faces.h) so the face can be redesigned
 without reading past a thousand lines of networking.
 
