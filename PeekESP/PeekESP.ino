@@ -775,23 +775,51 @@ static float battery_volts_raw() {
 // shows you the transmit burst.
 #define VOLT_EMA_ALPHA 0.15f
 
-static float g_volts_filtered = 0.0f;
+// Core 0 owns every one of these. Sixteen analogRead calls is a millisecond or
+// two of blocking, and it used to happen inside the LVGL timer on core 1 -
+// which is the one place on this device that must never block, because a frame
+// missed there is a visible stutter in an animation. Core 0 spends most of its
+// life asleep between polls, so it does the sampling and publishes the answer.
+static float    g_volts_filtered = 0.0f;   // core 0 only
+static bool     g_batt_charging_s = false; // core 0 only
 
-static float battery_volts() {
+// Published to core 1. Each is a single aligned 32-bit or byte store, so the
+// worst a reader can see is the previous sample - two seconds stale, on a
+// value that changes over minutes.
+static volatile float   g_batt_volts    = 0.0f;
+static volatile bool    g_batt_charging = false;
+static volatile bool    g_batt_absent   = true;
+static volatile uint8_t g_batt_pct      = 0;
+
+// Runs on core 0. Everything the power page needs, computed once, off the
+// render path.
+static void battery_sample() {
   const float v = battery_volts_raw();
-  if (g_volts_filtered <= 0.0f) {
-    g_volts_filtered = v;          // first read seeds it; no ramp up from zero
-  } else {
-    g_volts_filtered += VOLT_EMA_ALPHA * (v - g_volts_filtered);
-  }
-  return g_volts_filtered;
-}
 
-// Plugging in or pulling the cable is a real step change, not noise, and the
-// filter would otherwise crawl across it over half a minute while the display
-// showed values that were true at no point.
-static void battery_reset_filter() {
-  g_volts_filtered = 0.0f;
+  if (g_volts_filtered <= 0.0f) g_volts_filtered = v;   // seed, no ramp from 0
+  else g_volts_filtered += VOLT_EMA_ALPHA * (v - g_volts_filtered);
+
+  const float volts = g_volts_filtered;
+
+  // Hysteresis: a cell resting on a single threshold crossed it on almost
+  // every sample, so the state flickered. It has to climb past VOLTS_CHARGING
+  // to count as powered and fall below VOLTS_DISCHARGE to stop.
+  const bool was = g_batt_charging_s;
+  if      (volts >= VOLTS_CHARGING)  g_batt_charging_s = true;
+  else if (volts <= VOLTS_DISCHARGE) g_batt_charging_s = false;
+
+  if (g_batt_charging_s != was) {
+    // A cable going in or out is a step change. Left alone the average would
+    // crawl across it for half a minute, showing numbers true at no point on
+    // either side of the transition.
+    g_volts_filtered = 0.0f;
+  }
+
+  const bool absent = volts < VOLTS_ABSENT;
+  g_batt_absent   = absent;
+  g_batt_charging = g_batt_charging_s;
+  g_batt_pct      = absent ? 0 : battery_percent(volts);
+  g_batt_volts    = volts;
 }
 
 static void fmt_uptime(char *out, size_t n, uint32_t s) {
@@ -1060,11 +1088,19 @@ static void build_power_panel(lv_obj_t *scr) {
   lv_obj_add_flag(g_pwr_bolt, LV_OBJ_FLAG_HIDDEN);
 
   // ---- the numbers ----
-  g_pwr_pct   = make_label(g_pwr_panel, F_BIG, COL_TEXT,     140, 38, "--");
-  g_pwr_volts = make_label(g_pwr_panel, F_SM,  COL_TEXT_DIM, 140, 64, "-- V");
-  g_pwr_state = make_label(g_pwr_panel, F_SM,  COL_AMBER,    140, 80, "");
-  lv_obj_set_width(g_pwr_state, 94);
-  lv_label_set_long_mode(g_pwr_state, LV_LABEL_LONG_CLIP);
+  // The cell and its nub end at x=127, so the right-hand column starts at 132
+  // and gets the remaining 104 px. It used to start at 140 with 94 px, which
+  // is four pixels less than "EXTERNAL POWER" needs at this size - so the
+  // longest and most important state string was the one that got cut off.
+  // Every label here is width-bounded and clipped: the default long mode wraps,
+  // and a second line would land on the host battery row below.
+  g_pwr_pct   = make_label(g_pwr_panel, F_BIG, COL_TEXT,     132, 38, "--");
+  g_pwr_volts = make_label(g_pwr_panel, F_SM,  COL_TEXT_DIM, 132, 64, "-- V");
+  g_pwr_state = make_label(g_pwr_panel, F_SM,  COL_AMBER,    132, 80, "");
+  for (lv_obj_t *l : {g_pwr_pct, g_pwr_volts, g_pwr_state}) {
+    lv_obj_set_width(l, 104);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
+  }
 
   // The monitored machine's own battery, which is a different thing from the
   // board's and worth having on the same screen: this is the page you come to
@@ -1307,16 +1343,13 @@ static void ui_sync_cb(lv_timer_t *t) {
 
   // The clock is the only thing here that has to move every second, and it
   // only has to when it is the page being looked at.
-  {
-    const bool dated   = g_clk_panel  && !lv_obj_has_flag(g_clk_panel, LV_OBJ_FLAG_HIDDEN);
-    const bool vanilla = g_clkp_panel && !lv_obj_has_flag(g_clkp_panel, LV_OBJ_FLAG_HIDDEN);
-    if (dated || vanilla) {
-      static uint32_t clk_next = 0;
-      if ((int32_t)(millis() - clk_next) >= 0) {
-        clk_next = millis() + 200;
-        if (dated) render_clock_dated();
-        else       render_clock_vanilla();
-      }
+  // The clock is the only thing here that has to move every second, and only
+  // when it is the page being looked at.
+  if (g_clk_panel && !lv_obj_has_flag(g_clk_panel, LV_OBJ_FLAG_HIDDEN)) {
+    static uint32_t clk_next = 0;
+    if ((int32_t)(millis() - clk_next) >= 0) {
+      clk_next = millis() + 200;
+      render_clock_dated();
     }
   }
 
@@ -1383,7 +1416,12 @@ static void render_host_battery() {
     } else {
       snprintf(tail, sizeof tail, "on battery");
     }
-    snprintf(buf, sizeof buf, "%s  %d%%  %s", t.host, (int)t.battery_percent, tail);
+    // The hostname can be nineteen characters on its own, so it gets a hard
+    // budget rather than being allowed to push the charge state off the end.
+    // Twelve plus the longest tail is 217 px in a 224 px label; the label is
+    // clipped as well, so a longer name loses its own end rather than the
+    // number that matters.
+    snprintf(buf, sizeof buf, "%.12s  %d%%  %s", t.host, (int)t.battery_percent, tail);
   }
   lv_label_set_text(g_pwr_host, buf);
 }
@@ -1393,10 +1431,6 @@ static void render_selected() {
   // numbers come from the ADC sampler and only this line comes from telemetry.
   if (g_view == g_shown.n) {
     render_clock_dated();
-    return;
-  }
-  if (g_view == g_shown.n + 1) {
-    render_clock_vanilla();
     return;
   }
   if (g_view > g_shown.n) {
@@ -1477,34 +1511,20 @@ static void obj_set_x(void *obj, int32_t v) {
 // charge state changed, which on a board whose voltage sits near the threshold
 // meant it reappeared every couple of seconds, over the top of whatever you
 // were actually trying to read. It is a page you swipe to now.
+// Presentation only. The measuring, the filtering and the hysteresis all
+// happen on core 0 in battery_sample(); this reads four published values and
+// draws them, so the LVGL timer never waits on an ADC.
 static void power_tick() {
-  static uint32_t next_sample = 0;
+  static uint32_t next_draw = 0;
   const uint32_t now = millis();
-  if ((int32_t)(now - next_sample) < 0) return;
-  next_sample = now + 2000;
+  if ((int32_t)(now - next_draw) < 0) return;
+  next_draw = now + 2000;
 
-  const float volts  = battery_volts();
-  const bool  absent = volts < VOLTS_ABSENT;
-
-  // Hysteresis, and the reason it is here: a cell resting right on the
-  // threshold crossed it on almost every sample, so the state flickered
-  // between CHARGING and ON BATTERY. It has to climb past VOLTS_CHARGING to
-  // count as powered and fall back below VOLTS_DISCHARGE to stop, so a reading
-  // that wobbles inside that band does not change anything.
-  static bool charging = false;
-  const bool was_charging = charging;
-  if      (volts >= VOLTS_CHARGING)  charging = true;
-  else if (volts <= VOLTS_DISCHARGE) charging = false;
-
-  if (charging != was_charging) {
-    // A cable going in or out is a step change. Left alone the average would
-    // crawl across it for half a minute, showing numbers that were true at no
-    // point on either side of the transition.
-    battery_reset_filter();
-  }
-
-  const uint8_t pct = absent ? 0 : battery_percent(volts);
-  char buf[32];
+  const float   volts    = g_batt_volts;
+  const bool    absent   = g_batt_absent;
+  const bool    charging = g_batt_charging;
+  const uint8_t pct      = g_batt_pct;
+  char buf[40];
 
   if (absent) {
     lv_label_set_text(g_pwr_pct, "--");
@@ -1522,7 +1542,7 @@ static void power_tick() {
     lv_label_set_text(g_pwr_pct, LV_SYMBOL_CHARGE);
     snprintf(buf, sizeof buf, "%.2f V", volts);
     lv_label_set_text(g_pwr_volts, buf);
-    lv_label_set_text(g_pwr_state, "EXTERNAL POWER");
+    lv_label_set_text(g_pwr_state, "USB POWER");
     lv_obj_set_style_text_color(g_pwr_state, COL_GREEN, 0);
   } else {
     lv_label_set_text_fmt(g_pwr_pct, "%u%%", (unsigned)pct);
@@ -1588,15 +1608,14 @@ static void view_slide_in_done(lv_anim_t *a) {
 // single gesture to learn and no screen that can appear without being asked
 // for.
 static uint8_t page_count() {
-  // Machines, then both clock faces, then power. The last three always exist,
-  // so a device that has never heard from a machine still has somewhere to go.
-  return (uint8_t)(g_shown.n + 3);
+  // Machines, then the clock, then power. The last two always exist, so a
+  // device that has never heard from a machine still has somewhere to go.
+  return (uint8_t)(g_shown.n + 2);
 }
 
 static lv_obj_t *page_obj(uint8_t page) {
-  if (page <  g_shown.n)      return g_body;
-  if (page == g_shown.n)      return g_clk_panel;    // dated
-  if (page == g_shown.n + 1)  return g_clkp_panel;   // vanilla
+  if (page <  g_shown.n) return g_body;
+  if (page == g_shown.n) return g_clk_panel;
   return g_pwr_panel;
 }
 
@@ -1667,8 +1686,21 @@ static void uiTask(void *arg) {
     // In standby the panel is off, so every frame is work nobody can see.
     // The tick above still advances, so animations do not resume mid-sweep
     // from a stale timebase when the screen comes back.
-    if (!g_standby) lv_timer_handler();
-    vTaskDelay(pdMS_TO_TICKS(g_standby ? 100 : 5));   // yield to IDLE1 / the watchdog
+    // lv_timer_handler returns how long until its next timer is due. Sleeping
+    // that long instead of a flat 5 ms means core 1 wakes ~200 times a second
+    // during an animation and a handful of times a second when nothing is
+    // moving, rather than 200 times a second always. Clamped at both ends:
+    // never busier than every 2 ms, never less responsive than every 30 ms,
+    // because a button press has to be picked up promptly either way.
+    uint32_t idle = 30;
+    if (!g_standby) {
+      idle = lv_timer_handler();
+      if (idle > 30) idle = 30;
+      if (idle < 2)  idle = 2;
+    } else {
+      idle = 100;
+    }
+    vTaskDelay(pdMS_TO_TICKS(idle));      // yield to IDLE1 / the watchdog
   }
 }
 
@@ -1861,7 +1893,8 @@ static void netTask(void *arg) {
   if (!time_sync(20000)) Serial.println("[net] NTP timed out - TLS will likely fail");
 
 
-  uint8_t failures = 0;
+  uint8_t  failures = 0;
+  uint32_t batt_at  = 0;      // next battery sample, owned by this core
 
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
@@ -1909,17 +1942,29 @@ static void netTask(void *arg) {
       esp_restart();
     }
 
-    // Sleep in slices so a button press can cut the wait short.
+    // Sleep in slices so a button press can cut the wait short - and use the
+    // slices. This core is otherwise idle between polls while core 1 is the
+    // one that must never block, so the ADC sampling belongs here.
     const uint32_t wake = millis() + (uint32_t)cfg.poll_s * 1000u;
     while ((int32_t)(millis() - wake) < 0 && !g_force) {
       if (g_reboot_at) break;
+      if ((int32_t)(millis() - batt_at) >= 0) {
+        batt_at = millis() + 2000;
+        battery_sample();
+      }
       vTaskDelay(pdMS_TO_TICKS(50));
     }
 
     // Nothing is on screen in standby, so polling would spend requests and
     // radio time on numbers nobody is looking at. Waking sets g_force, so the
-    // first thing that happens on the way back is a fresh reading.
+    // first thing that happens on the way back is a fresh reading. The battery
+    // is still sampled, so the power page is correct the moment it reappears
+    // rather than showing whatever was true when the screen went off.
     while (g_standby && !g_force && !g_reboot_at) {
+      if ((int32_t)(millis() - batt_at) >= 0) {
+        batt_at = millis() + 2000;
+        battery_sample();
+      }
       vTaskDelay(pdMS_TO_TICKS(200));
     }
     g_force = false;
@@ -2237,6 +2282,12 @@ void setup() {
     Serial.printf("[power] eFuse Vref %u mV\n", (unsigned)adc_chars.vref);
   }
 
+  // One reading before anything else starts. The periodic sampling lives on
+  // core 0 inside netTask, which does not get going until WiFi is up - and a
+  // device joining a slow network would otherwise report NO BATTERY to anyone
+  // who swiped to the power page while it was still trying.
+  battery_sample();
+
   pinMode(PIN_BTN_L, INPUT_PULLUP);
   pinMode(PIN_BTN_R, INPUT);      // GPIO35 is input-only; the board pulls it up
 
@@ -2290,7 +2341,6 @@ void setup() {
     // Before the pairing overlay, so pairing wins at boot: a device that has
     // never been paired has something more useful to say than its own voltage.
     build_clock_dated(lv_scr_act());
-    build_clock_vanilla(lv_scr_act());
     build_power_panel(lv_scr_act());
     // The overlay sits on top until the first reading arrives, so a freshly
     // flashed device shows its code rather than a dashboard full of zeroes.

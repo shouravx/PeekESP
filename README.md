@@ -72,12 +72,26 @@ doing rather than leaving you to guess.
 
 Two pinned FreeRTOS tasks that share nothing but a mutex-guarded struct:
 
-- **Core 0** — WiFi → NTP → a blocking `HTTPS GET` → JSON parse. Everything
-  here is allowed to stall for seconds at a time.
-- **Core 1** — `lv_timer_handler()` and nothing else. It never opens a socket, so
-  a slow link cannot drop a frame. It picks up new data by watching a sequence
-  counter and takes the mutex with a zero timeout, so even a contended lock just
-  defers the update to the next 120 ms tick rather than blocking the UI.
+- **Core 0** — WiFi → NTP → a blocking `HTTPS GET` → JSON parse. Everything here
+  is allowed to stall for seconds at a time. It also samples the battery ADC,
+  filters it and works out the charge state, in the gaps between polls where it
+  would otherwise just be asleep.
+- **Core 1** — `lv_timer_handler()` and nothing else. It never opens a socket
+  and never waits on hardware, so a slow link cannot drop a frame. It picks up
+  new data by watching a sequence counter and takes the mutex with a zero
+  timeout, so even a contended lock just defers the update to the next tick
+  rather than blocking the UI.
+
+The battery split matters more than it looks. Sixteen `analogRead` calls is a
+millisecond or two of blocking, and it used to run *inside* the LVGL timer —
+the one place on this device that must never block, because a frame missed
+there is a visible stutter mid-animation. Core 0 publishes four values; core 1
+formats them and draws.
+
+Core 1 also sleeps for however long `lv_timer_handler()` says the next timer is
+due, clamped to 2–30 ms, rather than a flat 5 ms. During an animation that is
+about as often as before; with nothing moving it is a handful of wakeups a
+second instead of two hundred.
 
 Values animate through `lv_anim_t` with `lv_anim_path_ease_out` over 500 ms. The
 gauges run on a 0–1000 range rather than 0–100 so a 3 % change still resolves
@@ -380,7 +394,7 @@ Both buttons do two things, chosen by how long you hold them.
 
 | Button | Action |
 |---|---|
-| Left (GPIO 0) — tap | Next page — each machine in turn, then the two clock faces, then the power screen, then back to the first |
+| Left (GPIO 0) — tap | Next page — each machine in turn, then the clock, then the power screen, then back to the first |
 | Left — hold 1.5 s | Reboot into setup mode |
 | Left — held at power-on | Boot straight into setup mode |
 | Right (GPIO 35) — tap | Cycle backlight brightness — 100 / 59 / 27 / 8 %, remembered across reboots |
@@ -409,23 +423,22 @@ at one screen or at seven.
 
 ## Clock
 
-Two faces, both on Dhaka time (UTC+6, no daylight saving), swiped to like any
-other page. They live in [`PeekESP/clock_faces.h`](PeekESP/clock_faces.h) so a
-face can be redesigned without reading past a thousand lines of networking.
+Dhaka time (UTC+6, no daylight saving), swiped to like any other page: time,
+seconds, weekday and full date, with a bar that fills across the minute so the
+page never looks frozen. It lives in
+[`PeekESP/clock_faces.h`](PeekESP/clock_faces.h) so the face can be redesigned
+without reading past a thousand lines of networking.
 
-**Dated** — time, seconds, weekday and full date, with a bar that fills across
-the minute so the page never looks frozen.
-
-**Vanilla** — the time and nothing else, as large as the panel allows, for
-reading across a room. A single dot breathes once a second: a clock with no
-seconds is indistinguishable from a screenshot for up to a minute at a time,
-which is unsettling on a device whose whole job is being live.
+There was briefly a second, time-only face. It went because it earned a whole
+page of the carousel to show strictly less than the page beside it, and every
+extra page is another button press between you and the machine you actually
+wanted to look at.
 
 The time comes from the NTP sync the TLS handshake needed anyway. The board has
 no battery-backed RTC — the internal one keeps counting between syncs but
-drifts, and loses everything on a power cut — so both faces show `--:--` until
-the first sync lands, rather than 01:00 on 1 January 1970, which is what an
-unsynced ESP32 sincerely believes.
+drifts, and loses everything on a power cut — so it shows `--:--` until the
+first sync lands, rather than 01:00 on 1 January 1970, which is what an unsynced
+ESP32 sincerely believes.
 
 ## Power screen
 
