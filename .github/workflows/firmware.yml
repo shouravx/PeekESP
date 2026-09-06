@@ -52,31 +52,13 @@ jobs:
       - name: Install the toolchain
         run: python tools/setup_arduino.py --no-build
 
-      # --warnings all, because the warnings this project has actually hit were
-      # real: an unused function left behind by a removal, a deprecated ADC
-      # constant, and a cast between function types that happened to work.
-      - name: Compile
-        run: |
-          tools/.arduino-cli/arduino-cli compile \
-            --fqbn "esp32:esp32:lilygo_t_display:PartitionScheme=huge_app" \
-            --warnings all \
-            PeekESP 2>&1 | tee build.log
-          if grep -E "^(/home/runner/work.*)?PeekESP/(PeekESP\.ino|clock_faces\.h):.*warning" build.log; then
-            echo "::error::the sketch produced warnings"
-            exit 1
-          fi
-
-      - name: Report the size
-        run: |
-          grep -E "Sketch uses|Global variables" build.log
-          # The partition is 3 MB and has no OTA slot, so there is room - but a
-          # jump worth noticing should be noticed, not discovered at flash time.
-          bytes=$(grep -oP 'Sketch uses \K[0-9]+' build.log)
-          echo "flash: $bytes bytes"
-          if [ "$bytes" -gt 2900000 ]; then
-            echo "::error::the sketch no longer fits the 3 MB app partition"
-            exit 1
-          fi
+      # One Python step rather than three shell ones. The shell version
+      # compiled correctly on Linux and then failed extracting the byte count,
+      # with the log readable only by someone who could authenticate to
+      # Actions - a build that becomes undebuggable from outside is worse than
+      # one that is merely wrong. This behaves the same on a laptop.
+      - name: Compile, check warnings, report size
+        run: python tools/ci_compile.py
 
       # The committed image is what tools/flash.py writes, and it is easy to
       # change the sketch and forget to regenerate it.
