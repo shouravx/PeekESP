@@ -1,0 +1,33 @@
+# Creates and removes the service account. A package cannot ship a user, so
+# this is the one thing that has to happen at install time rather than in
+# package().
+
+_user=peekesp
+
+post_install() {
+    if ! id "$_user" >/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/bin/nologin "$_user"
+    fi
+    cat <<'MSG'
+
+PeekESP is installed but not paired. The device shows a code on its screen:
+
+    sudo peekesp pair K7M2-P4QX-9R
+    sudo peekesp enable
+
+Then `peekesp status` says whether it is actually pushing, which is not the
+same question as whether the service is running.
+
+MSG
+}
+
+post_upgrade() {
+    post_install
+}
+
+post_remove() {
+    # The account goes; /etc/peekesp/agent.conf does not, because it holds the
+    # pairing code and pacman treats it as a backup file. Removing it here
+    # would delete a credential the user may still want on reinstall.
+    userdel "$_user" 2>/dev/null || true
+}

@@ -57,6 +57,90 @@ const PAIR_RE = /^[0-9a-f]{16}$/;
 const TOKEN_HEX_LEN = 48;
 
 // ---------------------------------------------------------------------------
+//  Telling the device about updates
+// ---------------------------------------------------------------------------
+// The device already trusts this Worker and pins the certificate authority that
+// serves it. Having it also poll api.github.com would mean a second host, a
+// second CA in a firmware image with no room to spare, and a second request per
+// device per interval against a budget that is already the limiting factor.
+// The relay is talking to it anyway, so the answer rides along.
+//
+// Cached in the isolate and again at the edge. Isolates are recycled without
+// warning, so neither cache is a guarantee - which is why a failed lookup
+// returns the previous answer rather than an empty one. An update banner that
+// appears because a check failed is worse than one that appears late.
+// ---------------------------------------------------------------------------
+//  Commands
+// ---------------------------------------------------------------------------
+// The device polls; it never listens. So a command is left here and collected
+// on the next poll, which means the latency is the poll interval and there is
+// still no inbound port anywhere.
+//
+// Delivered at most once: the pending command is cleared as it is handed over,
+// not acknowledged afterwards. For "reboot" and "standby" a lost command is
+// plainly better than one that arrives twice, and a device that reboots before
+// acting has told you the answer anyway.
+//
+// A closed vocabulary, not free text. Everything here is reversible by pressing
+// a button on the device, and nothing here changes configuration - that is what
+// the settings page is for, behind its own password.
+const COMMANDS = new Set([
+  "reboot",     // restart; comes back on the same settings
+  "standby",    // screen off, polling paused
+  "wake",       // screen back on
+  "refresh",    // poll now instead of waiting out the interval
+  "identify",   // flash the screen, to find which device this is
+  "page",       // page:N  - jump to a page
+  "bright",     // bright:N - backlight step 0-3
+]);
+
+// "bright:2" -> {verb:"bright", arg:2}. Anything unrecognised is rejected at
+// the edge rather than shipped to a device that would ignore it silently.
+function parseCommand(raw) {
+  const text = String(raw ?? "").trim().toLowerCase().slice(0, 24);
+  const [verb, argText] = text.split(":", 2);
+  if (!COMMANDS.has(verb)) return null;
+  const arg = argText === undefined ? 0 : Number(argText);
+  if (!Number.isInteger(arg) || arg < 0 || arg > 15) return null;
+  return { verb, arg, text: argText === undefined ? verb : `${verb}:${arg}` };
+}
+
+const FW_CACHE_MS = 6 * 60 * 60 * 1000;
+let fwCache = { at: 0, tag: "" };
+
+// Test seam. Without it the unit suite reaches api.github.com on every run,
+// which makes a local test depend on the network and on someone else's rate
+// limit - a suite that fails for reasons unrelated to the code stops being
+// consulted.
+export function _seedFirmwareCache(tag) {
+  fwCache = { at: Date.now(), tag };
+}
+
+async function latestFirmware() {
+  const now = Date.now();
+  if (fwCache.tag && now - fwCache.at < FW_CACHE_MS) return fwCache.tag;
+  try {
+    const r = await fetch(
+      "https://api.github.com/repos/shouravx/PeekESP/releases/latest",
+      {
+        headers: {
+          // GitHub rejects requests with no user agent outright.
+          "User-Agent": "PeekESP-relay",
+          Accept: "application/vnd.github+json",
+        },
+        cf: { cacheTtl: 3600, cacheEverything: true },
+      });
+    if (!r.ok) return fwCache.tag;
+    const j = await r.json();
+    const tag = String(j.tag_name || "").replace(/^v/, "").slice(0, 15);
+    if (tag) fwCache = { at: now, tag };
+  } catch {
+    // Leave whatever was known. The device treats an absent tag as "no news".
+  }
+  return fwCache.tag;
+}
+
+// ---------------------------------------------------------------------------
 //  Several machines, one pairing code
 // ---------------------------------------------------------------------------
 // A pairing code identifies a person, not a machine. Someone with a desktop, a
@@ -202,6 +286,13 @@ export class TelemetryStore {
       }
     }
 
+    if (request.method === "POST" && new URL(request.url).pathname === "/command") {
+      const cmd = parseCommand(await request.text());
+      if (!cmd) return json({ error: "unknown command" }, 400);
+      await this.state.storage.put("cmd", { text: cmd.text, at: Date.now() });
+      return json({ ok: true, queued: cmd.text });
+    }
+
     if (request.method === "POST") {
       const text = await request.text();
       let parsed;
@@ -246,7 +337,26 @@ export class TelemetryStore {
     // age_s lets the display distinguish "the host stopped reporting" from
     // "the network is down" - without it a dead agent looks like fresh data
     // forever, which is the worst possible failure for a monitor.
-    return json({ ...freshest, devices, device_count: devices.length });
+    // Taken as it is handed over. A command left in place until the device
+    // acknowledged it would run twice whenever an acknowledgement was lost,
+    // and "reboot, twice" is a worse failure than "reboot, never".
+    const pending = await this.state.storage.get("cmd");
+    let cmd;
+    if (pending) {
+      await this.state.storage.delete("cmd");
+      // Stale commands are dropped rather than delivered. A "standby" queued
+      // while the device was unplugged for a week should not fire the moment
+      // it comes back.
+      if (now - (pending.at || 0) < 5 * 60 * 1000) cmd = pending.text;
+    }
+
+    return json({
+      ...freshest,
+      devices,
+      device_count: devices.length,
+      latest_fw: await latestFirmware(),
+      ...(cmd ? { cmd } : {}),
+    });
   }
 
   /** { list, newest } - live slots in a stable order, plus which one is current. */
@@ -324,14 +434,19 @@ export default {
     const route = parts[0];
     const stream = parts[1];
 
-    if (parts.length > 2 || (route !== "ingest" && route !== "telemetry")) {
+    if (parts.length > 2 ||
+        (route !== "ingest" && route !== "telemetry" && route !== "command")) {
       return json({ error: "not found" }, 404);
     }
 
-    const wantsWrite = route === "ingest";
+    // A command is a write, and is authorised with the push token - the same
+    // credential the agent already holds. It grants nothing the holder did not
+    // already have: anyone who can forge this machine's telemetry can also ask
+    // its display to reboot, and neither is possible without the pairing code.
+    const wantsWrite = route === "ingest" || route === "command";
     if (wantsWrite !== (request.method === "POST")) {
       return json({
-        error: wantsWrite ? "/ingest takes POST" : "/telemetry takes GET",
+        error: wantsWrite ? `/${route} takes POST` : "/telemetry takes GET",
       }, 405);
     }
 
@@ -361,9 +476,10 @@ export default {
       const init = {
         headers: { "X-Peek-Role": wantsWrite ? "push" : "read", "X-Peek-Token": token },
       };
+      const path = route === "command" ? "https://do/command" : "https://do/";
       return wantsWrite
-        ? stub.fetch("https://do/", { ...init, method: "POST", body: await request.text() })
-        : stub.fetch("https://do/", init);
+        ? stub.fetch(path, { ...init, method: "POST", body: await request.text() })
+        : stub.fetch(path, init);
     } else {
       // ---- shared: one stream per tenant, tokens minted from MASTER_SECRET ----
       if (!streamsReady) {
@@ -387,8 +503,9 @@ export default {
     }
 
     const stub = env.TELEMETRY.get(env.TELEMETRY.idFromName(doName));
+    const path = route === "command" ? "https://do/command" : "https://do/";
     return wantsWrite
-      ? stub.fetch("https://do/", { method: "POST", body: await request.text() })
-      : stub.fetch("https://do/");
+      ? stub.fetch(path, { method: "POST", body: await request.text() })
+      : stub.fetch(path);
   },
 };

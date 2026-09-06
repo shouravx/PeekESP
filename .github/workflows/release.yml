@@ -18,8 +18,62 @@ permissions:
   contents: write
 
 jobs:
+  linux:
+    name: Linux package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: The version has to agree with itself
+        run: python tools/bump_version.py --check
+
+      # The agent is standard library only, so "does it run" is a real check
+      # rather than a smoke test of the packaging around it.
+      - name: The agent reads this machine
+        run: |
+          out=$(python3 dietpi/peek-agent.py --once)
+          echo "$out"
+          echo "$out" | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          need = ['host','cpu_percent','ram_percent','storage_percent',
+                  'storage_total_gb','cpu_temp_c','battery_percent','uptime_seconds']
+          missing = [k for k in need if k not in d]
+          if missing:
+              raise SystemExit('missing fields: ' + ', '.join(missing))
+          print('all fields present')
+          "
+
+      - name: Build the .deb
+        run: sh packaging/build-deb.sh
+
+      # dpkg will happily produce a package that installs and then does
+      # nothing. Installing it is the only way to find out that a path in the
+      # control file was wrong.
+      - name: Install it, and check what it shipped
+        run: |
+          sudo apt-get install -y ./dist/peekesp_*_all.deb
+          peekesp version
+          test -x /usr/lib/peekesp/peek-agent.py
+          test -f /lib/systemd/system/peek-agent.service
+          # No pairing code, on purpose - a package carrying one would put a
+          # credential in every user's filesystem.
+          sudo grep -q '^PEEK_PAIR_CODE=$' /etc/peekesp/agent.conf
+          echo "installs clean, and ships no secret"
+          sudo apt-get remove -y peekesp
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-package
+          path: dist/*.deb
+
   windows:
     name: Windows app
+    needs: linux
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +81,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: The version has to agree with itself
+        run: python tools/bump_version.py --check
 
       - name: Check the tag matches the VERSION file
         if: startsWith(github.ref, 'refs/tags/v')
@@ -71,6 +128,13 @@ jobs:
             windows/dist/*.sha256
             packaging/winget/*/*.yaml
 
+      - name: Bring in the Linux package
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-package
+          path: windows/dist
+
       - name: Collect the manifests that match THIS build
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
@@ -108,6 +172,7 @@ jobs:
             "app zip"       = "windows/dist/PeekESP-$v-win-x64.zip"
             "app checksum"  = "windows/dist/PeekESP-$v-win-x64.zip.sha256"
             "manifests"     = "windows/dist/winget-manifests-$v.zip"
+            "linux package" = "windows/dist/peekesp_${v}_all.deb"
             "tray app"      = "windows/dist/PeekESP.exe"
             "headless agent"= "windows/dist/peek-agent.exe"
             "firmware"      = "firmware/PeekESP-merged.bin"

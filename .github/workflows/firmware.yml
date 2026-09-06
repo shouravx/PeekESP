@@ -1,0 +1,105 @@
+name: Firmware
+
+# The sketch is the largest and most fragile thing here, and until now it was
+# only ever compiled on one laptop. Every break it has had - a struct used
+# above its declaration, a %s handed a char(*)[33], a string literal a shell
+# mangled - was caught by a compile someone happened to run. This runs it on
+# every push, so "it builds" stops depending on who pushed.
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'PeekESP/**'
+      - 'lv_conf.h'
+      - 'tools/**'
+      - 'VERSION'
+      - '.github/workflows/firmware.yml'
+  pull_request:
+    paths:
+      - 'PeekESP/**'
+      - 'lv_conf.h'
+      - 'tools/**'
+      - 'VERSION'
+      - '.github/workflows/firmware.yml'
+  workflow_dispatch:
+
+jobs:
+  compile:
+    name: Compile the sketch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: The version has to agree with itself
+        run: python tools/bump_version.py --check
+
+      # The ESP32 core is ~250 MB and the libraries another 130 MB. Downloading
+      # that on every push would make this the slowest thing in the repository
+      # and the first check people learn to ignore.
+      - name: Cache the toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+            tools/.arduino-cli
+          key: esp32-toolchain-${{ hashFiles('tools/setup_arduino.py') }}-v1
+
+      - name: Install the toolchain
+        run: python tools/setup_arduino.py --no-build
+
+      # --warnings all, because the warnings this project has actually hit were
+      # real: an unused function left behind by a removal, a deprecated ADC
+      # constant, and a cast between function types that happened to work.
+      - name: Compile
+        run: |
+          tools/.arduino-cli/arduino-cli compile \
+            --fqbn "esp32:esp32:lilygo_t_display:PartitionScheme=huge_app" \
+            --warnings all \
+            PeekESP 2>&1 | tee build.log
+          if grep -E "^(/home/runner/work.*)?PeekESP/(PeekESP\.ino|clock_faces\.h):.*warning" build.log; then
+            echo "::error::the sketch produced warnings"
+            exit 1
+          fi
+
+      - name: Report the size
+        run: |
+          grep -E "Sketch uses|Global variables" build.log
+          # The partition is 3 MB and has no OTA slot, so there is room - but a
+          # jump worth noticing should be noticed, not discovered at flash time.
+          bytes=$(grep -oP 'Sketch uses \K[0-9]+' build.log)
+          echo "flash: $bytes bytes"
+          if [ "$bytes" -gt 2900000 ]; then
+            echo "::error::the sketch no longer fits the 3 MB app partition"
+            exit 1
+          fi
+
+      # The committed image is what tools/flash.py writes, and it is easy to
+      # change the sketch and forget to regenerate it.
+      #
+      # Compared by commit order, not by bytes. The ESP32 toolchain embeds
+      # build paths in the binary, so a Linux runner cannot reproduce an image
+      # built on Windows - a byte comparison would fail on every run and teach
+      # everyone to ignore this job. Asking "was the image committed after the
+      # last change to the sketch" needs no reproducible build and catches the
+      # mistake that actually happens.
+      - name: Is the committed image older than the sketch?
+        run: |
+          sketch=$(git log -1 --format=%ct -- PeekESP/ lv_conf.h)
+          image=$(git log -1 --format=%ct -- firmware/PeekESP-merged.bin)
+          if [ -z "$image" ]; then
+            echo "::error::firmware/PeekESP-merged.bin is not committed"
+            exit 1
+          fi
+          if [ "$image" -lt "$sketch" ]; then
+            echo "::error::firmware/PeekESP-merged.bin predates the last sketch change."
+            echo "Run: python tools/export_firmware.py, then commit the result."
+            echo "  sketch last changed: $(date -d @$sketch -u)"
+            echo "  image last changed:  $(date -d @$image -u)"
+            exit 1
+          fi
+          echo "the committed image is at least as new as the sketch"

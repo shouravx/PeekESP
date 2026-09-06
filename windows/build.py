@@ -98,6 +98,21 @@ def main():
     if not SCRIPT.exists():
         sys.exit(f"missing {SCRIPT.name}")
 
+    # The app reports this version and the update check compares against it, so
+    # a build claiming a version it is not is worse than one claiming none.
+    version_file = HERE.parent / "VERSION"
+    ver_module = HERE / "peek_version.py"
+    if version_file.exists() and ver_module.exists():
+        import re
+        want = version_file.read_text(encoding="utf-8").strip()
+        m = re.search(r'__version__\s*=\s*"([^"]+)"',
+                      ver_module.read_text(encoding="utf-8"))
+        if not m:
+            sys.exit("peek_version.py has no __version__")
+        if m.group(1) != want:
+            sys.exit(f"peek_version.py says {m.group(1)} but VERSION says {want}")
+        print(f"version {want}")
+
     py = venv_python()
     ensure_pyinstaller(py)
 

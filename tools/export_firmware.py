@@ -19,6 +19,7 @@ the sketch, or the committed image will quietly be the previous firmware.
 Needs the toolchain: python tools/setup_arduino.py
 """
 
+import re
 import shutil
 import subprocess
 import sys
@@ -59,6 +60,22 @@ def main():
         if not dst.exists() or dst.read_bytes() != src.read_bytes():
             shutil.copyfile(src, dst)
             print(f"lv_conf.h -> {dst}  (was out of date)")
+
+    # The sketch reports FW_VERSION over the wire and prints it on the settings
+    # page, and the update check compares it against the newest release. A
+    # device claiming a version it is not running is worse than one claiming
+    # none, because everything downstream believes it.
+    version_file = REPO / "VERSION"
+    if version_file.exists():
+        want = version_file.read_text(encoding="utf-8").strip()
+        sketch = (REPO / "PeekESP" / "PeekESP.ino").read_text(encoding="utf-8")
+        m = re.search(r'#define\s+FW_VERSION\s+"([^"]+)"', sketch)
+        if not m:
+            sys.exit("PeekESP.ino has no FW_VERSION define")
+        if m.group(1) != want:
+            sys.exit(f"FW_VERSION is {m.group(1)} but VERSION says {want} - "
+                     f"update the #define in PeekESP/PeekESP.ino")
+        print(f"version {want}")
 
     OUT.mkdir(exist_ok=True)
     print("compiling ...")

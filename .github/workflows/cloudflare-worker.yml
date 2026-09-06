@@ -5,7 +5,9 @@ name: Cloudflare Worker
 # these path filters every push would redeploy a Worker that did not change.
 on:
   push:
-    branches: [main]
+    # Tests run on both. The deploy job below is gated on main, so a push to
+    # dev is checked without touching the relay every device polls.
+    branches: [main, dev]
     paths:
       - 'cloudflare/**'
       - '.github/workflows/cloudflare-worker.yml'
@@ -51,7 +53,13 @@ jobs:
   deploy:
     name: Deploy
     needs: test
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    # Main only. The tests above run on dev as well, but this Worker is the one
+    # every paired device in the world is polling - a branch that exists to hold
+    # unfinished work must not be able to reach it. Without the ref check a push
+    # to dev would deploy, because 'push' alone does not say which branch.
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     # Attach branch protection / required reviewers to this environment in
     # repo settings if you want a human gate before anything reaches prod.

@@ -28,6 +28,8 @@ from pathlib import Path
 import peek_agent_win as agent
 import peek_config as cfgmod
 import peek_pair as pair
+import peek_remote as remote
+from peek_version import __version__ as APP_VERSION
 
 # Frozen, the icon is bundled beside the exe's temp root; from source it lives
 # in the repo's img/ folder. One file, no duplicated copy to drift.
@@ -221,6 +223,11 @@ def set_autostart(on: bool):
 # ==========================================================================
 #  Settings window
 # ==========================================================================
+# One per process rather than one per window, so opening settings repeatedly
+# does not re-ask GitHub each time.
+updates = remote.UpdateCheck(APP_VERSION)
+
+
 def open_settings(runner):
     import tkinter as tk
     from tkinter import ttk
@@ -544,6 +551,46 @@ def open_settings(runner):
     v_code.trace_add("write", refresh_device_panel)
     refresh_device_panel()
 
+    # ---- device controls ----
+    # The device polls and never listens, so nothing here reaches it directly:
+    # a command waits at the relay until the next poll. The button text says
+    # what was asked for, and the status line says it was queued rather than
+    # done, because "done" is not something this side can know.
+    ctl_wrap = tk.Frame(body, bg=BG)
+    ctl_wrap.pack(fill="x", pady=(16, 0))
+    label(ctl_wrap, "DEVICE", DIM, 8).pack(anchor="w")
+    ctl_note = label(ctl_wrap,
+                     "Sent through the relay - the device acts on its next poll.",
+                     DIM, 8)
+    ctl_note.pack(anchor="w", pady=(2, 6))
+
+    ctl_row = tk.Frame(ctl_wrap, bg=BG)
+    ctl_row.pack(anchor="w")
+
+    def send(verb):
+        code = pair.normalise(v_code.get())
+        if not code:
+            set_status(AMBER, "enter the pairing code first")
+            return
+        set_status(AMBER, f"sending {verb}...")
+        root.update_idletasks()
+
+        def worker():
+            ok, msg = remote.send_command(v_base.get().strip(), code, verb)
+            # Back onto the UI thread. Tk is not thread-safe, and a widget
+            # touched from a worker fails intermittently rather than loudly.
+            root.after(0, lambda: set_status(GREEN if ok else RED, msg))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    for text, verb in (("Reboot", "reboot"), ("Standby", "standby"),
+                       ("Wake", "wake"), ("Identify", "identify"),
+                       ("Refresh", "refresh")):
+        tk.Button(ctl_row, text=text, command=(lambda v=verb: send(v)),
+                  bg=CARD, fg=TEXT, activebackground=EDGE, activeforeground=CYAN,
+                  relief="flat", bd=0, font=("Segoe UI", 8),
+                  padx=10, pady=5, cursor="hand2").pack(side="left", padx=(0, 6))
+
     tk.Checkbutton(body, text="Start automatically when I sign in",
                    variable=v_auto, bg=BG, fg=TEXT, selectcolor=CARD,
                    activebackground=BG, activeforeground=CYAN,
@@ -552,6 +599,26 @@ def open_settings(runner):
 
     hint = label(body, f"config file: {cfgmod.config_path()}", DIM, 8)
     hint.pack(anchor="w", pady=(6, 0))
+
+    # Version, and an update line that only appears when there is one. A row
+    # that permanently reads "you are up to date" is furniture people stop
+    # seeing; one that appears is news. A failed check shows nothing at all,
+    # because an update prompt caused by a dropped network teaches people to
+    # ignore update prompts.
+    ver = label(body, f"version {APP_VERSION}", DIM, 8)
+    ver.pack(anchor="w", pady=(2, 0))
+
+    def show_update():
+        if not updates.available:
+            return
+        ver.config(text=f"version {APP_VERSION}  ·  {updates.latest} available",
+                   fg=AMBER, cursor="hand2")
+        ver.bind("<Button-1>", lambda _e: webbrowser.open(remote.RELEASES_PAGE))
+        ver.bind("<Enter>", lambda _e: ver.config(fg=CYAN))
+        ver.bind("<Leave>", lambda _e: ver.config(fg=AMBER))
+
+    updates.start()
+    root.after(2500, show_update)
 
     by = tk.Label(body, text="PeekESP by shouravx  ·  github.com/shouravx/PeekESP",
                   bg=BG, fg=DIM, font=("Segoe UI", 8), cursor="hand2")
