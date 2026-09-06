@@ -59,7 +59,7 @@ def main():
         print(out)
         # The last lines are the ones naming the file and line, so they are the
         # ones worth carrying into an annotation.
-        tail = [ln for ln in out.strip().splitlines() if ln.strip()][-12:]
+        tail = [ln for ln in out.strip().splitlines() if ln.strip()][-40:]
         die("the sketch did not compile:\n" + "\n".join(tail))
 
     # Only our own files. The libraries produce warnings we do not control -
@@ -77,7 +77,7 @@ def main():
     if not m:
         # Say what was actually there rather than failing on an empty variable.
         print(out)
-        tail = [ln for ln in out.strip().splitlines() if ln.strip()][-12:]
+        tail = [ln for ln in out.strip().splitlines() if ln.strip()][-40:]
         die("could not find the size in arduino-cli's output. It said:\n"
             + "\n".join(tail))
 
