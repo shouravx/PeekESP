@@ -9,6 +9,11 @@
 # run on Linux, and is also installed to /usr/local/bin as the peekesp command.
 dietpi/peekesp text eol=lf
 
+# Shell too, and read by makepkg on an Arch machine. A CRLF PKGBUILD fails in
+# ways that point at the recipe rather than at the line endings.
+packaging/aur/PKGBUILD text eol=lf
+packaging/aur/peekesp.install text eol=lf
+
 # Firmware images and icons must never be line-ending "corrected".
 *.bin binary
 *.ico binary

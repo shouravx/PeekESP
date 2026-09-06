@@ -20,7 +20,16 @@
 set -eu
 
 RAW_BASE="https://raw.githubusercontent.com/shouravx/PeekESP/main"
-PREFIX="/opt/peekesp"
+# Two layouts, one script. The curl installer puts the agent in /opt because
+# that is what /opt is for - software installed outside the distribution's
+# package manager. A distribution package cannot use /opt and must use
+# /usr/lib. Checking for the packaged path first means the same peekesp works
+# whichever way it arrived, and a machine that has both prefers the managed one.
+if [ -f /usr/lib/peekesp/peek-agent.py ]; then
+    PREFIX="/usr/lib/peekesp"
+else
+    PREFIX="/opt/peekesp"
+fi
 CONF_DIR="/etc/peekesp"
 CONF="$CONF_DIR/agent.conf"
 UNIT="/etc/systemd/system/peek-agent.service"
@@ -272,6 +281,11 @@ update)
 
 uninstall)
     need_root uninstall
+    if [ "$PREFIX" = "/usr/lib/peekesp" ]; then
+        die "this copy was installed by your package manager.
+       Remove it with that instead:  sudo pacman -R peekesp
+                                     sudo apt remove peekesp"
+    fi
     systemctl disable --now "$SVC" 2>/dev/null || true
     rm -f "$UNIT"
     systemctl daemon-reload 2>/dev/null || true

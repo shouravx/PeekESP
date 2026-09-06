@@ -1,0 +1,91 @@
+# Maintainer: shouravx <rhshourav02@gmail.com>
+pkgname=peekesp
+pkgver=1.1.0
+pkgrel=1
+pkgdesc="Push this machine's CPU, RAM, storage and temperature to a PeekESP display"
+arch=('any')
+url="https://github.com/shouravx/PeekESP"
+license=('MIT')
+# python only. The agent is standard library throughout - no psutil, no wheels,
+# nothing to resolve - which is most of why this packages cleanly at all.
+depends=('python' 'systemd')
+optdepends=('lm_sensors: nothing is needed for temperature, /sys/class/thermal is enough')
+backup=('etc/peekesp/agent.conf')
+install="${pkgname}.install"
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')   # replaced by `updpkgsums` before submitting
+
+package() {
+  cd "PeekESP-${pkgver}"
+
+  # /usr/lib, not /opt: /opt is for software installed outside the package
+  # manager, and this is the package manager. The peekesp command checks for
+  # the packaged path first, so one script serves both routes.
+  install -Dm755 dietpi/peek-agent.py "${pkgdir}/usr/lib/${pkgname}/peek-agent.py"
+  install -Dm755 dietpi/peekesp       "${pkgdir}/usr/bin/peekesp"
+
+  install -Dm644 /dev/stdin "${pkgdir}/usr/lib/systemd/system/peek-agent.service" <<'UNIT'
+[Unit]
+Description=PeekESP telemetry agent
+Documentation=https://github.com/shouravx/PeekESP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/peekesp/agent.conf
+ExecStart=/usr/bin/python3 /usr/lib/peekesp/peek-agent.py
+Restart=always
+RestartSec=10
+
+User=peekesp
+Group=peekesp
+
+# The agent reads /proc and /sys and writes nothing, so it can give up
+# essentially everything.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+PrivateTmp=true
+
+# ProtectHome is deliberately NOT set. It replaces /home with an empty mount,
+# and this agent adds up every real filesystem to report storage - so a machine
+# with /home on its own partition would silently stop counting it.
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  # Shipped empty of secrets. The pairing code is added by `peekesp pair`, and
+  # a package that shipped one would put it in every user's filesystem.
+  install -Dm600 /dev/stdin "${pkgdir}/etc/peekesp/agent.conf" <<'CONF'
+# PeekESP agent configuration.  Edit with:  sudo peekesp set KEY VALUE
+#
+# The pairing code is the only secret here: the stream id and the push token
+# are derived from it, so anything that can read this file can push telemetry
+# to your device. Set it with:  sudo peekesp pair YOUR-CODE
+PEEK_PAIR_CODE=
+
+# Seconds between pushes. Each agent costs 86400/interval requests a day
+# against Cloudflare's free 100,000.
+PEEK_INTERVAL=5
+
+# A different Worker, if you deployed your own.
+PEEK_RELAY_BASE=https://peek-relay.peekesp.workers.dev
+
+# Also answer on :8080, for a device polling over the same LAN. Off by
+# default: an open port is not something pushing telemetry should imply.
+PEEK_SERVE=0
+CONF
+
+  install -Dm644 LICENSE      "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 dietpi/README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}
