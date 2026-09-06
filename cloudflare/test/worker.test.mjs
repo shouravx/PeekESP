@@ -1,4 +1,4 @@
-import worker, { TelemetryStore, deriveToken, derivePairing } from "../src/index.js";
+import worker, { TelemetryStore, deriveToken, derivePairing, _seedFirmwareCache } from "../src/index.js";
 import { deriveTokenNode } from "../mint.mjs";
 
 // --- stub the Durable Object runtime ---------------------------------------
@@ -373,6 +373,66 @@ await check("...and the first new push replaces it rather than sitting beside it
   (j) => j.device_count === 1 && j.devices[0].host === "newdata");
 assert("the legacy keys are gone once a per-host slot exists",
   !legacyStore.state.storage.map.has("latest"));
+
+// ===========================================================================
+//  Commands, and the version the relay carries
+// ===========================================================================
+_seedFirmwareCache("9.9.9");          // no network reachable from the unit suite
+
+const cd = await derivePairing("CMD4TEST99");
+const cmdUrl = "/command/" + cd.stream;
+const telUrl = "/telemetry/" + cd.stream;
+
+// Claim both roles first, so what follows is about commands rather than TOFU.
+await worker.fetch(req("/ingest/" + cd.stream, {
+  method: "POST", token: cd.push, body: JSON.stringify({ host: "box", cpu_percent: 1 }),
+}), env);
+await worker.fetch(req(telUrl, { token: cd.read }), env);
+
+await check("the relay tells the device the newest published version",
+  await worker.fetch(req(telUrl, { token: cd.read }), env), 200,
+  (j) => j.latest_fw === "9.9.9");
+
+await check("a command needs the push token, not the read token",
+  await worker.fetch(req(cmdUrl, { method: "POST", token: cd.read, body: "reboot" }), env), 401);
+
+await check("no token queues nothing",
+  await worker.fetch(req(cmdUrl, { method: "POST", body: "reboot" }), env), 401);
+
+await check("an unknown verb is refused at the edge, not shipped to the device",
+  await worker.fetch(req(cmdUrl, { method: "POST", token: cd.push, body: "rm -rf /" }), env), 400);
+
+await check("an argument outside the allowed range is refused",
+  await worker.fetch(req(cmdUrl, { method: "POST", token: cd.push, body: "bright:99" }), env), 400);
+
+await check("a valid command is queued",
+  await worker.fetch(req(cmdUrl, { method: "POST", token: cd.push, body: "bright:2" }), env), 200,
+  (j) => j.queued === "bright:2");
+
+await check("the device collects it on its next poll",
+  await worker.fetch(req(telUrl, { token: cd.read }), env), 200,
+  (j) => j.cmd === "bright:2");
+
+// The whole point of clearing on delivery rather than on acknowledgement.
+await check("...and does not collect it a second time",
+  await worker.fetch(req(telUrl, { token: cd.read }), env), 200,
+  (j) => j.cmd === undefined);
+
+await check("a bare verb needs no argument, and normalises on the way through",
+  await worker.fetch(req(cmdUrl, { method: "POST", token: cd.push, body: "REBOOT " }), env), 200,
+  (j) => j.queued === "reboot");
+await check("...and arrives lower-cased",
+  await worker.fetch(req(telUrl, { token: cd.read }), env), 200, (j) => j.cmd === "reboot");
+
+// A command queued while the device was unplugged must not fire on its return.
+await worker.fetch(req(cmdUrl, { method: "POST", token: cd.push, body: "standby" }), env);
+const cmdStore = storeFor("pair:" + cd.stream).state.storage;
+cmdStore.map.set("cmd", { ...cmdStore.map.get("cmd"), at: Date.now() - 10 * 60 * 1000 });
+await check("a command older than five minutes is dropped, not delivered",
+  await worker.fetch(req(telUrl, { token: cd.read }), env), 200, (j) => j.cmd === undefined);
+
+await check("GET /command is refused - a command is a write",
+  await worker.fetch(req(cmdUrl, { token: cd.push }), env), 405);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

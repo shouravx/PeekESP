@@ -134,6 +134,12 @@
 // the single most common way to get a POSIX TZ string exactly backwards.
 #define TZ_DHAKA "<+06>-6"
 
+// Kept in step with the VERSION file at the repository root by
+// tools/export_firmware.py, which refuses to build if the two disagree - a
+// device reporting a version it is not running is worse than one reporting
+// none, because the update check believes it.
+#define FW_VERSION "1.1.0"
+
 #define PAIR_ALPHABET "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 #define PAIR_CODE_LEN 10
 
@@ -308,6 +314,29 @@ static volatile uint32_t g_data_at = 0;
 // garbled name for one frame, which is the entire cost of not locking a string
 // that exists only to be looked at.
 static char              g_wifi_try[33] = "";
+
+// The newest published version, as reported by the relay in its telemetry
+// reply. Empty until a poll has succeeded, which is the right default: an
+// update banner should never appear because a check failed. Written and read
+// on core 0 only - the network task fills it, the web handlers render it.
+static char              g_update_tag[16] = "";
+
+// A command collected from the relay, waiting for whichever core can act on
+// it. Core 0 receives; standby is entered from the button loop and the page
+// changes belong to the UI task, so the verb is parked here rather than acted
+// on where it arrives.
+enum Cmd : uint8_t {
+  CMD_NONE = 0, CMD_REBOOT, CMD_STANDBY, CMD_WAKE,
+  CMD_REFRESH, CMD_IDENTIFY, CMD_PAGE, CMD_BRIGHT,
+};
+static volatile uint8_t  g_cmd     = CMD_NONE;
+static volatile uint8_t  g_cmd_arg = 0;
+
+// How often to poll while the screen is off. Standby stops the normal five
+// second poll, and that would make "wake" a command the device can never hear -
+// a remote standby you cannot undo without walking to the device is a trap, not
+// a feature. A minute of latency costs 1,440 requests a day against 17,280.
+#define STANDBY_POLL_MS 60000
 
 // Buttons run on core 1 beside the UI task but must never touch LVGL, so a tap
 // leaves a step here and the UI timer picks it up on its next tick.
@@ -1432,6 +1461,34 @@ static void ui_sync_cb(lv_timer_t *t) {
     else      lv_obj_add_flag(g_spinner, LV_OBJ_FLAG_HIDDEN);
   }
 
+  // Commands whose effect is on screen. Handled here because everything they
+  // touch belongs to this task.
+  const uint8_t cmd = g_cmd;
+  if (cmd == CMD_PAGE || cmd == CMD_BRIGHT || cmd == CMD_IDENTIFY) {
+    const uint8_t arg = g_cmd_arg;
+    g_cmd = CMD_NONE;
+
+    if (cmd == CMD_PAGE && arg < page_count() && !g_sliding) {
+      // Stepped rather than jumped, so it animates the way a button press
+      // does and the display never simply cuts to a different page.
+      const uint8_t here = g_view;
+      if (arg != here) view_step(arg > here ? 1 : -1);
+    } else if (cmd == CMD_BRIGHT && arg < BL_LEVEL_COUNT) {
+      cfg.bl_idx = arg;
+      backlight_set(BL_LEVELS[arg]);
+      config_save_backlight();
+    } else if (cmd == CMD_IDENTIFY) {
+      // Which of the ones on the shelf is this? Three flashes of the
+      // backlight, which is visible across a room and needs no screen space.
+      for (uint8_t i = 0; i < 3; i++) {
+        backlight_set(0);
+        delay(90);
+        backlight_set(BL_LEVELS[cfg.bl_idx]);
+        delay(90);
+      }
+    }
+  }
+
   power_tick();
 
   // The clock is the only thing here that has to move every second, and it
@@ -1953,6 +2010,53 @@ static void parse_one(JsonObjectConst o, Telemetry &out) {
   strlcpy(out.host, o["host"] | "dietpi", sizeof out.host);
 }
 
+// The relay carries the newest published version alongside the telemetry, so
+// the device learns about updates without a second request, a second host to
+// trust, or a certificate authority beyond the one it already pins.
+static void note_latest_version(JsonDocument &doc) {
+  const char *tag = doc["latest_fw"] | "";
+  if (tag && *tag) strlcpy(g_update_tag, tag, sizeof g_update_tag);
+}
+
+// A command rides in on the same reply. The relay has already rejected
+// anything outside its vocabulary, but this parses defensively anyway: the
+// device is the thing that would act on a bad one, and it is not in a position
+// to check who really sent it.
+static void note_command(JsonDocument &doc) {
+  const char *c = doc["cmd"] | "";
+  if (!c || !*c) return;
+
+  const char *colon = strchr(c, ':');
+  const size_t vlen = colon ? (size_t)(colon - c) : strlen(c);
+  char verb[12];
+  if (vlen == 0 || vlen >= sizeof verb) return;
+  memcpy(verb, c, vlen);
+  verb[vlen] = '\0';
+
+  long arg = colon ? strtol(colon + 1, nullptr, 10) : 0;
+  if (arg < 0 || arg > 15) return;
+
+  uint8_t v = CMD_NONE;
+  if      (!strcmp(verb, "reboot"))   v = CMD_REBOOT;
+  else if (!strcmp(verb, "standby"))  v = CMD_STANDBY;
+  else if (!strcmp(verb, "wake"))     v = CMD_WAKE;
+  else if (!strcmp(verb, "refresh"))  v = CMD_REFRESH;
+  else if (!strcmp(verb, "identify")) v = CMD_IDENTIFY;
+  else if (!strcmp(verb, "page"))     v = CMD_PAGE;
+  else if (!strcmp(verb, "bright"))   v = CMD_BRIGHT;
+  if (v == CMD_NONE) return;
+
+  Serial.printf("[cmd] %s\n", c);
+
+  // The two that can be handled here are handled here. Everything else waits
+  // for the task that owns the thing it touches.
+  if (v == CMD_REFRESH) { g_force = true; return; }
+  if (v == CMD_REBOOT)  { g_reboot_at = millis() + 400; return; }
+
+  g_cmd_arg = (uint8_t)arg;
+  g_cmd     = v;
+}
+
 static bool parse_payload(const String &payload, DeviceSet &out) {
   // ArduinoJson 7 sizes itself; 6 needs the capacity up front.
 #if ARDUINOJSON_VERSION_MAJOR >= 7
@@ -1986,6 +2090,8 @@ static bool parse_payload(const String &payload, DeviceSet &out) {
   if (!out.n) {
     parse_one(doc.as<JsonObjectConst>(), out.d[out.n++]);
   }
+  note_latest_version(doc);
+  note_command(doc);
   return true;
 }
 
@@ -2156,15 +2262,28 @@ static void netTask(void *arg) {
       vTaskDelay(pdMS_TO_TICKS(50));
     }
 
-    // Nothing is on screen in standby, so polling would spend requests and
-    // radio time on numbers nobody is looking at. Waking sets g_force, so the
-    // first thing that happens on the way back is a fresh reading. The battery
-    // is still sampled, so the power page is correct the moment it reappears
-    // rather than showing whatever was true when the screen went off.
+    // Standby drops the poll rate rather than stopping it. Nothing is on
+    // screen, so five seconds would be spending requests on numbers nobody is
+    // looking at - but stopping entirely would make a remote "wake" impossible
+    // to hear, and a standby that can only be undone by walking to the device
+    // is a trap. A minute is 1,440 requests a day against 17,280.
+    //
+    // The battery is still sampled throughout, so the power page is right the
+    // moment it reappears rather than showing what was true when it went off.
+    uint32_t slow_at = millis() + STANDBY_POLL_MS;
     while (g_standby && !g_force && !g_reboot_at) {
       if ((int32_t)(millis() - batt_at) >= 0) {
         batt_at = millis() + 2000;
         battery_sample();
+      }
+      if ((int32_t)(millis() - slow_at) >= 0) {
+        slow_at = millis() + STANDBY_POLL_MS;
+        DeviceSet quiet;
+        uint32_t ms = 0;
+        if (fetch(quiet, ms)) {
+          // Only the command matters here; the readings are not being drawn.
+          // Publishing them would also wake nothing, so they are left alone.
+        }
       }
       vTaskDelay(pdMS_TO_TICKS(200));
     }
@@ -2184,34 +2303,99 @@ static void netTask(void *arg) {
 static const char PAGE_CSS[] PROGMEM =
   "<!doctype html><meta charset=utf-8>"
   "<meta name=viewport content='width=device-width,initial-scale=1'>"
-  "<title>PeekESP setup</title><style>"
+  "<meta name=theme-color content=#05070E>"
+  "<title>PeekESP</title><style>"
   "*{box-sizing:border-box}"
-  "body{margin:0;padding:20px;background:#05070E;color:#E6EDF7;"
-  "font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}"
-  "main{max-width:520px;margin:0 auto}"
-  "h1{font-size:20px;margin:0 0 2px;color:#00E5FF;letter-spacing:.06em}"
-  "p.sub{margin:0 0 22px;color:#5C6B82;font-size:13px}"
-  "fieldset{border:1px solid #1A2334;border-radius:8px;padding:14px 14px 4px;"
-  "margin:0 0 16px;background:#0B1220}"
-  "legend{color:#5C6B82;font-size:12px;letter-spacing:.12em;padding:0 6px}"
-  "label{display:block;margin:0 0 12px}"
-  "span{display:block;font-size:12px;color:#5C6B82;margin-bottom:4px}"
+
+  // The device's own palette, so the page a phone opens and the screen the
+  // phone is standing next to are recognisably the same product.
+  ":root{--bg:#05070E;--card:#0B1220;--line:#1A2334;--ink:#E6EDF7;--dim:#5C6B82;"
+  "--mid:#8C9BB3;--cy:#00E5FF;--am:#FFB020;--gr:#35D07F;--rd:#FF4D6D}"
+
+  // Monospace everywhere was most of why this looked like a debug page. A
+  // system sans carries the prose and the labels; mono is kept for the things
+  // that are actually data - addresses, versions, values you might compare.
+  "body{margin:0;padding:0 16px 40px;background:var(--bg);color:var(--ink);"
+  "font:16px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
+  "-webkit-text-size-adjust:100%}"
+  "main{max-width:560px;margin:0 auto}"
+
+  "header{display:flex;align-items:center;justify-content:space-between;gap:12px;"
+  "padding:18px 0 14px;border-bottom:1px solid var(--line);margin-bottom:18px}"
+  ".brand{font:600 15px/1 ui-monospace,Consolas,monospace;letter-spacing:.14em;color:var(--cy)}"
+  ".brand i{font-style:normal;color:var(--dim);margin-left:8px}"
+  ".pill{font:500 11px/1 ui-monospace,Consolas,monospace;letter-spacing:.1em;"
+  "text-transform:uppercase;padding:6px 10px;border-radius:99px;"
+  "border:1px solid var(--line);color:var(--mid);white-space:nowrap}"
+  ".pill.ok{color:var(--gr);border-color:#1d4034}"
+  ".pill.warn{color:var(--am);border-color:#3d2f10}"
+
+  // What the device knows about itself, before anything it wants you to type.
+  // A settings page that only takes input tells you nothing about whether the
+  // thing is working.
+  ".stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(116px,1fr));"
+  "gap:1px;background:var(--line);border:1px solid var(--line);border-radius:10px;"
+  "overflow:hidden;margin:0 0 18px}"
+  ".stat>div{background:var(--card);padding:10px 12px;min-width:0}"
+  ".stat dt{font:500 10px/1.4 ui-monospace,Consolas,monospace;letter-spacing:.12em;"
+  "text-transform:uppercase;color:var(--dim)}"
+  ".stat dd{margin:3px 0 0;font:14px/1.3 ui-monospace,Consolas,monospace;"
+  "color:var(--ink);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}"
+
+  ".upd{padding:13px 15px;margin:0 0 18px;border:1px solid #3d2f10;"
+  "background:#171106;border-radius:10px;font-size:14px;color:var(--mid)}"
+  ".upd b{display:block;color:var(--am);font-size:15px;margin-bottom:2px}"
+  ".upd a{color:var(--cy)}"
+
+  ".card{border:1px solid var(--line);border-radius:10px;background:var(--card);"
+  "padding:16px;margin:0 0 14px}"
+  ".card h2{margin:0;font:600 12px/1 ui-monospace,Consolas,monospace;"
+  "letter-spacing:.14em;text-transform:uppercase;color:var(--cy)}"
+
+  "label{display:block;margin:13px 0 0}"
+  "label>span{display:block;font-size:13px;color:var(--mid);margin-bottom:5px}"
+  // 16px is a floor, not a preference: anything smaller and iOS Safari zooms
+  // the whole page the moment a field takes focus, which on a phone held in
+  // one hand mid-setup is genuinely disorienting.
   "input[type=text],input[type=password],input[type=number],select{width:100%;"
-  "padding:9px 10px;border:1px solid #1A2334;border-radius:6px;background:#05070E;"
-  "color:#E6EDF7;font:inherit}"
-  "input:focus,select:focus{outline:none;border-color:#00E5FF}"
-  ".row{display:flex;gap:10px}.row label{flex:1}"
-  "label.chk{display:flex;align-items:center;gap:8px;color:#E6EDF7;font-size:14px}"
-  "label.chk span{margin:0;color:#E6EDF7;font-size:14px}"
-  "button{width:100%;padding:12px;border:0;border-radius:6px;background:#00E5FF;"
-  "color:#05070E;font:600 15px/1 inherit;letter-spacing:.04em;cursor:pointer}"
-  "button.alt{margin-top:12px;background:transparent;color:#FFB020;"
-  "border:1px solid #FFB020}"
-  "a.reset{display:block;text-align:center;margin-top:14px;color:#FF4D6D;font-size:13px}"
-  "p.hint{margin:-4px 0 12px;font-size:12px;line-height:1.45;color:#5C6B82}"
-  "p.by{text-align:center;margin:22px 0 0;font-size:12px;color:#5C6B82}"
-  "p.by a{color:#00E5FF;text-decoration:none}"
+  "padding:11px 12px;border:1px solid var(--line);border-radius:8px;"
+  "background:var(--bg);color:var(--ink);"
+  "font:16px/1.2 ui-monospace,Consolas,monospace}"
+  "input:focus,select:focus{outline:none;border-color:var(--cy);"
+  "box-shadow:0 0 0 3px rgba(0,229,255,.14)}"
+  "input::placeholder{color:#3d4b60}"
+
+  ".chk{display:flex;align-items:center;gap:10px;margin-top:15px}"
+  ".chk input{width:20px;height:20px;accent-color:var(--cy);margin:0;flex:none}"
+  ".chk span{margin:0;font-size:15px;color:var(--ink)}"
+  ".hint{margin:7px 0 0;font-size:13px;line-height:1.5;color:var(--dim)}"
+  ".hint a{color:var(--cy)}"
+
+  "button{width:100%;padding:14px;border:0;border-radius:8px;background:var(--cy);"
+  "color:var(--bg);font:600 15px/1 inherit;letter-spacing:.03em;cursor:pointer}"
+  "button:active{transform:translateY(1px)}"
+  "button.alt{margin-top:10px;background:transparent;color:var(--am);"
+  "border:1px solid #3d2f10}"
+  "a.reset{display:block;text-align:center;margin-top:16px;color:var(--rd);"
+  "font-size:13px;text-decoration:none}"
+  ".by{text-align:center;margin:26px 0 0;font-size:12px;color:var(--dim)}"
+  ".by a{color:var(--cy);text-decoration:none}"
   "</style>";
+
+
+// How long this has been up, for the status strip. Deliberately coarse: a
+// settings page refreshed by hand does not need seconds, and "up 3h 12m" is
+// read at a glance where "11543 s" is arithmetic.
+static String uptime_text() {
+  const uint32_t s = millis() / 1000UL;
+  char b[24];
+  if (s >= 86400)   snprintf(b, sizeof b, "%ud %uh", (unsigned)(s / 86400), (unsigned)((s % 86400) / 3600));
+  else if (s >= 3600) snprintf(b, sizeof b, "%uh %um", (unsigned)(s / 3600), (unsigned)((s % 3600) / 60));
+  else if (s >= 60)   snprintf(b, sizeof b, "%um", (unsigned)(s / 60));
+  else                snprintf(b, sizeof b, "%us", (unsigned)s);
+  return String(b);
+}
+
 
 /**
  * Escape text before it goes into the page.
@@ -2262,14 +2446,62 @@ static void handle_root() {
   // reallocating, so building 12 KB an append at a time walks the heap through
   // dozens of ever-larger allocations on a device with no memory to waste.
   String p;
-  p.reserve(14000);
+  p.reserve(18000);
   p += FPSTR(PAGE_CSS);
-  p += F("<main><h1>PeekESP</h1><p class=sub>");
-  p += g_ap_ssid;
-  p += F(" &middot; settings are saved to flash and survive a reflash of the"
-         " sketch.</p><form method=POST action=/save>");
+  p += F("<main><header><div class=brand>PEEK<i>settings</i></div>");
 
-  p += F("<fieldset><legend>WIFI</legend>"
+  if (g_setup_mode) {
+    p += F("<div class='pill warn'>setup mode</div>");
+  } else if (cfg.pair_code[0]) {
+    p += F("<div class='pill ok'>paired</div>");
+  } else {
+    p += F("<div class=pill>configured</div>");
+  }
+  p += F("</header>");
+
+  // What the device knows about itself, before anything it wants typed in. A
+  // settings page that only takes input never answers the question people
+  // actually arrive with, which is whether the thing is working.
+  p += F("<dl class=stat>");
+  p += F("<div><dt>firmware</dt><dd>");
+  p += F(FW_VERSION);
+  p += F("</dd></div><div><dt>uptime</dt><dd>");
+  p += uptime_text();
+  p += F("</dd></div><div><dt>address</dt><dd>");
+  if (g_setup_mode)      p += WiFi.softAPIP().toString();
+  else if (WiFi.status() == WL_CONNECTED) p += WiFi.localIP().toString();
+  else                   p += F("offline");
+  p += F("</dd></div><div><dt>");
+  if (g_setup_mode || WiFi.status() != WL_CONNECTED) {
+    p += F("access point</dt><dd>");
+    p += html_escape(g_ap_ssid);
+  } else {
+    p += F("signal</dt><dd>");
+    p += WiFi.RSSI();
+    p += F(" dBm");
+  }
+  p += F("</dd></div><div><dt>free memory</dt><dd>");
+  p += (unsigned)(ESP.getFreeHeap() / 1024);
+  p += F(" KB</dd></div><div><dt>machines</dt><dd>");
+  p += (unsigned)g_device_count;
+  p += F("</dd></div></dl>");
+
+  // Only rendered when the relay has actually reported something newer. An
+  // update banner that is always there is furniture; one that appears is news.
+  if (g_update_tag[0] && strcmp(g_update_tag, FW_VERSION) != 0) {
+    p += F("<div class=upd><b>Version ");
+    p += html_escape(g_update_tag);
+    p += F(" is available</b>This device is running ");
+    p += F(FW_VERSION);
+    p += F(". Updating means reflashing over USB - there is no over-the-air "
+           "path, because the partition table has a single app slot. "
+           "<a href='https://github.com/shouravx/PeekESP/releases' "
+           "target=_blank rel=noopener>Release notes</a></div>");
+  }
+
+  p += F("<form method=POST action=/save>");
+
+  p += F("<section class=card><h2>Wi-Fi</h2>"
          "<p class=hint>Up to five networks. The device scans on boot and joins "
          "whichever of them it can actually hear, strongest first - so a spare "
          "here costs nothing until the day you need it.</p>");
@@ -2353,12 +2585,12 @@ static void handle_root() {
     p += cfg.wifi_pass[i][0] ? F("unchanged") : F("none saved");
     p += F("\" value=\"\"></label>");
   }
-  p += F("</fieldset>");
+  p += F("</section>");
 
   // Pairing is the normal route and needs nothing here - the code on the
   // device's own screen fills the fields below in. They exist for a named or
   // private stream, where you were given a URL and token directly.
-  p += F("<fieldset><legend>RELAY</legend>"
+  p += F("<section class=card><h2>Relay</h2>"
          "<p class=hint>If you paired this device from the PeekESP app, these "
          "are already set and there is nothing to do here.</p>");
   p += field("Worker URL", "rurl", cfg.relay_url);
@@ -2378,10 +2610,10 @@ static void handle_root() {
   p += F("><span>Verify TLS certificate</span></label>"
          "<p class=hint>Leave verification on. Turn it off only if Cloudflare "
          "rotates to a CA that is not pinned in ca_certs.h - it makes the "
-         "connection interceptable.</p></fieldset>");
+         "connection interceptable.</p></section>");
 
   // ---- clock ----
-  p += F("<fieldset><legend>CLOCK</legend>"
+  p += F("<section class=card><h2>Clock</h2>"
          "<label><span>Time zone</span><select name=tzmin>");
   {
     // Every offset in current civil use, including the quarter-hour ones.
@@ -2414,10 +2646,10 @@ static void handle_root() {
          "It changes nothing else.</p>");
   p += F("<label class=chk><input type=checkbox name=clk24 value=1 ");
   if (cfg.clock_24h) p += F("checked");
-  p += F("><span>24-hour clock</span></label></fieldset>");
+  p += F("><span>24-hour clock</span></label></section>");
 
   // ---- device ----
-  p += F("<fieldset><legend>DEVICE</legend>"
+  p += F("<section class=card><h2>Device</h2>"
          "<label class=chk><input type=checkbox name=webui value=1 ");
   if (cfg.web_ui) p += F("checked");
   p += F("><span>Settings page on my network</span></label>"
@@ -2426,14 +2658,14 @@ static void handle_root() {
          "by everything else on that network. It asks for a password (user "
          "<b>peek</b>, the setup password shown on the screen), but that "
          "crosses the network unencrypted, so leave it off unless you want it."
-         "</p></fieldset>");
+         "</p></section>");
 
-  p += F("<button type=submit>SAVE &amp; REBOOT</button></form>"
+  p += F("<button type=submit>Save &amp; reboot</button></form>"
          "<form method=POST action=/newcode "
          "onsubmit=\"return confirm('Generate a new pairing code? The app and "
          "any other machines paired to this device will stop reaching it until "
          "you type the new code into each of them.')\">"
-         "<button class=alt type=submit>NEW PAIRING CODE</button></form>"
+         "<button class=alt type=submit>Generate a new pairing code</button></form>"
          "<a class=reset href=/reset>erase all settings</a>"
          "<p class=by>PeekESP by <a href=\"https://github.com/shouravx\">shouravx</a>"
          " &middot; <a href=\"https://github.com/shouravx/PeekESP\">source</a></p>"
@@ -2786,7 +3018,11 @@ static void enter_standby() {
   while (digitalRead(PIN_BTN_R) == LOW) vTaskDelay(pdMS_TO_TICKS(10));
   vTaskDelay(pdMS_TO_TICKS(80));   // contact bounce
 
-  while (digitalRead(PIN_BTN_R) == HIGH) vTaskDelay(pdMS_TO_TICKS(25));
+  // Either the button, or a "wake" that arrived on the slow poll.
+  while (digitalRead(PIN_BTN_R) == HIGH && g_cmd != CMD_WAKE) {
+    vTaskDelay(pdMS_TO_TICKS(25));
+  }
+  if (g_cmd == CMD_WAKE) g_cmd = CMD_NONE;
 
   tft.writecommand(0x11);          // SLPOUT
   delay(120);                      // the ST7789 wants ~120 ms out of sleep
@@ -2812,6 +3048,15 @@ void loop() {
   static bool     right_fired = false;
 
   const uint32_t now = millis();
+
+  // A command that has to be acted on from this task rather than from the one
+  // that received it.
+  if (g_cmd == CMD_STANDBY && !g_standby && !g_setup_mode) {
+    g_cmd = CMD_NONE;
+    enter_standby();
+  } else if (g_cmd == CMD_WAKE && !g_standby) {
+    g_cmd = CMD_NONE;              // already awake; nothing to undo
+  }
 
   // --- left: tap to swipe machines, hold to drop into setup mode ---
   if (digitalRead(PIN_BTN_L) == LOW) {
