@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PeekESP - live system metrics on an ESP32 desk display</title>
+<meta name="description" content="An ESP32 with a 1.14-inch display showing live CPU, RAM, storage, temperature and network for a machine anywhere on the internet - no port forward, no VPN, no account. Open source, MIT.">
+<link rel="canonical" href="https://shouravx.github.io/PeekESP/">
+<meta name="theme-color" content="#05070E">
+
+<!-- The social card. This is what LinkedIn, Hacker News, Reddit and Slack
+     fetch to build a preview, and it is the whole difference between a bare
+     link and one with the device photographed at full width. og:image has to
+     be absolute - relative paths are silently dropped by most scrapers. -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="PeekESP">
+<meta property="og:url" content="https://shouravx.github.io/PeekESP/">
+<meta property="og:title" content="PeekESP - live metrics for a server 250 km away">
+<meta property="og:description" content="An ESP32 with a 1.14-inch display showing live CPU, RAM, storage, temperature and network for a machine anywhere on the internet - no port forward, no VPN, no account. Open source, MIT.">
+<meta property="og:image" content="https://shouravx.github.io/PeekESP/og.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The PeekESP dashboard running on a LilyGO TTGO T-Display.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="PeekESP - live metrics for a server 250 km away">
+<meta name="twitter:description" content="An ESP32 with a 1.14-inch display showing live CPU, RAM, storage, temperature and network for a machine anywhere on the internet - no port forward, no VPN, no account. Open source, MIT.">
+<meta name="twitter:image" content="https://shouravx.github.io/PeekESP/og.jpg">
+
+<link rel="icon" href="favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500&family=Montserrat:wght@600;800&display=swap">
+<style>
+  html { background: #05070E; }
+  body { margin: 0; }
+  img { max-width: 100%; }
+</style>
+</head>
+<body>
+<style>
+/* ---------------------------------------------------------------------------
+   The palette is not invented. Every value below is lifted from PeekESP.ino,
+   where it is what the device actually renders - COL_BG, COL_PANEL, COL_TRACK,
+   COL_TEXT, COL_TEXT_DIM, COL_CYAN, COL_MAGENTA. The page is the screen.
+
+   Deliberately single-theme. The product is a dark panel in a dark room; a
+   light version would be an imitation of it rather than a variant. Every
+   surface and every colour is painted explicitly so the page holds on any
+   host ground.
+--------------------------------------------------------------------------- */
+:root {
+  --ground:   #05070E;
+  --panel:    #0B1220;
+  --panel-2:  #0E1626;
+  --rule:     #1A2334;
+  --ink:      #E6EDF7;
+  --ink-dim:  #5C6B82;
+  --ink-mid:  #8C9BB3;
+  --cyan:     #00E5FF;
+  --magenta:  #FF2E7E;
+  --amber:    #FFB020;
+  --green:    #35D07F;
+
+  --measure: 66ch;
+  --gutter: clamp(20px, 5vw, 56px);
+
+  --f-display: "Montserrat", "Segoe UI", system-ui, sans-serif;
+  --f-body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font: 400 16px/1.65 var(--f-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* The device draws a cyan hairline under its header. So does the page. */
+.rule {
+  height: 1px;
+  background: var(--cyan);
+  opacity: .3;
+  border: 0;
+  margin: 0;
+}
+
+.wrap {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding-inline: var(--gutter);
+}
+
+.prose { max-width: var(--measure); }
+
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; margin: 0; }
+
+h1 {
+  font-weight: 800;
+  font-size: clamp(34px, 6.2vw, 62px);
+  line-height: 1.04;
+  letter-spacing: -.02em;
+}
+h2 {
+  font-weight: 800;
+  font-size: clamp(24px, 3.4vw, 34px);
+  line-height: 1.12;
+  letter-spacing: -.015em;
+}
+h3 {
+  font-weight: 600;
+  font-size: 17px;
+  line-height: 1.3;
+  letter-spacing: -.005em;
+}
+
+p { margin: 0; }
+a { color: var(--cyan); }
+
+/* The "//" is the device's own separator - it prints PEEK // Cryo-PC. Reused
+   as the section marker so the page speaks the product's punctuation. */
+.eyebrow {
+  font: 500 12px/1 var(--f-mono);
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.eyebrow::before { content: "//"; color: var(--cyan); }
+
+section { padding-block: clamp(56px, 9vw, 104px); }
+.stack { display: flex; flex-direction: column; gap: 22px; }
+.stack-sm { display: flex; flex-direction: column; gap: 12px; }
+
+/* --- masthead ------------------------------------------------------------ */
+.mast {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-block: 16px;
+  font: 500 13px/1 var(--f-mono);
+  letter-spacing: .12em;
+}
+.mast b { font-weight: 500; color: var(--cyan); }
+.mast span { color: var(--ink-dim); }
+.mast a { color: var(--ink-mid); text-decoration: none; }
+.mast a:hover { color: var(--ink); }
+
+/* --- hero ---------------------------------------------------------------- */
+.hero { padding-top: clamp(44px, 7vw, 84px); }
+.hero-grid {
+  display: grid;
+  gap: clamp(32px, 5vw, 56px);
+  grid-template-columns: 1fr;
+  align-items: start;
+}
+@media (min-width: 900px) { .hero-grid { grid-template-columns: 1.05fr .95fr; } }
+
+.lede { font-size: clamp(17px, 1.9vw, 19px); color: var(--ink-mid); }
+.lede strong { color: var(--ink); font-weight: 500; }
+
+.cta-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.btn {
+  font: 500 14px/1 var(--f-mono);
+  letter-spacing: .06em;
+  text-decoration: none;
+  padding: 13px 20px;
+  border-radius: 3px;
+  display: inline-block;
+}
+.btn-primary { background: var(--cyan); color: var(--ground); }
+.btn-primary:hover { background: #5CEEFF; }
+.btn-ghost { color: var(--ink); border: 1px solid var(--rule); }
+.btn-ghost:hover { border-color: var(--ink-dim); }
+a:focus-visible, button:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 3px;
+}
+
+/* --- the screen, rebuilt ------------------------------------------------- */
+.screen-figure { display: flex; flex-direction: column; gap: 14px; }
+.screen {
+  background: var(--ground);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 10px;
+}
+.screen svg { display: block; width: 100%; height: auto; }
+.caption {
+  font: 400 12.5px/1.5 var(--f-mono);
+  color: var(--ink-dim);
+}
+
+.arc-track { stroke: #1A2334; }
+.arc-ind {
+  stroke-linecap: round;
+  stroke-dasharray: 122.5;
+  stroke-dashoffset: 122.5;
+  animation: sweep .5s cubic-bezier(.25,.8,.35,1) .35s forwards;
+}
+/* 500 ms with an ease-out, which is the same sweep lv_anim_path_ease_out gives
+   the real gauges - the page quotes the firmware rather than approximating it. */
+@keyframes sweep { to { stroke-dashoffset: var(--to); } }
+
+.bar-fill {
+  transform-origin: left center;
+  transform: scaleX(0);
+  animation: fill .5s cubic-bezier(.25,.8,.35,1) .5s forwards;
+}
+@keyframes fill { to { transform: scaleX(var(--to)); } }
+
+.dot-pulse { animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+
+@media (prefers-reduced-motion: reduce) {
+  .arc-ind { animation: none; stroke-dashoffset: var(--to); }
+  .bar-fill { animation: none; transform: scaleX(var(--to)); }
+  .dot-pulse { animation: none; }
+}
+
+/* --- photographs --------------------------------------------------------- */
+figure { margin: 0; display: flex; flex-direction: column; gap: 12px; }
+figure img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 4px;
+  border: 1px solid var(--rule);
+}
+
+/* --- the flow ------------------------------------------------------------ */
+.flow {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: 1fr;
+  font-family: var(--f-mono);
+}
+@media (min-width: 760px) { .flow { grid-template-columns: 1fr auto 1fr auto 1fr; align-items: center; } }
+.node {
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  padding: 16px 18px;
+}
+.node .n-t { font-size: 14px; color: var(--ink); }
+.node .n-s { font-size: 12px; color: var(--ink-dim); margin-top: 4px; }
+.arrow {
+  font: 400 12px/1 var(--f-mono);
+  color: var(--cyan);
+  text-align: center;
+  letter-spacing: .1em;
+  white-space: nowrap;
+}
+.arrow small { display: block; color: var(--ink-dim); letter-spacing: .06em; margin-top: 5px; }
+
+/* --- derivation ---------------------------------------------------------- */
+pre {
+  margin: 0;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-left: 2px solid var(--cyan);
+  border-radius: 3px;
+  padding: 18px 20px;
+  overflow-x: auto;
+  font: 400 13px/1.7 var(--f-mono);
+  color: var(--ink-mid);
+}
+pre b { color: var(--ink); font-weight: 400; }
+pre .c { color: var(--ink-dim); }
+
+code {
+  font: 400 .92em/1 var(--f-mono);
+  background: var(--panel-2);
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  padding: 2px 6px;
+  color: var(--ink);
+}
+
+/* --- pages list. Numbered because the carousel genuinely is an order: this
+       is the sequence the left button walks through. ------------------------ */
+.pages { display: flex; flex-direction: column; gap: 0; }
+.page-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 18px;
+  padding-block: 20px;
+  border-top: 1px solid var(--rule);
+  align-items: start;
+}
+.page-row:last-child { border-bottom: 1px solid var(--rule); }
+.page-n {
+  font: 500 12px/1.6 var(--f-mono);
+  color: var(--cyan);
+  letter-spacing: .1em;
+}
+
+/* --- specs --------------------------------------------------------------- */
+.specs {
+  display: grid;
+  gap: 0;
+  grid-template-columns: 1fr;
+  font-family: var(--f-mono);
+  font-variant-numeric: tabular-nums;
+}
+@media (min-width: 700px) { .specs { grid-template-columns: 1fr 1fr; column-gap: 40px; } }
+.spec {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding-block: 11px;
+  border-bottom: 1px solid var(--rule);
+  font-size: 13.5px;
+}
+.spec dt { color: var(--ink-dim); }
+.spec dd { margin: 0; color: var(--ink); text-align: right; }
+
+/* --- install ------------------------------------------------------------- */
+.cmds { display: flex; flex-direction: column; gap: 26px; }
+.cmd .cmd-h {
+  font: 500 12px/1 var(--f-mono);
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+  margin-bottom: 10px;
+}
+
+/* --- honest section. Amber rule, not another cyan card: it is a different
+       kind of statement and should not look like the rest. ------------------ */
+.caveats { display: flex; flex-direction: column; gap: 0; }
+.caveat {
+  padding: 18px 0 18px 18px;
+  border-left: 2px solid var(--rule);
+}
+.caveat:first-child { border-left-color: var(--amber); }
+.caveat h3 { color: var(--ink); margin-bottom: 6px; }
+.caveat p { color: var(--ink-mid); font-size: 15px; }
+
+/* --- footer -------------------------------------------------------------- */
+footer { padding-block: 44px 60px; }
+.foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 26px;
+  justify-content: space-between;
+  align-items: baseline;
+  font: 400 13px/1.6 var(--f-mono);
+  color: var(--ink-dim);
+}
+.foot a { color: var(--ink-mid); text-decoration: none; }
+.foot a:hover { color: var(--cyan); }
+.foot nav { display: flex; flex-wrap: wrap; gap: 20px; }
+</style>
+
+<div class="wrap">
+  <header class="mast">
+    <div><b>PEEK</b> <span>// system metrics, on a desk</span></div>
+    <a href="https://github.com/shouravx/PeekESP">github.com/shouravx/PeekESP</a>
+  </header>
+</div>
+<hr class="rule">
+
+<!-- ===================== HERO ===================== -->
+<section class="hero">
+  <div class="wrap hero-grid">
+    <div class="stack">
+      <h1>My home server is in Kushtia.<br>I live in Dhaka.</h1>
+      <p class="lede prose">
+        That is a long drive to answer <strong>&ldquo;is it still running?&rdquo;</strong>
+        &mdash; and for months the answer was to SSH in when I remembered, find
+        everything fine, and close the terminal.
+      </p>
+      <p class="lede prose">
+        PeekESP is a 1.14&Prime; screen on my desk that just tells me. CPU, memory,
+        storage, temperature and throughput for that machine, updating every
+        five seconds, 250&nbsp;km away.
+      </p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="https://github.com/shouravx/PeekESP">Build one</a>
+        <a class="btn btn-ghost" href="https://github.com/shouravx/PeekESP/releases">Download v1.1.0</a>
+      </div>
+      <p class="caption">Arduino + LVGL &middot; Cloudflare Worker &middot; MIT licensed</p>
+    </div>
+
+    <div class="screen-figure">
+      <!-- The dashboard, rebuilt at its real resolution: the panel is 240x135
+           and so is this viewBox, so every proportion is the device's own. -->
+      <div class="screen">
+        <svg viewBox="0 0 240 135" role="img"
+             aria-label="The PeekESP dashboard: CPU 12 percent, RAM 43 percent, temperature 48 degrees, storage 61 percent used with 906 gigabytes free, uptime 3 days 4 hours, link OK.">
+          <text x="8" y="12" font-family="Montserrat, sans-serif" font-size="9" font-weight="600" fill="#00E5FF">PEEK</text>
+          <text x="36" y="12" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">// cryo-pc</text>
+          <text x="196" y="12" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82" text-anchor="end">42 ms</text>
+          <circle class="dot-pulse" cx="227" cy="9" r="5" fill="#35D07F"/>
+          <rect x="8" y="19" width="224" height="1" fill="#00E5FF" opacity=".3"/>
+
+          <!-- CPU -->
+          <path d="M 20.6 74.4 A 26 26 0 1 1 57.4 74.4" fill="none" class="arc-track" stroke-width="6" stroke-linecap="round"/>
+          <path d="M 20.6 74.4 A 26 26 0 1 1 57.4 74.4" fill="none" class="arc-ind" stroke="#00E5FF" stroke-width="6" style="--to:107.8"/>
+          <text x="39" y="55" font-family="Montserrat, sans-serif" font-size="17" font-weight="600" fill="#E6EDF7" text-anchor="middle">12</text>
+          <text x="39" y="68" font-family="Montserrat, sans-serif" font-size="8" fill="#5C6B82" text-anchor="middle">CPU %</text>
+
+          <!-- RAM -->
+          <path d="M 92.6 74.4 A 26 26 0 1 1 129.4 74.4" fill="none" class="arc-track" stroke-width="6" stroke-linecap="round"/>
+          <path d="M 92.6 74.4 A 26 26 0 1 1 129.4 74.4" fill="none" class="arc-ind" stroke="#FF2E7E" stroke-width="6" style="--to:69.8"/>
+          <text x="111" y="55" font-family="Montserrat, sans-serif" font-size="17" font-weight="600" fill="#E6EDF7" text-anchor="middle">43</text>
+          <text x="111" y="68" font-family="Montserrat, sans-serif" font-size="8" fill="#5C6B82" text-anchor="middle">RAM %</text>
+
+          <!-- temp + throughput panel -->
+          <rect x="150" y="23" width="84" height="66" rx="6" fill="#0B1220" stroke="#1A2334"/>
+          <text x="156" y="35" font-family="Montserrat, sans-serif" font-size="8" fill="#5C6B82">TEMP</text>
+          <text x="156" y="55" font-family="Montserrat, sans-serif" font-size="17" font-weight="600" fill="#E6EDF7">48&#176;</text>
+          <text x="156" y="72" font-family="Montserrat, sans-serif" font-size="8" fill="#5C6B82">&#8595; 128K &#8593; 13K</text>
+
+          <!-- storage -->
+          <text x="8" y="99" font-family="Montserrat, sans-serif" font-size="8" fill="#5C6B82">STORAGE  906G FREE</text>
+          <text x="232" y="99" font-family="Montserrat, sans-serif" font-size="8" fill="#E6EDF7" text-anchor="end">61%</text>
+          <rect x="7" y="104" width="226" height="8" rx="4" fill="#1A2334"/>
+          <rect class="bar-fill" x="7" y="104" width="226" height="8" rx="4" fill="#00E5FF" style="--to:.61"/>
+
+          <!-- footer -->
+          <text x="8" y="125" font-family="Montserrat, sans-serif" font-size="8" fill="#5C6B82">up 3d 4h</text>
+          <text x="232" y="125" font-family="Montserrat, sans-serif" font-size="8" fill="#35D07F" text-anchor="end">LINK OK</text>
+        </svg>
+      </div>
+      <p class="caption">240 &times; 135. Drawn here at the panel&rsquo;s real resolution.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== WHY ===================== -->
+<section>
+  <div class="wrap stack">
+    <p class="eyebrow">The problem</p>
+    <h2 class="prose">Nothing can connect <em>to</em> a machine behind CGNAT.</h2>
+    <div class="prose stack-sm">
+      <p>Home broadband in Kushtia sits behind carrier-grade NAT. There is no port
+      to forward, no inbound connection to accept, and no amount of router
+      configuration changes that &mdash; the address is not mine to open.</p>
+      <p>A VPN was the next thought and also wrong. <strong style="color:var(--ink)">An
+      ESP32 cannot join a Tailscale network at all</strong>: Tailscale is WireGuard
+      plus a control plane &mdash; node registration, rotating keys, DERP relays
+      &mdash; and none of that has an embedded client. Plain WireGuard was
+      possible, and this project used to do it, but it needed the monitored host
+      to accept an inbound connection. Which is where we came in.</p>
+      <p>So both ends dial <em>out</em> instead.</p>
+    </div>
+
+    <div class="flow" style="margin-top:16px">
+      <div class="node">
+        <div class="n-t">Kushtia</div>
+        <div class="n-s">agent pushes</div>
+      </div>
+      <div class="arrow">&#9654;&#9654;<small>POST /ingest</small></div>
+      <div class="node">
+        <div class="n-t">Cloudflare Worker</div>
+        <div class="n-s">holds the last reading</div>
+      </div>
+      <div class="arrow">&#9664;&#9664;<small>GET /telemetry</small></div>
+      <div class="node">
+        <div class="n-t">Dhaka</div>
+        <div class="n-s">display polls</div>
+      </div>
+    </div>
+    <p class="caption prose">Neither side listens. Nothing needs an inbound port, which is
+    what makes this work behind CGNAT or on a network you do not administer.</p>
+  </div>
+</section>
+
+<hr class="rule">
+
+<!-- ===================== PAIRING ===================== -->
+<section>
+  <div class="wrap hero-grid">
+    <div class="stack">
+      <p class="eyebrow">Setup</p>
+      <h2>Ten characters, typed once.</h2>
+      <div class="prose stack-sm">
+        <p>The device shows a code on first boot. You type it into the desktop app.
+        That is the whole configuration &mdash; no account, no token to copy, no
+        port to open.</p>
+        <p>Both sides derive the stream and both auth tokens from that code
+        locally. <strong style="color:var(--ink)">The relay never sees it</strong>,
+        which is why pairing needs no secrets configured on the Worker at all.</p>
+      </div>
+      <pre><span class="c"># the same three lines in four languages</span>
+stream = SHA-256(<b>"peek-stream:"</b> + CODE)  first 16 hex
+push   = SHA-256(<b>"peek-push:"</b>   + CODE)  first 48 hex
+read   = SHA-256(<b>"peek-read:"</b>   + CODE)  first 48 hex</pre>
+      <p class="caption prose">C++ on the device, Python in the app and the Linux agent,
+      JavaScript in the Worker &mdash; all pinned against vectors generated by
+      <code>openssl</code>. A drift between any two would have a machine pushing to
+      a stream the device never reads, with every request still looking valid from
+      both ends.</p>
+      <p class="prose">The alphabet drops <code>I</code>, <code>O</code>,
+      <code>0</code> and <code>1</code>: those are the pairs people mistype reading
+      a code off a screen this size. Ten characters from the remaining 32 is
+      2<sup>50</sup>.</p>
+    </div>
+
+    <figure>
+      <img src="img/setup.jpg" alt="The device in setup mode, showing a QR code beside the access point name PeekESP-4C1B, its generated password, and the address 192.168.4.1.">
+      <figcaption class="caption">First boot raises its own access point. The QR encodes a
+      <code>WIFI:</code> join string, so a phone camera joins it directly rather than
+      anyone reading a generated password off a 1.14&Prime; panel.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<hr class="rule">
+
+<!-- ===================== PAGES ===================== -->
+<section>
+  <div class="wrap stack">
+    <p class="eyebrow">On the device</p>
+    <h2 class="prose">One button walks the pages.</h2>
+    <p class="prose lede">A pairing code identifies a person, not a machine. Run the agent
+    on a desktop, a laptop and a Pi with the same code and all three appear here.
+    Six per code.</p>
+
+    <div class="pages" style="margin-top:12px">
+      <div class="page-row">
+        <div class="page-n">01&ndash;06</div>
+        <div class="stack-sm">
+          <h3>Each machine</h3>
+          <p>CPU and memory arcs, temperature and throughput, storage across
+          <em>every</em> fixed disk with free space beside it. Swiping costs nothing:
+          one poll already carried them all, so the display makes the same number of
+          requests whether it shows one machine or six.</p>
+        </div>
+      </div>
+      <div class="page-row">
+        <div class="page-n">07</div>
+        <div class="stack-sm">
+          <h3>Clock</h3>
+          <p>Local time from the NTP sync the TLS handshake needed anyway, with a bar
+          that fills across the minute so the page never looks frozen. The offset is
+          stored in <em>minutes</em>, because Kathmandu is +5:45 and an hours-only
+          field silently cannot express that.</p>
+        </div>
+      </div>
+      <div class="page-row">
+        <div class="page-n">08</div>
+        <div class="stack-sm">
+          <h3>Power</h3>
+          <p>The board&rsquo;s own cell, and the monitored machine&rsquo;s battery
+          underneath it. While a charger holds the node up there is no percentage
+          shown at all &mdash; that voltage is the charger&rsquo;s, not the
+          cell&rsquo;s state of charge, and reporting it as one reads
+          &ldquo;100&nbsp;%&rdquo; against an almost empty battery.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="hero-grid" style="margin-top:34px">
+      <figure>
+        <img src="img/dashboard.jpg" alt="The PeekESP dashboard running on a LilyGO TTGO T-Display, wired on a desk.">
+        <figcaption class="caption">A LilyGO TTGO T-Display. The whole thing is the board, a
+        USB cable, and about 1.3&nbsp;MB of firmware.</figcaption>
+      </figure>
+      <div class="stack">
+        <h3>When a machine goes quiet</h3>
+        <p class="prose">After five polls bring nothing newer, its readings grey out and its
+        name turns amber. The age is counted on the device&rsquo;s own clock, not the
+        relay&rsquo;s timestamp &mdash; that field only refreshes when a poll
+        <em>succeeds</em>, so when the network drops it freezes and the machine goes
+        on reporting <code>up 3d 4h</code> indefinitely. Live-looking numbers behind a
+        dead link is the one failure a monitor must not have.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="rule">
+
+<!-- ===================== INSTALL ===================== -->
+<section>
+  <div class="wrap hero-grid">
+    <div class="stack">
+      <p class="eyebrow">Install</p>
+      <h2>Three commands, one code.</h2>
+      <div class="cmds" style="margin-top:8px">
+        <div class="cmd">
+          <div class="cmd-h">Windows</div>
+          <pre>winget install peekesp</pre>
+        </div>
+        <div class="cmd">
+          <div class="cmd-h">Linux &middot; DietPi, Debian, Raspberry Pi OS</div>
+          <pre>curl -fsSL https://raw.githubusercontent.com/\
+shouravx/PeekESP/main/dietpi/install.sh | sudo sh</pre>
+          <p class="caption" style="margin-top:8px">Asks for the pairing code, installs a
+          hardened systemd service, and waits to confirm the machine is actually
+          pushing before it says it worked. Then <code>peekesp status</code>,
+          <code>peekesp logs -f</code>, <code>sudo peekesp uninstall</code>.</p>
+        </div>
+        <div class="cmd">
+          <div class="cmd-h">The board</div>
+          <pre>python tools/flash.py</pre>
+          <p class="caption" style="margin-top:8px">Writes the prebuilt image. No Arduino IDE,
+          no ESP32 core, no libraries &mdash; the only download is esptool.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="stack">
+      <figure>
+        <img src="img/app.jpg" alt="The PeekESP settings window on Windows: a status line reading pushing - last push OK, a field for the pairing code, and the relay address already filled in.">
+        <figcaption class="caption">Everything below the code is derived from it. The status
+        line answers &ldquo;did it work&rdquo; on the same screen where you typed it.</figcaption>
+      </figure>
+
+      <dl class="specs" style="margin-top:10px">
+        <div class="spec"><dt>Board</dt><dd>LilyGO TTGO T-Display</dd></div>
+        <div class="spec"><dt>Panel</dt><dd>ST7789V &middot; 240&times;135</dd></div>
+        <div class="spec"><dt>Firmware</dt><dd>1.29 MB &middot; 42% of 3 MB</dd></div>
+        <div class="spec"><dt>Poll interval</dt><dd>5 s, configurable</dd></div>
+        <div class="spec"><dt>Machines per code</dt><dd>6</dd></div>
+        <div class="spec"><dt>WiFi networks</dt><dd>5</dd></div>
+        <div class="spec"><dt>Worker tests</dt><dd>74 unit &middot; 17 live</dd></div>
+        <div class="spec"><dt>Licence</dt><dd>MIT</dd></div>
+      </dl>
+    </div>
+  </div>
+</section>
+
+<hr class="rule">
+
+<!-- ===================== HONEST ===================== -->
+<section>
+  <div class="wrap stack">
+    <p class="eyebrow">Before you build one</p>
+    <h2 class="prose">What this does not do.</h2>
+    <div class="caveats prose" style="margin-top:6px">
+      <div class="caveat">
+        <h3>The Windows binaries are unsigned</h3>
+        <p>SmartScreen will warn the first time &mdash; <em>More info &rarr; Run
+        anyway</em>. A self-signed certificate would not help: it is trusted by
+        exactly one machine, and the Microsoft tooling that offers to make one says
+        &ldquo;for testing purposes only&rdquo; in its own documentation. A real one
+        needs a hardware token and a yearly fee.</p>
+      </div>
+      <div class="caveat">
+        <h3>The free tier is a request budget, not a device count</h3>
+        <p>Each agent costs 17,280 requests a day at a five-second interval, and so
+        does each display, against Cloudflare&rsquo;s 100,000. One display and two
+        machines fits comfortably; four is close to the edge. Raising the interval to
+        15&nbsp;s divides everything by three.</p>
+      </div>
+      <div class="caveat">
+        <h3>Pairing is trust-on-first-use</h3>
+        <p>The guarantee is precisely <em>&ldquo;once a role is claimed, only that
+        token works&rdquo;</em> &mdash; not &ldquo;only the right token was ever
+        possible&rdquo;. Squatting an unclaimed stream needs the 16-hex stream id,
+        which needs the code, which only ever appears on the device&rsquo;s screen.</p>
+      </div>
+      <div class="caveat">
+        <h3>2.4 GHz only, and no over-the-air updates</h3>
+        <p>An ESP32 has no 5 GHz radio, so a network missing from the scan is usually
+        5 GHz-only rather than a fault. And the partition table has a single app slot,
+        so new firmware means a USB cable &mdash; fine for a display on your desk,
+        which is where this one lives.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="rule">
+
+<footer>
+  <div class="wrap foot">
+    <div>PeekESP &middot; by <a href="https://github.com/shouravx">shouravx</a> &middot; MIT</div>
+    <nav>
+      <a href="https://github.com/shouravx/PeekESP">Source</a>
+      <a href="https://github.com/shouravx/PeekESP/releases">Releases</a>
+      <a href="https://github.com/shouravx/PeekESP/wiki">Wiki</a>
+      <a href="https://github.com/shouravx/PeekESP/issues">Issues</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>
