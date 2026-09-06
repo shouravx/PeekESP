@@ -30,9 +30,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 3.11, not 3.12, and this is load-bearing. arduino-cli's ESP32 platform
+      # shells out to the esptool.py bundled with core 2.0.17 to produce the
+      # binary, and that esptool cannot import under 3.12 - it fails with a
+      # traceback from inside the core, several layers away from anything in
+      # this repository. It never showed up locally because the Windows core
+      # ships esptool.exe, which needs no Python at all.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: The version has to agree with itself
         run: python tools/bump_version.py --check
