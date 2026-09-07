@@ -95,6 +95,13 @@ winget uninstall shouravx.PeekESP
 > uploaded. The copies in this directory are a record of what was generated,
 > useful for reading and diffing, and wrong to submit on their own.
 >
+> `1.2.0/` is the exception, and the pattern to follow from here: those files
+> were taken *out* of the release's `winget-manifests-1.2.0.zip` after the
+> release was published, so they are the ones that describe the published zip
+> and the ones that were submitted. Checked against it: the SHA-256 in the
+> manifest is the SHA-256 of the 27,334,468-byte file the InstallerUrl serves,
+> and both `RelativeFilePath` entries exist at the root of that archive.
+>
 > The zip itself *is* reproducible from a given pair of exes — entry timestamps
 > are fixed — so re-running `package.py` without rebuilding will not silently
 > change the hash under you.
