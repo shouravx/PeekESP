@@ -149,9 +149,13 @@ EOF
 
 chmod 755 "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/prerm" "$STAGE/DEBIAN/postrm"
 
-dpkg-deb --root-owner-group --build "$STAGE" >/dev/null
+# Named explicitly rather than letting dpkg-deb derive it. Given only a
+# directory it writes "$STAGE.deb", which for this staging path is already the
+# name we want - so the mv that used to follow was moving the file onto itself,
+# and GNU mv treats that as an error rather than a no-op. Passing the
+# destination says what is wanted instead of depending on the two agreeing.
 DEB="$OUT/peekesp_${VERSION}_all.deb"
-mv "$STAGE.deb" "$DEB"
+dpkg-deb --root-owner-group --build "$STAGE" "$DEB" >/dev/null
 rm -rf "$STAGE"
 
 echo "$DEB"

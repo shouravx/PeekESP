@@ -253,6 +253,17 @@ set)
 update)
     installed
     need_root update
+    # Same reasoning as uninstall. Downloading over a dpkg- or pacman-managed
+    # file leaves the package manager's records describing a file that is no
+    # longer there, and the copy of this script would land in /usr/local/bin,
+    # which shadows the packaged /usr/bin/peekesp on PATH from then on - so the
+    # machine would be running an unmanaged agent while apt still believed it
+    # owned one.
+    if [ "$PREFIX" = "/usr/lib/peekesp" ]; then
+        die "this copy was installed by your package manager.
+       Update it with that instead:  sudo pacman -Syu peekesp
+                                     sudo apt update && sudo apt install --only-upgrade peekesp"
+    fi
     say "fetching the latest agent ..."
     tmp="$PREFIX/.peek-agent.py.new"
     if command -v curl >/dev/null 2>&1; then
