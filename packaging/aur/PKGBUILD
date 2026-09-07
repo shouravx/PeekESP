@@ -1,6 +1,6 @@
 # Maintainer: shouravx <rhshourav02@gmail.com>
 pkgname=peekesp
-pkgver=1.1.0
+pkgver=1.2.0
 pkgrel=1
 pkgdesc="Push this machine's CPU, RAM, storage and temperature to a PeekESP display"
 arch=('any')

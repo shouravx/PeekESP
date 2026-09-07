@@ -5,4 +5,4 @@ which refuses to build when the two disagree. A build claiming a version it is
 not is worse than one claiming none, because the update check believes it.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"

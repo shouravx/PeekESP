@@ -46,7 +46,7 @@ The manifest's `InstallerUrl` points at a release asset that does not exist
 yet. Push the tag:
 
 ```bash
-git tag v1.1.0 && git push origin v1.1.0
+git tag v1.2.0 && git push origin v1.2.0
 ```
 
 The [release workflow](../../.github/workflows/release.yml) builds on a clean
@@ -61,14 +61,14 @@ Then confirm the URL actually serves the file, because a manifest pointing at a
 404 is the single most common reason a submission bounces:
 
 ```powershell
-curl -sIL https://github.com/shouravx/PeekESP/releases/download/v1.1.0/PeekESP-1.1.0-win-x64.zip | findstr /i "HTTP content-length"
+curl -sIL https://github.com/shouravx/PeekESP/releases/download/v1.2.0/PeekESP-1.2.0-win-x64.zip | findstr /i "HTTP content-length"
 ```
 
 ### 3. Test the manifests locally
 
 ```powershell
-winget validate --manifest packaging\winget\1.1.0
-winget install --manifest packaging\winget\1.1.0
+winget validate --manifest packaging\winget\1.2.0
+winget install --manifest packaging\winget\1.2.0
 ```
 
 `validate` only checks the schema. **`install` is the one that matters** — it
@@ -102,9 +102,9 @@ winget uninstall shouravx.PeekESP
 Fork <https://github.com/microsoft/winget-pkgs>, then:
 
 ```
-manifests/s/shouravx/PeekESP/1.1.0/shouravx.PeekESP.yaml
-manifests/s/shouravx/PeekESP/1.1.0/shouravx.PeekESP.installer.yaml
-manifests/s/shouravx/PeekESP/1.1.0/shouravx.PeekESP.locale.en-US.yaml
+manifests/s/shouravx/PeekESP/1.2.0/shouravx.PeekESP.yaml
+manifests/s/shouravx/PeekESP/1.2.0/shouravx.PeekESP.installer.yaml
+manifests/s/shouravx/PeekESP/1.2.0/shouravx.PeekESP.locale.en-US.yaml
 ```
 
 The path is `manifests/<first letter, lowercase>/<Publisher>/<Package>/<Version>/`
@@ -118,7 +118,7 @@ a human reviews it. Expect a few days.
 
 ```powershell
 winget install Microsoft.WingetCreate
-wingetcreate submit --token <github-pat> packaging\winget\1.1.0
+wingetcreate submit --token <github-pat> packaging\winget\1.2.0
 ```
 
 ### 5. Later versions

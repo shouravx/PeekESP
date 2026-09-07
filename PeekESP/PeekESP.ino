@@ -138,7 +138,7 @@
 // tools/export_firmware.py, which refuses to build if the two disagree - a
 // device reporting a version it is not running is worse than one reporting
 // none, because the update check believes it.
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.2.0"
 
 #define PAIR_ALPHABET "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 #define PAIR_CODE_LEN 10
