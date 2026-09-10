@@ -339,6 +339,55 @@ the LVGL config path as build flags, which is why PlatformIO never had the
 pio run -t upload -t monitor
 ```
 
+## Other screens, other hosts
+
+The T-Display is the default, not the only option. Everything below reads the
+same relay with the same pairing code, so they can all run at once — a device
+in Kushtia, one on your desk, and Home Assistant watching both.
+
+### A different screen on the ESP32
+
+```bash
+pio run -e ili9341-320x240      # 2.4"/2.8" colour TFT
+pio run -e gc9a01-round         # 1.28" circular
+pio run -e st7789-240x240       # 1.3" square
+```
+
+Seven panels, one PlatformIO environment each — TFT_eSPI decides its driver,
+pins and geometry at compile time, so a firmware image drives exactly one
+screen. The dashboard's layout is derived from the panel's dimensions rather
+than hardcoded. Full list, wiring and what to change when it comes up sideways:
+**[PeekESP/PANELS.md](PeekESP/PANELS.md)**.
+
+Only the T-Display has run on hardware. The rest compile in CI, and that is the
+whole claim.
+
+### A Raspberry Pi instead of an ESP32
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shouravx/PeekESP/main/pi/install.sh | sudo sh
+```
+
+Drives every panel above *plus* the ones the firmware cannot: SSD1306 OLED,
+Waveshare e-paper, a 16×2 character LCD and a MAX7219 LED matrix. Those last
+three are not framebuffers — 32 character cells, or 8 rows of dots — so they
+get their own presentation rather than a shrunken dashboard.
+
+`peek-display --self-test` draws a pattern that proves the wiring before you
+blame the software. **[pi/README.md](pi/README.md)**.
+
+A Pi can be both ends at once: run [the agent](dietpi/) alongside and it appears
+in its own carousel.
+
+### Home Assistant
+
+Add `https://github.com/shouravx/PeekESP` to HACS as an **Integration**, then
+pair with the same code. One device per monitored machine — CPU, memory,
+storage, temperature, throughput, battery, last boot — plus buttons that drive
+the ESP32 display: identify, refresh, wake, standby, reboot.
+
+**[custom_components/peekesp/README.md](custom_components/peekesp/README.md)**.
+
 ## Configuration
 
 There is no compile-time setup. A freshly flashed device has no WiFi
