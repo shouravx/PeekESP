@@ -1,0 +1,158 @@
+name: Dev release
+
+# A rolling pre-release built from the dev branch.
+#
+# The tagged release workflow exists to produce something people install and
+# hold on to, so it stops at a draft a person publishes. This one is the
+# opposite: it publishes immediately, without asking, to a single tag that
+# gets overwritten every time. Nothing here is meant to be kept, and the
+# release body says so.
+#
+# Why a moving tag rather than v1.3.0-dev.4, v1.3.0-dev.5 and so on:
+# every one of those would be a permanent public artefact for a build whose
+# whole purpose is to be replaced within the hour, and the Releases page would
+# become a list of things nobody should download. One tag means one URL that
+# always points at the newest dev build, which is what a link in an issue
+# thread needs to mean.
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+# Two pushes to dev a minute apart would otherwise race to replace the same
+# assets, and the loser would leave a release advertising a firmware image
+# from a commit that is no longer the tip.
+concurrency:
+  group: dev-release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  DEV_TAG: dev
+
+jobs:
+  build:
+    name: Build and publish
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gh release needs the tag to exist locally to move it, and the
+          # default shallow clone has no tags at all.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: The version has to agree with itself
+        run: python tools/bump_version.py --check
+
+      - name: Work out what this build is called
+        id: ver
+        shell: pwsh
+        run: |
+          # Not a version anyone should depend on: the base version, the run
+          # number so two builds of the same base are orderable, and the short
+          # sha so a bug report names a commit rather than a day.
+          $base = (Get-Content VERSION -Raw).Trim()
+          $sha  = "${{ github.sha }}".Substring(0, 7)
+          $full = "$base-dev.${{ github.run_number }}+$sha"
+          "base=$base"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "full=$full"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha=$sha"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Output "building $full"
+
+      - name: Build and package the Windows app
+        shell: pwsh
+        run: |
+          cd windows
+          python package.py
+
+      - name: Smoke-test the headless agent
+        shell: pwsh
+        run: |
+          # Same reasoning as the tagged release: a build that succeeds is not
+          # evidence the binary runs. A dev build that cannot start is worth
+          # catching here rather than in the issue that reports it.
+          $out = & windows\dist\peek-agent.exe --once | Out-String
+          Write-Output $out
+          $json = $out | ConvertFrom-Json
+          foreach ($k in 'host','cpu_percent','ram_percent','storage_percent') {
+            if ($null -eq $json.$k) { Write-Error "missing field: $k"; exit 1 }
+          }
+
+      - name: Publish the rolling pre-release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $v    = "${{ steps.ver.outputs.base }}"
+          $full = "${{ steps.ver.outputs.full }}"
+
+          # Named rather than globbed, for the same reason the tagged release
+          # names them: a pre-release quietly missing its firmware looks
+          # finished, and the person who downloads it finds out instead.
+          $expected = [ordered]@{
+            "app zip"        = "windows/dist/PeekESP-$v-win-x64.zip"
+            "app checksum"   = "windows/dist/PeekESP-$v-win-x64.zip.sha256"
+            "tray app"       = "windows/dist/PeekESP.exe"
+            "headless agent" = "windows/dist/peek-agent.exe"
+            "firmware"       = "firmware/PeekESP-merged.bin"
+          }
+          $files = @(); $missing = @()
+          foreach ($k in $expected.Keys) {
+            if (Test-Path $expected[$k]) {
+              $files += (Resolve-Path $expected[$k]).Path
+              Write-Output "attaching  $k"
+            } else { $missing += "$k ($($expected[$k]))" }
+          }
+          if ($missing.Count) {
+            Write-Error ("missing assets: " + ($missing -join ", ")); exit 1
+          }
+
+          $notes = @"
+**This is an automatic build of the ``dev`` branch. It is not a release.**
+
+Built from ``${{ steps.ver.outputs.sha }}`` on $(Get-Date -Format 'yyyy-MM-dd HH:mm') UTC
+as ``$full``.
+
+It has passed CI and nothing else. It may be broken, it may be mid-refactor,
+and it will be replaced by the next push to ``dev`` without warning - so the
+files behind this tag are not the files that were here an hour ago. If you are
+reporting a bug against it, quote the commit above, because ``dev`` on its own
+does not identify a build.
+
+For something meant to be kept, use the
+[latest release](https://github.com/shouravx/PeekESP/releases/latest).
+"@
+
+          # The tag is moved rather than created: it has to point at this
+          # commit for the release page's "source code" links to mean
+          # anything. -f on both sides because it exists after the first run.
+          git tag -f $env:DEV_TAG "${{ github.sha }}"
+          git push -f origin "refs/tags/$env:DEV_TAG"
+
+          $exists = $false
+          gh release view $env:DEV_TAG > $null 2>&1
+          if ($LASTEXITCODE -eq 0) { $exists = $true }
+
+          if ($exists) {
+            # Edited in place rather than deleted and recreated. Deleting would
+            # break any link to it for as long as the rebuild takes, and would
+            # lose the release's own identity every few minutes.
+            gh release edit $env:DEV_TAG --target "${{ github.sha }}" `
+              --title "Dev build $full" --notes "$notes" --prerelease
+            gh release upload $env:DEV_TAG $files --clobber
+          } else {
+            gh release create $env:DEV_TAG $files `
+              --prerelease `
+              --title "Dev build $full" `
+              --notes "$notes"
+          }
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          Write-Output ""
+          Write-Output "published https://github.com/shouravx/PeekESP/releases/tag/$env:DEV_TAG"

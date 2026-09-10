@@ -1,0 +1,12 @@
+{
+  "domain": "peekesp",
+  "name": "PeekESP",
+  "codeowners": ["@shouravx"],
+  "config_flow": true,
+  "documentation": "https://github.com/shouravx/PeekESP/blob/main/custom_components/peekesp/README.md",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/shouravx/PeekESP/issues",
+  "requirements": [],
+  "version": "1.2.0"
+}
