@@ -114,20 +114,20 @@ jobs:
           }
 
           $notes = @"
-**This is an automatic build of the ``dev`` branch. It is not a release.**
+          **This is an automatic build of the ``dev`` branch. It is not a release.**
 
-Built from ``${{ steps.ver.outputs.sha }}`` on $(Get-Date -Format 'yyyy-MM-dd HH:mm') UTC
-as ``$full``.
+          Built from ``${{ steps.ver.outputs.sha }}`` on $([DateTime]::UtcNow.ToString('yyyy-MM-dd HH:mm')) UTC
+          as ``$full``.
 
-It has passed CI and nothing else. It may be broken, it may be mid-refactor,
-and it will be replaced by the next push to ``dev`` without warning - so the
-files behind this tag are not the files that were here an hour ago. If you are
-reporting a bug against it, quote the commit above, because ``dev`` on its own
-does not identify a build.
+          It has passed CI and nothing else. It may be broken, it may be mid-refactor,
+          and it will be replaced by the next push to ``dev`` without warning - so the
+          files behind this tag are not the files that were here an hour ago. If you are
+          reporting a bug against it, quote the commit above, because ``dev`` on its own
+          does not identify a build.
 
-For something meant to be kept, use the
-[latest release](https://github.com/shouravx/PeekESP/releases/latest).
-"@
+          For something meant to be kept, use the
+          [latest release](https://github.com/shouravx/PeekESP/releases/latest).
+          "@
 
           # The tag is moved rather than created: it has to point at this
           # commit for the release page's "source code" links to mean
