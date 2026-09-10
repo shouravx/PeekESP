@@ -54,8 +54,11 @@ doing rather than leaving you to guess.
 |---|---|
 | [PeekESP/PeekESP.ino](PeekESP/PeekESP.ino) | The firmware. Open this one in the Arduino IDE. |
 | [PeekESP/secrets.example.h](PeekESP/secrets.example.h) | Optional factory defaults. Real config happens on-device. |
+| [PeekESP/PANELS.md](PeekESP/PANELS.md) | Building for a different screen — ILI9341, ST7789, GC9A01 round, ST7735. |
 | [lv_conf.h](lv_conf.h) | LVGL config for this board. |
-| [platformio.ini](platformio.ini) + [main.cpp](main.cpp) | PlatformIO build of the exact same sketch. |
+| [platformio.ini](platformio.ini) + [main.cpp](main.cpp) | PlatformIO build of the exact same sketch, one env per panel. |
+| [pi/](pi/) | The same dashboard on a Raspberry Pi — colour TFT, OLED, e-paper, 16×2 LCD, LED matrix. |
+| [custom_components/peekesp/](custom_components/peekesp/) | Home Assistant integration. Sensors per machine, buttons for the display. |
 | [dietpi/peek-agent.py](dietpi/peek-agent.py) | Run on the Linux host: serves the JSON, and/or pushes it to the relay. |
 | [windows/](windows/) | The same agent for a Windows PC, plus a one-file `.exe` build. |
 | [cloudflare/](cloudflare/) | Worker relay for when the host has no reachable port. `npm test` covers it. |

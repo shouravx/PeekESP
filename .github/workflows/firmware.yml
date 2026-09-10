@@ -70,8 +70,14 @@ jobs:
       # with the log readable only by someone who could authenticate to
       # Actions - a build that becomes undebuggable from outside is worse than
       # one that is merely wrong. This behaves the same on a laptop.
-      - name: Compile, check warnings, report size
-        run: python tools/ci_compile.py
+      # Every panel profile, not just the default. The first time this ran
+      # across all of them it found that a 320-wide panel overflowed
+      # dram0_0_seg by 1,944 bytes, because the LVGL draw buffer was sized as
+      # SCREEN_W * 40 and nobody had ever built it at a width other than 240.
+      # That failure is a linker message naming a segment and no source line,
+      # so it is precisely the kind of thing worth catching automatically.
+      - name: Compile every panel, check warnings, report size
+        run: python tools/ci_compile.py --all
 
       # The committed image is what tools/flash.py writes, and it is easy to
       # change the sketch and forget to regenerate it.

@@ -47,6 +47,11 @@ class PeekCoordinator(DataUpdateCoordinator[RelayData]):
         self._read_token: str = keys["read"]
         self._push_token: str = keys["push"]
 
+        # config_entry became a DataUpdateCoordinator argument in 2024.8 and
+        # the way to associate a coordinator with its entry thereafter. hacs.json
+        # asks for 2024.12 so this is safe; passing it on an older core would
+        # be a TypeError at setup, which is a worse first impression than a
+        # version requirement.
         super().__init__(
             hass,
             _LOGGER,
