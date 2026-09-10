@@ -30,7 +30,7 @@
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500&family=Montserrat:wght@600;800&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500&family=Montserrat:wght@400;600;800&display=swap">
 <style>
   html { background: #05070E; }
   body { margin: 0; }
@@ -152,6 +152,11 @@ section { padding-block: clamp(56px, 9vw, 104px); }
 }
 .mast b { font-weight: 500; color: var(--cyan); }
 .mast span { color: var(--ink-dim); }
+/* At 375 px the tagline wrapped to four lines and ran into the repository
+   link beside it. It is decoration and the link is not, so the tagline is the
+   one that goes. */
+@media (max-width: 560px) { .mast span { display: none; } }
+.mast a { white-space: nowrap; }
 .mast a { color: var(--ink-mid); text-decoration: none; }
 .mast a:hover { color: var(--ink); }
 
@@ -203,8 +208,8 @@ a:focus-visible, button:focus-visible {
 .arc-track { stroke: #1A2334; }
 .arc-ind {
   stroke-linecap: round;
-  stroke-dasharray: 122.5;
-  stroke-dashoffset: 122.5;
+  stroke-dasharray: 141.4;
+  stroke-dashoffset: 141.4;
   animation: sweep .5s cubic-bezier(.25,.8,.35,1) .35s forwards;
 }
 /* 500 ms with an ease-out, which is the same sweep lv_anim_path_ease_out gives
@@ -212,6 +217,12 @@ a:focus-visible, button:focus-visible {
 @keyframes sweep { to { stroke-dashoffset: var(--to); } }
 
 .bar-fill {
+  /* fill-box, not the default view-box. transform-box defaults to view-box on
+     SVG, so "left center" meant the left edge of the 240x135 canvas rather than
+     of the bar - which scales every bar towards x=0 instead of towards its own
+     start. The storage bars begin at x=7 and the error hid inside the rounding;
+     the battery fill begins at x=17 and slid visibly out of its own outline. */
+  transform-box: fill-box;
   transform-origin: left center;
   transform: scaleX(0);
   animation: fill .5s cubic-bezier(.25,.8,.35,1) .5s forwards;
@@ -225,6 +236,98 @@ a:focus-visible, button:focus-visible {
   .arc-ind { animation: none; stroke-dashoffset: var(--to); }
   .bar-fill { animation: none; transform: scaleX(var(--to)); }
   .dot-pulse { animation: none; }
+}
+
+/* --- the device: a screen you can actually press ------------------------- */
+/* Progressive enhancement. Without JavaScript the first page is the whole
+   figure, exactly as before, and the button rail never appears - a dead
+   control is worse than no control. */
+.pg { display: none; }
+.pg.is-on { display: inline; }
+
+.device-rail { display: none; }
+.js-only { display: none; }
+.device.has-js ~ .caption .js-only,
+.screen-figure:has(.device.has-js) .js-only { display: inline; }
+.device.has-js .device-rail {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+  padding: 0 6px;
+}
+
+/* The two buttons sit where they sit on the board: GPIO 0 on the left of the
+   USB-C, GPIO 35 on the right. */
+.hw-btn {
+  display: grid;
+  gap: 3px;
+  justify-items: center;
+  padding: 7px 12px 8px;
+  background: linear-gradient(#141d2e, #0d1524);
+  border: 1px solid var(--rule);
+  border-radius: 5px;
+  box-shadow: 0 2px 0 #070c15, 0 3px 6px rgb(0 0 0 / .45);
+  color: var(--ink-mid);
+  font: 500 10px/1 var(--f-mono);
+  letter-spacing: .04em;
+  cursor: pointer;
+  transition: transform .12s cubic-bezier(.25,.8,.35,1),
+              box-shadow .12s cubic-bezier(.25,.8,.35,1),
+              color .12s, border-color .12s;
+}
+.hw-btn b {
+  font: 600 11px/1 var(--f-mono);
+  color: var(--ink);
+  letter-spacing: .02em;
+}
+.hw-btn:hover { border-color: #2a3a55; color: var(--ink); }
+.hw-btn:active {
+  transform: translateY(2px);
+  box-shadow: 0 0 0 #070c15, 0 1px 3px rgb(0 0 0 / .5);
+}
+.hw-btn:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
+
+/* The USB-C notch, purely so the two buttons read as being on a board edge
+   rather than floating under a picture. */
+.device-usb {
+  height: 5px;
+  border-radius: 3px;
+  background: #0d1524;
+  border: 1px solid var(--rule);
+  max-width: 46px;
+  justify-self: center;
+  width: 100%;
+}
+
+/* Backlight. The real right button steps 100 / 59 / 27 / 8 %, and the panel
+   dims rather than the image changing, so this is brightness on the whole
+   screen and not an overlay. */
+.device-screen { transition: filter .18s cubic-bezier(.25,.8,.35,1); }
+.device-screen[data-bl="1"] { filter: brightness(.62); }
+.device-screen[data-bl="2"] { filter: brightness(.34); }
+.device-screen[data-bl="3"] { filter: brightness(.14); }
+
+/* The carousel slides the whole page sideways, which is what the firmware
+   does - one animation on one object rather than a dozen co-ordinated ones. */
+.pg { transform-box: view-box; }
+.pg.slide-in-l  { animation: pg-in-l .34s cubic-bezier(.22,.9,.3,1) both; }
+.pg.slide-in-r  { animation: pg-in-r .34s cubic-bezier(.22,.9,.3,1) both; }
+@keyframes pg-in-l { from { transform: translateX(240px); } to { transform: translateX(0); } }
+@keyframes pg-in-r { from { transform: translateX(-240px); } to { transform: translateX(0); } }
+
+.pg-dots { display: flex; gap: 5px; align-items: center; }
+.pg-dot {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--rule);
+  transition: background .2s, transform .2s;
+}
+.pg-dot.is-on { background: var(--cyan); transform: scale(1.25); }
+
+@media (prefers-reduced-motion: reduce) {
+  .pg.slide-in-l, .pg.slide-in-r { animation: none; }
+  .device-screen { transition: none; }
 }
 
 /* --- photographs --------------------------------------------------------- */
@@ -386,53 +489,151 @@ footer { padding-block: 44px 60px; }
       </p>
       <div class="cta-row">
         <a class="btn btn-primary" href="https://github.com/shouravx/PeekESP">Build one</a>
-        <a class="btn btn-ghost" href="https://github.com/shouravx/PeekESP/releases">Download v1.1.0</a>
+        <a class="btn btn-ghost" href="https://github.com/shouravx/PeekESP/releases">Download v1.2.0</a>
       </div>
       <p class="caption">Arduino + LVGL &middot; Cloudflare Worker &middot; MIT licensed</p>
     </div>
 
     <div class="screen-figure">
       <!-- The dashboard, rebuilt at its real resolution: the panel is 240x135
-           and so is this viewBox, so every proportion is the device's own. -->
-      <div class="screen">
-        <svg viewBox="0 0 240 135" role="img"
-             aria-label="The PeekESP dashboard: CPU 12 percent, RAM 43 percent, temperature 48 degrees, storage 61 percent used with 906 gigabytes free, uptime 3 days 4 hours, link OK.">
-          <text x="8" y="12" font-family="Montserrat, sans-serif" font-size="9" font-weight="600" fill="#00E5FF">PEEK</text>
-          <text x="36" y="12" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">// cryo-pc</text>
-          <text x="196" y="12" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82" text-anchor="end">42 ms</text>
-          <circle class="dot-pulse" cx="227" cy="9" r="5" fill="#35D07F"/>
-          <rect x="8" y="19" width="224" height="1" fill="#00E5FF" opacity=".3"/>
+           and so is this viewBox, so every proportion is the device's own.
+           The coordinates are the firmware's, lifted from build_dashboard_ui()
+           and clock_faces.h rather than eyeballed from a photograph. -->
+      <div class="device" id="peek-device">
+        <div class="screen device-screen" id="peek-screen" data-bl="0">
+          <svg viewBox="0 0 240 135" id="peek-svg"
+               aria-live="polite"
+               aria-label="A simulation of the PeekESP display.">
+            <rect width="240" height="135" fill="#05070E"/>
 
-          <!-- CPU -->
-          <path d="M 20.6 74.4 A 26 26 0 1 1 57.4 74.4" fill="none" class="arc-track" stroke-width="6" stroke-linecap="round"/>
-          <path d="M 20.6 74.4 A 26 26 0 1 1 57.4 74.4" fill="none" class="arc-ind" stroke="#00E5FF" stroke-width="6" style="--to:107.8"/>
-          <text x="39" y="55" font-family="Montserrat, sans-serif" font-size="17" font-weight="600" fill="#E6EDF7" text-anchor="middle">12</text>
-          <text x="39" y="68" font-family="Montserrat, sans-serif" font-size="8" fill="#5C6B82" text-anchor="middle">CPU %</text>
+            <!-- ===== page 0: kushtia-server ===== -->
+            <g class="pg is-on" data-page="0" data-kind="machine">
+              <text x="8" y="12" font-family="Montserrat, sans-serif" font-size="9" font-weight="600" fill="#00E5FF">PEEK</text>
+              <text x="44" y="12" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">// kushtia-server</text>
+              <text x="162" y="12" font-family="Montserrat, sans-serif" font-size="9" fill="#00E5FF" text-anchor="end">1/2</text>
+              <text x="206" y="12" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82" text-anchor="end">42 ms</text>
+              <circle class="dot-pulse" cx="227" cy="10" r="5" fill="#35D07F"/>
+              <rect x="8" y="19" width="224" height="1" fill="#00E5FF" opacity=".3"/>
 
-          <!-- RAM -->
-          <path d="M 92.6 74.4 A 26 26 0 1 1 129.4 74.4" fill="none" class="arc-track" stroke-width="6" stroke-linecap="round"/>
-          <path d="M 92.6 74.4 A 26 26 0 1 1 129.4 74.4" fill="none" class="arc-ind" stroke="#FF2E7E" stroke-width="6" style="--to:69.8"/>
-          <text x="111" y="55" font-family="Montserrat, sans-serif" font-size="17" font-weight="600" fill="#E6EDF7" text-anchor="middle">43</text>
-          <text x="111" y="68" font-family="Montserrat, sans-serif" font-size="8" fill="#5C6B82" text-anchor="middle">RAM %</text>
+              <path d="M 17.79 77.21 A 30 30 0 1 1 60.21 77.21" fill="none" class="arc-track" stroke-width="6" stroke-linecap="round"/>
+              <path d="M 17.79 77.21 A 30 30 0 1 1 60.21 77.21" fill="none" class="arc-ind" stroke="#00E5FF" stroke-width="6" style="--to:82.0"/>
+              <text x="39" y="51" font-family="Montserrat, sans-serif" font-size="17" font-weight="600" fill="#E6EDF7" text-anchor="middle" dominant-baseline="central">42</text>
+              <text x="39" y="70" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82" text-anchor="middle" dominant-baseline="central">CPU %</text>
 
-          <!-- temp + throughput panel -->
-          <rect x="150" y="23" width="84" height="66" rx="6" fill="#0B1220" stroke="#1A2334"/>
-          <text x="156" y="35" font-family="Montserrat, sans-serif" font-size="8" fill="#5C6B82">TEMP</text>
-          <text x="156" y="55" font-family="Montserrat, sans-serif" font-size="17" font-weight="600" fill="#E6EDF7">48&#176;</text>
-          <text x="156" y="72" font-family="Montserrat, sans-serif" font-size="8" fill="#5C6B82">&#8595; 128K &#8593; 13K</text>
+              <path d="M 89.79 77.21 A 30 30 0 1 1 132.21 77.21" fill="none" class="arc-track" stroke-width="6" stroke-linecap="round"/>
+              <path d="M 89.79 77.21 A 30 30 0 1 1 132.21 77.21" fill="none" class="arc-ind" stroke="#FF2E7E" stroke-width="6" style="--to:31.1"/>
+              <text x="111" y="51" font-family="Montserrat, sans-serif" font-size="17" font-weight="600" fill="#E6EDF7" text-anchor="middle" dominant-baseline="central">78</text>
+              <text x="111" y="70" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82" text-anchor="middle" dominant-baseline="central">RAM %</text>
 
-          <!-- storage -->
-          <text x="8" y="99" font-family="Montserrat, sans-serif" font-size="8" fill="#5C6B82">STORAGE  906G FREE</text>
-          <text x="232" y="99" font-family="Montserrat, sans-serif" font-size="8" fill="#E6EDF7" text-anchor="end">61%</text>
-          <rect x="7" y="104" width="226" height="8" rx="4" fill="#1A2334"/>
-          <rect class="bar-fill" x="7" y="104" width="226" height="8" rx="4" fill="#00E5FF" style="--to:.61"/>
+              <rect x="150" y="23" width="84" height="66" rx="6" fill="#0B1220" stroke="#1A2334"/>
+              <text x="154" y="34" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">TEMP</text>
+              <text x="154" y="53" font-family="Montserrat, sans-serif" font-size="17" font-weight="600" fill="#E6EDF7">48&#176;</text>
+              <text x="154" y="74" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">RX 1.3M</text>
+              <text x="154" y="85" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">TX 113k</text>
 
-          <!-- footer -->
-          <text x="8" y="125" font-family="Montserrat, sans-serif" font-size="8" fill="#5C6B82">up 3d 4h</text>
-          <text x="232" y="125" font-family="Montserrat, sans-serif" font-size="8" fill="#35D07F" text-anchor="end">LINK OK</text>
-        </svg>
+              <text x="8" y="99" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">STORAGE  436G FREE</text>
+              <text x="232" y="99" font-family="Montserrat, sans-serif" font-size="9" fill="#E6EDF7" text-anchor="end">61%</text>
+              <rect x="7" y="108" width="226" height="8" rx="4" fill="#1A2334"/>
+              <rect class="bar-fill" x="7" y="108" width="226" height="8" rx="4" fill="#00E5FF" style="--to:.61"/>
+
+              <text x="8" y="126" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">up 3d 4h</text>
+              <text x="232" y="126" font-family="Montserrat, sans-serif" font-size="9" fill="#35D07F" text-anchor="end">LINK OK</text>
+            </g>
+
+            <!-- ===== page 1: dhaka-laptop ===== -->
+            <g class="pg" data-page="1" data-kind="machine">
+              <text x="8" y="12" font-family="Montserrat, sans-serif" font-size="9" font-weight="600" fill="#00E5FF">PEEK</text>
+              <text x="44" y="12" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">// dhaka-laptop</text>
+              <text x="162" y="12" font-family="Montserrat, sans-serif" font-size="9" fill="#00E5FF" text-anchor="end">2/2</text>
+              <text x="206" y="12" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82" text-anchor="end">18 ms</text>
+              <circle class="dot-pulse" cx="227" cy="10" r="5" fill="#35D07F"/>
+              <rect x="8" y="19" width="224" height="1" fill="#00E5FF" opacity=".3"/>
+
+              <path d="M 17.79 77.21 A 30 30 0 1 1 60.21 77.21" fill="none" class="arc-track" stroke-width="6" stroke-linecap="round"/>
+              <path d="M 17.79 77.21 A 30 30 0 1 1 60.21 77.21" fill="none" class="arc-ind" stroke="#00E5FF" stroke-width="6" style="--to:12.7"/>
+              <text x="39" y="51" font-family="Montserrat, sans-serif" font-size="17" font-weight="600" fill="#E6EDF7" text-anchor="middle" dominant-baseline="central">91</text>
+              <text x="39" y="70" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82" text-anchor="middle" dominant-baseline="central">CPU %</text>
+
+              <path d="M 89.79 77.21 A 30 30 0 1 1 132.21 77.21" fill="none" class="arc-track" stroke-width="6" stroke-linecap="round"/>
+              <path d="M 89.79 77.21 A 30 30 0 1 1 132.21 77.21" fill="none" class="arc-ind" stroke="#FF2E7E" stroke-width="6" style="--to:63.6"/>
+              <text x="111" y="51" font-family="Montserrat, sans-serif" font-size="17" font-weight="600" fill="#E6EDF7" text-anchor="middle" dominant-baseline="central">55</text>
+              <text x="111" y="70" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82" text-anchor="middle" dominant-baseline="central">RAM %</text>
+
+              <rect x="150" y="23" width="84" height="66" rx="6" fill="#0B1220" stroke="#1A2334"/>
+              <text x="154" y="34" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">TEMP</text>
+              <text x="154" y="53" font-family="Montserrat, sans-serif" font-size="17" font-weight="600" fill="#FFB020">71&#176;</text>
+              <text x="154" y="74" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">RX 88k</text>
+              <text x="154" y="85" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">BAT 64%+</text>
+
+              <text x="8" y="99" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">STORAGE  33G FREE</text>
+              <text x="232" y="99" font-family="Montserrat, sans-serif" font-size="9" fill="#E6EDF7" text-anchor="end">93%</text>
+              <rect x="7" y="108" width="226" height="8" rx="4" fill="#1A2334"/>
+              <rect class="bar-fill" x="7" y="108" width="226" height="8" rx="4" fill="#FF4D6D" style="--to:.93"/>
+
+              <text x="8" y="126" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">up 2h 35m</text>
+              <text x="232" y="126" font-family="Montserrat, sans-serif" font-size="9" fill="#35D07F" text-anchor="end">LINK OK</text>
+            </g>
+
+            <!-- ===== page 2: the clock, from clock_faces.h ===== -->
+            <g class="pg" data-page="2" data-kind="clock">
+              <text x="8" y="15" font-family="Montserrat, sans-serif" font-size="9" font-weight="600" fill="#00E5FF">PEEK</text>
+              <text x="44" y="15" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">// DHAKA</text>
+              <rect x="8" y="22" width="224" height="1" fill="#00E5FF" opacity=".3"/>
+
+              <!-- Aligned rather than positioned, as the firmware does: the big
+                   label changes width between "9:05" and "12:05". -->
+              <text id="clk-time" x="106" y="53" font-family="Montserrat, sans-serif" font-size="36" font-weight="600" fill="#E6EDF7" text-anchor="middle" dominant-baseline="central">--:--</text>
+              <text id="clk-ampm" x="150" y="42" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82" dominant-baseline="central">--</text>
+              <text id="clk-secs" x="150" y="62" font-family="Montserrat, sans-serif" font-size="15" font-weight="600" fill="#00E5FF" dominant-baseline="central">--</text>
+
+              <text id="clk-date" x="120" y="94" font-family="Montserrat, sans-serif" font-size="11" fill="#E6EDF7" text-anchor="middle" dominant-baseline="central">waiting for time</text>
+              <text id="clk-sub" x="120" y="112" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82" text-anchor="middle" dominant-baseline="central">no NTP sync yet</text>
+
+              <!-- A minute, drawn: 224 px for 60 seconds. -->
+              <rect id="clk-bar" x="8" y="128" width="0" height="2" rx="1" fill="#00E5FF"/>
+            </g>
+
+            <!-- ===== page 3: the power screen ===== -->
+            <g class="pg" data-page="3" data-kind="power">
+              <text x="8" y="15" font-family="Montserrat, sans-serif" font-size="9" font-weight="600" fill="#00E5FF">PEEK</text>
+              <text x="44" y="15" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">// POWER</text>
+              <rect x="8" y="22" width="224" height="1" fill="#00E5FF" opacity=".3"/>
+
+              <rect x="12" y="40" width="110" height="50" rx="4" fill="none" stroke="#5C6B82" stroke-width="2"/>
+              <rect x="122" y="56" width="5" height="18" rx="1" fill="#5C6B82"/>
+              <rect id="pwr-fill" class="bar-fill" x="17" y="45" width="102" height="40" rx="2"
+                    fill="#35D07F" style="--to:.81"/>
+              <!-- Drawn, not an emoji: a glyph would arrive in whatever weight
+                   the reader's font stack decided, next to strokes that are all
+                   ours. -->
+              <path d="M 61.5 54 L 52 67.5 L 57.5 67.5 L 55.5 78 L 65.5 63.5 L 60 63.5 Z"
+                    fill="#05070E"/>
+
+              <text x="132" y="48" font-family="Montserrat, sans-serif" font-size="15" font-weight="600" fill="#E6EDF7">81%</text>
+              <text x="132" y="72" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">4.02 V</text>
+              <text x="132" y="88" font-family="Montserrat, sans-serif" font-size="9" fill="#FFB020">CHARGING</text>
+
+              <text x="8" y="106" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">kushtia-server &mdash; no battery</text>
+              <text x="8" y="126" font-family="Montserrat, sans-serif" font-size="9" fill="#5C6B82">hold right to sleep</text>
+            </g>
+          </svg>
+        </div>
+
+        <div class="device-rail">
+          <button type="button" class="hw-btn" id="peek-btn-left">
+            <b>GPIO 0</b><span>next page</span>
+          </button>
+          <span class="device-usb" aria-hidden="true"></span>
+          <button type="button" class="hw-btn" id="peek-btn-right">
+            <b>GPIO 35</b><span>backlight</span>
+          </button>
+        </div>
       </div>
-      <p class="caption">240 &times; 135. Drawn here at the panel&rsquo;s real resolution.</p>
+
+      <p class="caption" id="peek-caption">
+        240 &times; 135, at the panel&rsquo;s real resolution.
+        <span class="js-only">The buttons work like the board&rsquo;s.</span>
+      </p>
     </div>
   </div>
 </section>
@@ -686,6 +887,175 @@ shouravx/PeekESP/main/dietpi/install.sh | sudo sh</pre>
     </nav>
   </div>
 </footer>
+
+<script>
+/* The device figure, driven the way the board is.
+ *
+ *   left  (GPIO 0)   tap - next page: each machine, then the clock, then power
+ *   right (GPIO 35)  tap - cycle the backlight, 100 / 59 / 27 / 8 %
+ *
+ * Those are the firmware's own semantics, not a convenient approximation:
+ * PeekESP.ino gives page_count() as machines + 2, and the right button steps
+ * four brightness levels and remembers them. The clock runs on Dhaka time
+ * (UTC+6, no daylight saving) because that is what clock_faces.h does.
+ *
+ * Everything here is an enhancement. With JavaScript off the first page is the
+ * whole figure and the rail never appears, because a button that does nothing
+ * is worse than no button.
+ */
+(function () {
+  "use strict";
+
+  var device = document.getElementById("peek-device");
+  var screen = document.getElementById("peek-screen");
+  var svg    = document.getElementById("peek-svg");
+  if (!device || !screen || !svg) return;
+
+  var pages = Array.prototype.slice.call(svg.querySelectorAll(".pg"));
+  if (pages.length < 2) return;
+
+  var left    = document.getElementById("peek-btn-left");
+  var right   = document.getElementById("peek-btn-right");
+  var caption = document.getElementById("peek-caption");
+
+  var reduced = window.matchMedia
+    ? window.matchMedia("(prefers-reduced-motion: reduce)")
+    : { matches: false };
+
+  var page = 0;
+  var bl = 0;                       // 0 = 100 %, then 59, 27, 8
+  var BL_LABEL = ["100%", "59%", "27%", "8%"];
+
+  // -- page indicator ------------------------------------------------------
+  // Built rather than written out, so it cannot fall out of step with the
+  // number of pages actually in the SVG.
+  var dots = document.createElement("div");
+  dots.className = "pg-dots";
+  dots.setAttribute("aria-hidden", "true");
+  pages.forEach(function () {
+    var d = document.createElement("span");
+    d.className = "pg-dot";
+    dots.appendChild(d);
+  });
+  if (caption) caption.parentNode.insertBefore(dots, caption);
+
+  var NAMES = ["kushtia-server", "dhaka-laptop", "the clock", "the power screen"];
+
+  // The gauges sweep to their values on arrival, and the arrival is the whole
+  // point - a page that slides in with its arcs already full has thrown away
+  // the one moment the real device spends 500 ms on. CSS animations only fire
+  // once per element, so they are restarted by hand.
+  function replay(g) {
+    if (reduced.matches) return;
+    var anims = g.querySelectorAll(".arc-ind, .bar-fill");
+    Array.prototype.forEach.call(anims, function (el) {
+      var css = el.style.animation;
+      el.style.animation = "none";
+      void el.getBoundingClientRect();      // force the style to settle
+      el.style.animation = css || "";
+    });
+  }
+
+  function paint(dir) {
+    pages.forEach(function (g, i) {
+      g.classList.remove("is-on", "slide-in-l", "slide-in-r");
+      if (i === page) {
+        g.classList.add("is-on");
+        if (dir && !reduced.matches) {
+          g.classList.add(dir > 0 ? "slide-in-l" : "slide-in-r");
+        }
+        if (dir) replay(g);
+      }
+    });
+    Array.prototype.forEach.call(dots.children, function (d, i) {
+      d.classList.toggle("is-on", i === page);
+    });
+    svg.setAttribute("aria-label",
+      "PeekESP display, showing " + (NAMES[page] || "page " + (page + 1)) +
+      ". Backlight " + BL_LABEL[bl] + ".");
+    if (page === 2) tickClock();
+  }
+
+  function nextPage() {
+    page = (page + 1) % pages.length;
+    paint(1);
+  }
+
+  function nextBacklight() {
+    bl = (bl + 1) % 4;
+    screen.setAttribute("data-bl", String(bl));
+    if (right) right.lastElementChild.textContent = "backlight " + BL_LABEL[bl];
+    svg.setAttribute("aria-label",
+      "PeekESP display, showing " + (NAMES[page] || "page " + (page + 1)) +
+      ". Backlight " + BL_LABEL[bl] + ".");
+  }
+
+  if (left)  left.addEventListener("click", nextPage);
+  if (right) right.addEventListener("click", nextBacklight);
+
+  // The screen itself advances too - the obvious thing to click is the thing
+  // you are looking at. Keyboard users get the two real buttons.
+  screen.addEventListener("click", nextPage);
+  screen.style.cursor = "pointer";
+
+  // -- the clock, from clock_faces.h ---------------------------------------
+  var WEEKDAY = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday",
+                 "Friday", "Saturday"];
+  var MONTH = ["January", "February", "March", "April", "May", "June", "July",
+               "August", "September", "October", "November", "December"];
+
+  var clkTime = document.getElementById("clk-time");
+  var clkAmpm = document.getElementById("clk-ampm");
+  var clkSecs = document.getElementById("clk-secs");
+  var clkDate = document.getElementById("clk-date");
+  var clkSub  = document.getElementById("clk-sub");
+  var clkBar  = document.getElementById("clk-bar");
+
+  function dhakaNow() {
+    // UTC+6, no daylight saving - the same fixed offset the firmware uses,
+    // so the face reads the same here as on a device sitting in Dhaka.
+    var now = new Date();
+    return new Date(now.getTime() + (now.getTimezoneOffset() + 360) * 60000);
+  }
+
+  function tickClock() {
+    if (!clkTime) return;
+    var t = dhakaNow();
+
+    // 0 and 12 both map to 12, one AM and one PM - a plain % 12 prints
+    // "0:15 AM" at a quarter past midnight.
+    var h12 = t.getHours() % 12;
+    if (h12 === 0) h12 = 12;
+    var mins = String(t.getMinutes());
+    if (mins.length < 2) mins = "0" + mins;
+    var secs = String(t.getSeconds());
+    if (secs.length < 2) secs = "0" + secs;
+
+    clkTime.textContent = h12 + ":" + mins;
+    clkAmpm.textContent = t.getHours() < 12 ? "AM" : "PM";
+    clkSecs.textContent = secs;
+    clkDate.textContent = WEEKDAY[t.getDay()];
+    clkSub.textContent  = t.getDate() + " " + MONTH[t.getMonth()] + " " +
+                          t.getFullYear();
+    clkBar.setAttribute("width", String((224 * t.getSeconds()) / 59));
+
+    // The marker and the seconds hang off the right edge of the big number,
+    // which changes width between "9:05" and "12:05" - so they are placed
+    // again once the text is set, exactly as render_clock_dated() does.
+    try {
+      var box = clkTime.getBBox();
+      clkAmpm.setAttribute("x", String(box.x + box.width + 7));
+      clkSecs.setAttribute("x", String(box.x + box.width + 6));
+    } catch (e) { /* getBBox throws while hidden; the next tick fixes it */ }
+  }
+
+  tickClock();
+  setInterval(function () { if (page === 2) tickClock(); }, 1000);
+
+  device.classList.add("has-js");
+  paint(0);
+})();
+</script>
 
 </body>
 </html>
