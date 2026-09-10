@@ -178,6 +178,27 @@ jobs:
             "firmware"      = "firmware/PeekESP-merged.bin"
           }
 
+          # One firmware image per display, zipped rather than attached as
+          # seven more assets. TFT_eSPI picks its driver at compile time, so
+          # each of these drives exactly one panel and the T-Display's image
+          # shows nothing on a GC9A01 - a release that offered only one would
+          # be a release that only works for one board.
+          #
+          # Zipped because seven near-identical 1.4 MB names on the release
+          # page is a wall to read past, and anyone who wants one already knows
+          # which panel they have.
+          $panels = Get-ChildItem -Path firmware -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { Get-ChildItem $_.FullName -Filter *-merged.bin }
+          if ($panels) {
+            Compress-Archive -Path ($panels | ForEach-Object { $_.FullName }) `
+              -DestinationPath "windows/dist/firmware-panels-$v.zip" -Force
+            $expected["panel firmware"] = "windows/dist/firmware-panels-$v.zip"
+            Write-Output "panel images: $($panels.Name -join ', ')"
+          } else {
+            Write-Error "no per-panel firmware in firmware/ - run tools/build_panels.py"
+            exit 1
+          }
+
           $files = @()
           $missing = @()
           foreach ($k in $expected.Keys) {

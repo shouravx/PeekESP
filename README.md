@@ -347,20 +347,27 @@ in Kushtia, one on your desk, and Home Assistant watching both.
 
 ### A different screen on the ESP32
 
+Each panel has its own prebuilt image. Flashing needs no toolchain:
+
 ```bash
-pio run -e ili9341-320x240      # 2.4"/2.8" colour TFT
-pio run -e gc9a01-round         # 1.28" circular
-pio run -e st7789-240x240       # 1.3" square
+python tools/flash.py --panel gc9a01-round       # 1.28" circular
+python tools/flash.py --panel ili9341-320x240    # 2.4"/2.8" colour TFT
+python tools/flash.py --panel st7789-240x240     # 1.3" square
 ```
 
-Seven panels, one PlatformIO environment each — TFT_eSPI decides its driver,
-pins and geometry at compile time, so a firmware image drives exactly one
-screen. The dashboard's layout is derived from the panel's dimensions rather
-than hardcoded. Full list, wiring and what to change when it comes up sideways:
+Seven panels, one image each — TFT_eSPI decides its driver, pins and geometry
+at compile time, so a firmware image drives exactly one screen and the
+T-Display's image shows nothing on a GC9A01. The dashboard's layout is derived
+from the panel's dimensions rather than hardcoded, so adding an eighth is a
+build flag and not a redraw.
+
+To build them yourself: `python tools/build_panels.py`. Full list, wiring, and
+what to change when it comes up sideways:
 **[PeekESP/PANELS.md](PeekESP/PANELS.md)**.
 
-Only the T-Display has run on hardware. The rest compile in CI, and that is the
-whole claim.
+Only the T-Display has run on hardware. The rest compile and link with the right
+driver and the pins written down in `platformio.ini`, and that is the whole
+claim.
 
 ### A Raspberry Pi instead of an ESP32
 

@@ -1,16 +1,46 @@
 # Building the firmware for a different panel
 
-The default is the LilyGO TTGO T-Display. Six other panels are supported:
+The default is the LilyGO TTGO T-Display. Six other panels are supported.
+
+## Just flash one
+
+Each panel has its own prebuilt image under `firmware/<panel>/`. No toolchain,
+no PlatformIO, no 250 MB download — only esptool:
 
 ```bash
-pio run -e ttgo-t-display        # 240x135  ST7789   (the default)
-pio run -e ili9341-320x240       # 320x240  ILI9341  2.4" / 2.8"
-pio run -e ili9341-240x320       # 240x320  ILI9341  same panel, upright
-pio run -e st7789-240x240        # 240x240  ST7789   1.3" square
-pio run -e st7789-240x320        # 240x320  ST7789   2.0"
-pio run -e gc9a01-round          # 240 dia  GC9A01   1.28" circular
-pio run -e st7735-160x128        # 160x128  ST7735   1.8"
+python tools/flash.py --panel gc9a01-round
+python tools/flash.py --panel ili9341-320x240
+python tools/flash.py --panel ttgo-t-display     # the default, also plain --
+```
 
+| `--panel` | Display | |
+|---|---|---|
+| `ttgo-t-display` | LilyGO TTGO T-Display | 240×135, ST7789 |
+| `ili9341-320x240` | ILI9341, landscape | 320×240 |
+| `ili9341-240x320` | ILI9341, upright | 240×320 |
+| `st7789-240x240` | ST7789 1.3″ square | 240×240 |
+| `st7789-240x320` | ST7789 2.0″ | 240×320 |
+| `gc9a01-round` | GC9A01 1.28″ round | 240 dia |
+| `st7735-160x128` | ST7735 1.8″ | 160×128 |
+
+**One image per panel is not a packaging choice.** TFT_eSPI selects its driver,
+its pins and its geometry with `#define`, so a firmware image drives exactly one
+display. Flashing the T-Display image onto a GC9A01 drives the wrong controller
+on the wrong pins and shows nothing at all.
+
+## Build them yourself
+
+```bash
+python tools/build_panels.py                 # every panel
+python tools/build_panels.py gc9a01-round    # just one
+python tools/build_panels.py --list
+```
+
+That needs PlatformIO (`pip install platformio`) and writes
+`firmware/<panel>/PeekESP-<panel>-merged.bin`. Or drive PlatformIO directly:
+
+```bash
+pio run -e gc9a01-round
 pio run -e gc9a01-round -t upload
 ```
 
@@ -65,27 +95,36 @@ and would still have drawn its header behind the bezel. Compiling is not using.
 
 ---
 
-## What CI proves, and what it does not
+## Two build paths, and what each one proves
 
 ```bash
-python tools/ci_compile.py --all
+python tools/ci_compile.py --all      # arduino-cli: geometry only
+python tools/build_panels.py          # PlatformIO: the real images
 ```
 
-Compiles the sketch at every panel's geometry and fails on any warning in our
-own files. This is worth having: the first run across all seven found that a
-320-pixel-wide panel **overflowed DRAM by 1,944 bytes**, because the LVGL draw
-buffer was `SCREEN_W * 40` and had only ever been built at width 240. The
-failure is a linker message naming `dram0_0_seg` with no source line attached
-to it. The buffer is a fixed pixel budget now, so a wider panel takes fewer
-lines per flush and the same RAM.
+**These are not interchangeable, and the difference matters.**
 
-**It does not verify the driver, the pins or the rotation.** `arduino-cli`
-builds against the installed TFT_eSPI setup — the LilyGO one — so across all
-seven builds only the *geometry* varies. Drivers and pins come from
-`platformio.ini`, and the only thing that verifies those is a panel in your
-hand.
+`ci_compile.py` builds against whatever TFT_eSPI setup is installed — the
+LilyGO one — so across all seven of its builds only the *geometry* changes. The
+driver, the pins and the rotation stay the T-Display's. An image from that path
+flashed onto a GC9A01 would show nothing. It is a compile check, and it is a
+good one: the first run across all seven found that a 320-pixel-wide panel
+**overflowed DRAM by 1,944 bytes**, because the LVGL draw buffer was
+`SCREEN_W * 40` and had only ever been built at width 240 — a linker message
+naming `dram0_0_seg` with no source line attached to it.
 
-**Only `ttgo-t-display` has ever run on hardware.** Everything else compiles.
+`build_panels.py` uses PlatformIO, which is the only thing that reads the
+`build_flags` in `platformio.ini` where the driver and pins live. Those are the
+images in `firmware/` and the ones anyone should flash.
+
+That path was itself broken for a while and nobody noticed, because the only
+build anyone ran was the IDE's: the Arduino IDE generates a prototype for every
+function before compiling, so functions called above their definitions build
+there and nowhere else. `pio run` failed on **every** board until the forward
+declarations went in. Both paths are exercised now.
+
+**Only `ttgo-t-display` has ever run on hardware.** Everything else compiles and
+links, with the right driver and the pins written down in `platformio.ini`.
 That is the entire claim.
 
 ---

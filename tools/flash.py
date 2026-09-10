@@ -21,6 +21,7 @@ Rebuild the committed image after changing the sketch:
 """
 
 import argparse
+import pathlib
 import re
 import subprocess
 import sys
@@ -151,7 +152,31 @@ def main():
     ap.add_argument("--erase", action="store_true",
                     help="erase flash first: forgets WiFi and the pairing code")
     ap.add_argument("--no-monitor", action="store_true")
+    # There is one image per display now, because TFT_eSPI picks its driver at
+    # compile time. Without this the only flashable image is the T-Display's,
+    # which on any other panel drives the wrong controller on the wrong pins
+    # and shows nothing.
+    ap.add_argument("--image", metavar="PATH",
+                    help="a specific merged image, e.g. one from "
+                         "firmware/gc9a01-round/ (default: the T-Display's)")
+    ap.add_argument("--panel", metavar="NAME",
+                    help="shorthand for --image firmware/<NAME>/PeekESP-<NAME>-merged.bin")
     a = ap.parse_args()
+
+    global MERGED
+    if a.panel:
+        MERGED = REPO / "firmware" / a.panel / ("PeekESP-%s-merged.bin" % a.panel)
+        if not MERGED.exists():
+            avail = sorted(d.name for d in (REPO / "firmware").iterdir()
+                           if d.is_dir() and any(d.glob("*-merged.bin")))
+            sys.exit("no image for panel '%s'.\n"
+                     "Built panels: %s\n"
+                     "Build one with: python tools/build_panels.py %s"
+                     % (a.panel, ", ".join(avail) or "none", a.panel))
+    elif a.image:
+        MERGED = pathlib.Path(a.image)
+        if not MERGED.exists():
+            sys.exit("%s does not exist" % MERGED)
 
     if a.list:
         found = ports()

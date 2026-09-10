@@ -1477,6 +1477,26 @@ static void build_setup_ui() {
 //  Core 1 -> pulls a snapshot of core 0's state. Runs inside lv_timer_handler,
 //  so it is always on the UI thread and free to touch LVGL.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+//  Forward declarations
+// ---------------------------------------------------------------------------
+// The Arduino IDE scans a sketch and generates a prototype for every function
+// before it compiles anything, so calling one above its definition works there
+// and only there. PlatformIO compiles main.cpp, which includes this file as
+// ordinary C++ and gets no such favour.
+//
+// The result was that `pio run` failed on every board while the README went on
+// documenting PlatformIO as a supported build - and it stayed broken because
+// the only build anyone ran was the IDE's. This block is what keeps the two
+// honest; each of these is called by the render loop below and defined after
+// it, next to the things it operates on.
+static uint8_t page_count();
+static void    view_step(int8_t step);
+static void    power_tick();
+static void    render_freshness();
+static void    render_selected();
+static void    register_routes();
+
 static void ui_sync_cb(lv_timer_t *t) {
   (void)t;
   static uint32_t last_seq   = 0;
@@ -2480,6 +2500,20 @@ static String field(const char *label, const char *name, const char *value,
   return s;
 }
 
+// Declared here, defined with the rest of the authentication below.
+//
+// The Arduino IDE generates prototypes for the whole sketch before compiling
+// it, so a function used above its definition builds there and nowhere else.
+// PlatformIO compiles main.cpp, which includes this file as ordinary C++ with
+// no such favour - and `pio run` had been failing on exactly this since
+// web_guard was introduced, for every board, while the README went on offering
+// PlatformIO as a supported path.
+//
+// Keeping the definition where it belongs - next to the comment explaining
+// what HTTP Basic over plain HTTP does and does not protect - and forward
+// declaring it here costs one line and keeps both builds honest.
+static bool web_guard();
+
 static void handle_root() {
   if (!web_guard()) return;
 
@@ -2507,6 +2541,11 @@ static void handle_root() {
   p += F("<dl class=stat>");
   p += F("<div><dt>firmware</dt><dd>");
   p += F(FW_VERSION);
+  // The image is panel-specific, and the settings page is reachable even when
+  // the screen shows nothing - which is exactly the situation where knowing
+  // which build is on the board is worth having.
+  p += F("</dd></div><div><dt>panel</dt><dd>");
+  p += F(PANEL_NAME);
   p += F("</dd></div><div><dt>uptime</dt><dd>");
   p += uptime_text();
   p += F("</dd></div><div><dt>address</dt><dd>");
@@ -2890,6 +2929,15 @@ void setup() {
   Serial.begin(115200);
   delay(100);
   Serial.println("\n[peek] booting");
+
+  // Which build this is, in the first three lines of the log.
+  //
+  // One image drives one display, so flashing the wrong one is a thing people
+  // will do - and the symptom is a blank screen, which looks identical to bad
+  // wiring, a dead backlight and a broken panel. Without this there is nothing
+  // on the device that can be asked which image it is running.
+  Serial.printf("[peek] firmware %s\n", FW_VERSION);
+  Serial.printf("[peek] panel    %s  (%dx%d)\n", PANEL_NAME, PANEL_W, PANEL_H);
 
   // Waking from deep sleep is a fresh boot, so without this there is no way to
   // tell "it woke up" from "it reset" - which is exactly the distinction you
