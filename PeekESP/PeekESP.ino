@@ -74,6 +74,8 @@
 
 #include "ca_certs.h"
 #include "logo_splash.h"
+#include "panel_profiles.h"     // which screen this build is for
+#include "layout_metrics.h"     // where things go, derived from its geometry
 
 #include <TFT_eSPI.h>
 #include <lvgl.h>
@@ -167,8 +169,12 @@
 #define COL_TEXT      lv_color_hex(0xE6EDF7)
 #define COL_TEXT_DIM  lv_color_hex(0x5C6B82)
 
-static const uint16_t SCREEN_W = 240;   // rotation 1 = landscape
-static const uint16_t SCREEN_H = 135;
+// From panel_profiles.h, selected by a build flag. 240x135 for the T-Display,
+// which is the default and the only panel any of this has run on. TFT_eSPI
+// picks its driver at compile time, so one image drives one panel - see
+// panel_profiles.h for why that is not a choice.
+static const uint16_t SCREEN_W = PANEL_W;   // rotation 1 = landscape
+static const uint16_t SCREEN_H = PANEL_H;
 
 #if LV_FONT_MONTSERRAT_12
   #define F_SM  &lv_font_montserrat_12
@@ -384,7 +390,28 @@ static lv_disp_draw_buf_t draw_buf;
 // One 40-line partial buffer, ~19 KB. A second buffer would only pay for
 // itself with a DMA flush; pushColors() below is synchronous, so LVGL would
 // wait on it either way and the extra 19 KB would buy nothing.
-static lv_color_t lv_buf[SCREEN_W * 40];
+// A fixed pixel budget, not a fixed number of lines.
+//
+// This was SCREEN_W * 40, which is the same 19,200 bytes on every panel 240 px
+// wide and quietly becomes 25,600 on one that is 320. That extra 6.4 KB does
+// not fail gracefully: it lands in .dram0.bss, and the first build for a
+// 320-wide panel overflowed dram0_0_seg by 1,944 bytes at link time. The
+// message names a linker segment and no source line, so nothing about it
+// points at this declaration.
+//
+// LVGL only needs a partial buffer - a tenth of the screen is its own
+// recommendation - so the budget is held constant and the number of lines
+// falls out of it. A wider panel gets fewer lines per flush and more flushes,
+// which costs a little SPI time and no RAM at all.
+#define LVGL_BUF_PX     (240 * 40)
+#define LVGL_BUF_LINES  (LVGL_BUF_PX / SCREEN_W)
+
+// Below about ten lines the flush overhead starts to dominate, and it would
+// mean a panel wider than anything this supports.
+static_assert(LVGL_BUF_LINES >= 10,
+              "the LVGL buffer is too few lines for this panel width");
+
+static lv_color_t lv_buf[LVGL_BUF_PX];
 
 static const int PIN_BL      = 4;
 // Both buttons do two things, chosen by how long they are held. The pairing
@@ -991,7 +1018,7 @@ static void make_gauge(Gauge *g, lv_obj_t *parent, int16_t x, int16_t y,
   g->shown = 0;
 
   g->arc = lv_arc_create(parent);
-  lv_obj_set_size(g->arc, 66, 66);
+  lv_obj_set_size(g->arc, LAY_GAUGE_D, LAY_GAUGE_D);
   lv_obj_set_pos(g->arc, x, y);
   lv_arc_set_rotation(g->arc, 135);
   lv_arc_set_bg_angles(g->arc, 0, 270);
@@ -1003,23 +1030,23 @@ static void make_gauge(Gauge *g, lv_obj_t *parent, int16_t x, int16_t y,
   lv_obj_set_style_border_width(g->arc, 0, LV_PART_MAIN);
   lv_obj_set_style_pad_all(g->arc, 0, LV_PART_MAIN);
   lv_obj_set_style_arc_color(g->arc, COL_TRACK, LV_PART_MAIN);
-  lv_obj_set_style_arc_width(g->arc, 6, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(g->arc, LAY_GAUGE_ARC_W, LV_PART_MAIN);
   lv_obj_set_style_arc_rounded(g->arc, true, LV_PART_MAIN);
   lv_obj_set_style_arc_color(g->arc, accent, LV_PART_INDICATOR);
-  lv_obj_set_style_arc_width(g->arc, 6, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_width(g->arc, LAY_GAUGE_ARC_W, LV_PART_INDICATOR);
   lv_obj_set_style_arc_rounded(g->arc, true, LV_PART_INDICATOR);
 
   g->value = lv_label_create(g->arc);
   lv_label_set_text(g->value, "0");
   lv_obj_set_style_text_font(g->value, F_BIG, 0);
   lv_obj_set_style_text_color(g->value, COL_TEXT, 0);
-  lv_obj_align(g->value, LV_ALIGN_CENTER, 0, -5);
+  lv_obj_align(g->value, LV_ALIGN_CENTER, 0, LAY_GAUGE_VAL_DY);
 
   lv_obj_t *cap = lv_label_create(g->arc);
   lv_label_set_text(cap, caption);
   lv_obj_set_style_text_font(cap, F_SM, 0);
   lv_obj_set_style_text_color(cap, COL_TEXT_DIM, 0);
-  lv_obj_align(cap, LV_ALIGN_CENTER, 0, 14);
+  lv_obj_align(cap, LV_ALIGN_CENTER, 0, LAY_GAUGE_CAP_DY);
 }
 
 static void build_dashboard_ui() {
@@ -1040,34 +1067,41 @@ static void build_dashboard_ui() {
   lv_obj_clear_flag(g_body, LV_OBJ_FLAG_SCROLLABLE);
 
   // ---- header ----
-  make_label(scr, F_SM, COL_CYAN, 8, 3, "PEEK");
-  g_lbl_host = make_label(g_body, F_SM, COL_TEXT_DIM, 44, 3, "// dietpi");
-  lv_obj_set_width(g_lbl_host, 92);
+  make_label(scr, F_SM, COL_CYAN, lay_row_x(LAY_PAD, LAY_HEAD_Y, LAY_ROW_H),
+             LAY_HEAD_Y, "PEEK");
+  g_lbl_host = make_label(g_body, F_SM, COL_TEXT_DIM,
+                          lay_row_x(LAY_HOST_X, LAY_HEAD_Y, LAY_ROW_H),
+                          LAY_HEAD_Y, "// dietpi");
+  lv_obj_set_width(g_lbl_host, lay_row_w(LAY_HOST_W, LAY_HEAD_Y, LAY_ROW_H));
   lv_label_set_long_mode(g_lbl_host, LV_LABEL_LONG_CLIP);
 
   // Which of several machines is on screen. Hidden outright when there is only
   // one, because "1/1" is noise on a 1.14" display.
-  g_lbl_which = make_label(scr, F_SM, COL_CYAN, 136, 3, "");
-  lv_obj_set_width(g_lbl_which, 26);        // "6/6" and no wider
+  g_lbl_which = make_label(scr, F_SM, COL_CYAN,
+                           lay_row_x(LAY_WHICH_X, LAY_HEAD_Y, LAY_ROW_H),
+                           LAY_HEAD_Y, "");
+  lv_obj_set_width(g_lbl_which, LAY_WHICH_W);   // "6/6" and no wider
   lv_obj_set_style_text_align(g_lbl_which, LV_TEXT_ALIGN_RIGHT, 0);
 
   // 44 px is what "999 ms" needs. Anything slower is rendered as seconds
   // rather than allowed to grow into the indicator beside it.
-  g_lbl_ping = make_label(scr, F_SM, COL_TEXT_DIM, 162, 3, "-- ms");
-  lv_obj_set_width(g_lbl_ping, 44);
+  g_lbl_ping = make_label(scr, F_SM, COL_TEXT_DIM,
+                          lay_row_x(LAY_PING_X, LAY_HEAD_Y, LAY_ROW_H),
+                          LAY_HEAD_Y, "-- ms");
+  lv_obj_set_width(g_lbl_ping, LAY_PING_W);
   lv_obj_set_style_text_align(g_lbl_ping, LV_TEXT_ALIGN_RIGHT, 0);
 
   lv_obj_t *rule = lv_obj_create(scr);
   lv_obj_remove_style_all(rule);
-  lv_obj_set_size(rule, 224, 1);
-  lv_obj_set_pos(rule, 8, 19);
+  lv_obj_set_size(rule, lay_width_at(LAY_RULE_Y, 1), 1);
+  lv_obj_set_pos(rule, lay_inset(LAY_RULE_Y, 1), LAY_RULE_Y);
   lv_obj_set_style_bg_color(rule, COL_CYAN, 0);
   lv_obj_set_style_bg_opa(rule, LV_OPA_30, 0);
 
   // Spinner ring, drawn around the dot, visible only while a GET is in flight.
   g_spinner = lv_spinner_create(scr, 900, 70);
-  lv_obj_set_size(g_spinner, 20, 20);
-  lv_obj_set_pos(g_spinner, 217, 0);
+  lv_obj_set_size(g_spinner, LAY_SPIN_D, LAY_SPIN_D);
+  lv_obj_set_pos(g_spinner, lay_row_x(LAY_SPIN_X, LAY_HEAD_Y, LAY_ROW_H), 0);
   lv_obj_remove_style(g_spinner, NULL, LV_PART_KNOB);
   lv_obj_set_style_arc_width(g_spinner, 2, LV_PART_MAIN);
   lv_obj_set_style_arc_opa(g_spinner, LV_OPA_TRANSP, LV_PART_MAIN);
@@ -1077,8 +1111,8 @@ static void build_dashboard_ui() {
 
   g_dot = lv_obj_create(scr);
   lv_obj_remove_style_all(g_dot);
-  lv_obj_set_size(g_dot, 10, 10);
-  lv_obj_set_pos(g_dot, 222, 5);
+  lv_obj_set_size(g_dot, LAY_DOT_D, LAY_DOT_D);
+  lv_obj_set_pos(g_dot, lay_row_x(LAY_DOT_X, LAY_HEAD_Y, LAY_ROW_H), LAY_DOT_Y);
   lv_obj_set_style_radius(g_dot, LV_RADIUS_CIRCLE, 0);
   lv_obj_set_style_bg_opa(g_dot, LV_OPA_COVER, 0);
   lv_obj_set_style_bg_color(g_dot, COL_AMBER, 0);
@@ -1086,45 +1120,49 @@ static void build_dashboard_ui() {
   lv_obj_set_style_outline_width(g_dot, 0, 0);
 
   // ---- gauges ----
-  make_gauge(&g_cpu, g_body,  6, 23, COL_CYAN,    "CPU %");
-  make_gauge(&g_ram, g_body, 78, 23, COL_MAGENTA, "RAM %");
+  make_gauge(&g_cpu, g_body, LAY_GAUGE_L_X, LAY_CONTENT_Y, COL_CYAN,    "CPU %");
+  make_gauge(&g_ram, g_body, LAY_GAUGE_R_X, LAY_CONTENT_Y, COL_MAGENTA, "RAM %");
 
   // ---- temperature / throughput panel ----
   lv_obj_t *panel = lv_obj_create(g_body);
   lv_obj_remove_style_all(panel);
-  lv_obj_set_size(panel, 84, 66);
-  lv_obj_set_pos(panel, 150, 23);
+  lv_obj_set_size(panel, LAY_STAT_W, LAY_STAT_H);
+  lv_obj_set_pos(panel, LAY_STAT_X, LAY_CONTENT_Y);
   lv_obj_set_style_bg_color(panel, COL_PANEL, 0);
   lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
   lv_obj_set_style_radius(panel, 6, 0);
   lv_obj_set_style_border_width(panel, 1, 0);
   lv_obj_set_style_border_color(panel, COL_TRACK, 0);
-  lv_obj_set_style_pad_all(panel, 4, 0);
+  lv_obj_set_style_pad_all(panel, LAY_STAT_PAD, 0);
   lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
 
   make_label(panel, F_SM, COL_TEXT_DIM, 0, 0, "TEMP");
-  g_lbl_temp = make_label(panel, F_BIG, COL_TEXT, 0, 13, "--");
-  g_lbl_net  = make_label(panel, F_SM,  COL_TEXT_DIM, 0, 40,
+  g_lbl_temp = make_label(panel, F_BIG, COL_TEXT, 0, LAY_STAT_TEMP_Y, "--");
+  g_lbl_net  = make_label(panel, F_SM,  COL_TEXT_DIM, 0, LAY_STAT_NET_Y,
                           LV_SYMBOL_DOWN " --  " LV_SYMBOL_UP " --");
 
   // ---- storage ----
   // Not a static caption any more: once the host reports capacity this becomes
   // "STORAGE  906G FREE", which is the number people actually want. It stays
   // left of x=162 so it cannot collide with the percentage.
-  g_lbl_store = make_label(g_body, F_SM, COL_TEXT_DIM, 8, 92, "STORAGE");
+  g_lbl_store = make_label(g_body, F_SM, COL_TEXT_DIM,
+                           lay_row_x(LAY_PAD, LAY_STORE_Y, LAY_ROW_H),
+                           LAY_STORE_Y, "STORAGE");
   // Bounded rather than measured: the default long mode wraps, which would put
   // a second line straight through the bar at y=108, and an unbounded label on
   // a 12 TB array would reach the percentage. Clipping does neither.
-  lv_obj_set_width(g_lbl_store, 150);
+  lv_obj_set_width(g_lbl_store, lay_row_w(LAY_STORE_W, LAY_STORE_Y, LAY_ROW_H));
   lv_label_set_long_mode(g_lbl_store, LV_LABEL_LONG_CLIP);
 
-  g_bar_value = make_label(g_body, F_SM, COL_TEXT, 162, 92, "0%");
-  lv_obj_set_width(g_bar_value, 70);
+  g_bar_value = make_label(g_body, F_SM, COL_TEXT,
+                           lay_row_x(LAY_PCT_X, LAY_STORE_Y, LAY_ROW_H),
+                           LAY_STORE_Y, "0%");
+  lv_obj_set_width(g_bar_value, lay_row_w(LAY_PCT_W, LAY_STORE_Y, LAY_ROW_H));
   lv_obj_set_style_text_align(g_bar_value, LV_TEXT_ALIGN_RIGHT, 0);
 
   g_bar = lv_bar_create(g_body);
-  lv_obj_set_size(g_bar, 226, 8);
-  lv_obj_set_pos(g_bar, 7, 108);
+  lv_obj_set_size(g_bar, lay_width_at(LAY_BAR_Y, LAY_BAR_H), LAY_BAR_H);
+  lv_obj_set_pos(g_bar, lay_inset(LAY_BAR_Y, LAY_BAR_H), LAY_BAR_Y);
   lv_bar_set_range(g_bar, 0, 1000);
   lv_bar_set_value(g_bar, 0, LV_ANIM_OFF);
   lv_obj_set_style_bg_color(g_bar, COL_TRACK, LV_PART_MAIN);
@@ -1135,9 +1173,13 @@ static void build_dashboard_ui() {
   lv_obj_set_style_radius(g_bar, 4, LV_PART_INDICATOR);
 
   // ---- footer ----
-  g_lbl_foot  = make_label(g_body, F_SM, COL_TEXT_DIM,   8, 118, "waiting for host");
-  g_lbl_state = make_label(scr, F_SM, COL_TEXT_DIM, 124, 118, "BOOT");
-  lv_obj_set_width(g_lbl_state, 108);
+  g_lbl_foot  = make_label(g_body, F_SM, COL_TEXT_DIM,
+                           lay_row_x(LAY_PAD, LAY_FOOT_Y, LAY_ROW_H),
+                           LAY_FOOT_Y, "waiting for host");
+  g_lbl_state = make_label(scr, F_SM, COL_TEXT_DIM,
+                           lay_row_x(LAY_STATE_X, LAY_FOOT_Y, LAY_ROW_H),
+                           LAY_FOOT_Y, "BOOT");
+  lv_obj_set_width(g_lbl_state, lay_row_w(LAY_STATE_W, LAY_FOOT_Y, LAY_ROW_H));
   lv_obj_set_style_text_align(g_lbl_state, LV_TEXT_ALIGN_RIGHT, 0);
 
   apply_state(NET_BOOT);
@@ -2899,7 +2941,7 @@ void setup() {
   g_setup_mode = !config_usable() || held || consume_setup_request();
 
   tft.init();
-  tft.setRotation(1);             // landscape, 240x135
+  tft.setRotation(PANEL_ROTATION);   // from panel_profiles.h
   tft.fillScreen(TFT_BLACK);
 
   // tft.init() drives the backlight pin directly; take it over for PWM and
@@ -2908,7 +2950,7 @@ void setup() {
   backlight_set(0);
 
   lv_init();
-  lv_disp_draw_buf_init(&draw_buf, lv_buf, NULL, SCREEN_W * 40);
+  lv_disp_draw_buf_init(&draw_buf, lv_buf, NULL, LVGL_BUF_PX);
 
   static lv_disp_drv_t disp_drv;
   lv_disp_drv_init(&disp_drv);

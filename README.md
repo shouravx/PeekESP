@@ -54,8 +54,11 @@ doing rather than leaving you to guess.
 |---|---|
 | [PeekESP/PeekESP.ino](PeekESP/PeekESP.ino) | The firmware. Open this one in the Arduino IDE. |
 | [PeekESP/secrets.example.h](PeekESP/secrets.example.h) | Optional factory defaults. Real config happens on-device. |
+| [PeekESP/PANELS.md](PeekESP/PANELS.md) | Building for a different screen — ILI9341, ST7789, GC9A01 round, ST7735. |
 | [lv_conf.h](lv_conf.h) | LVGL config for this board. |
-| [platformio.ini](platformio.ini) + [main.cpp](main.cpp) | PlatformIO build of the exact same sketch. |
+| [platformio.ini](platformio.ini) + [main.cpp](main.cpp) | PlatformIO build of the exact same sketch, one env per panel. |
+| [pi/](pi/) | The same dashboard on a Raspberry Pi — colour TFT, OLED, e-paper, 16×2 LCD, LED matrix. |
+| [custom_components/peekesp/](custom_components/peekesp/) | Home Assistant integration. Sensors per machine, buttons for the display. |
 | [dietpi/peek-agent.py](dietpi/peek-agent.py) | Run on the Linux host: serves the JSON, and/or pushes it to the relay. |
 | [windows/](windows/) | The same agent for a Windows PC, plus a one-file `.exe` build. |
 | [cloudflare/](cloudflare/) | Worker relay for when the host has no reachable port. `npm test` covers it. |
@@ -335,6 +338,55 @@ the LVGL config path as build flags, which is why PlatformIO never had the
 ```bash
 pio run -t upload -t monitor
 ```
+
+## Other screens, other hosts
+
+The T-Display is the default, not the only option. Everything below reads the
+same relay with the same pairing code, so they can all run at once — a device
+in Kushtia, one on your desk, and Home Assistant watching both.
+
+### A different screen on the ESP32
+
+```bash
+pio run -e ili9341-320x240      # 2.4"/2.8" colour TFT
+pio run -e gc9a01-round         # 1.28" circular
+pio run -e st7789-240x240       # 1.3" square
+```
+
+Seven panels, one PlatformIO environment each — TFT_eSPI decides its driver,
+pins and geometry at compile time, so a firmware image drives exactly one
+screen. The dashboard's layout is derived from the panel's dimensions rather
+than hardcoded. Full list, wiring and what to change when it comes up sideways:
+**[PeekESP/PANELS.md](PeekESP/PANELS.md)**.
+
+Only the T-Display has run on hardware. The rest compile in CI, and that is the
+whole claim.
+
+### A Raspberry Pi instead of an ESP32
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shouravx/PeekESP/main/pi/install.sh | sudo sh
+```
+
+Drives every panel above *plus* the ones the firmware cannot: SSD1306 OLED,
+Waveshare e-paper, a 16×2 character LCD and a MAX7219 LED matrix. Those last
+three are not framebuffers — 32 character cells, or 8 rows of dots — so they
+get their own presentation rather than a shrunken dashboard.
+
+`peek-display --self-test` draws a pattern that proves the wiring before you
+blame the software. **[pi/README.md](pi/README.md)**.
+
+A Pi can be both ends at once: run [the agent](dietpi/) alongside and it appears
+in its own carousel.
+
+### Home Assistant
+
+Add `https://github.com/shouravx/PeekESP` to HACS as an **Integration**, then
+pair with the same code. One device per monitored machine — CPU, memory,
+storage, temperature, throughput, battery, last boot — plus buttons that drive
+the ESP32 display: identify, refresh, wake, standby, reboot.
+
+**[custom_components/peekesp/README.md](custom_components/peekesp/README.md)**.
 
 ## Configuration
 

@@ -1,0 +1,78 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to PeekESP",
+        "description": "Enter the pairing code your device shows on screen. Dashes and capitals do not matter.\n\nThe code never leaves Home Assistant — the stream id and access tokens are derived from it here, and neither can be turned back into the code.",
+        "data": {
+          "pair_code": "Pairing code",
+          "name": "Name",
+          "relay": "Relay URL"
+        },
+        "data_description": {
+          "pair_code": "Ten characters, as shown on the device. For example K7M2-P4QX-9R.",
+          "name": "What to call this in Home Assistant.",
+          "relay": "Only change this if you deployed your own Cloudflare Worker."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Pairing code changed",
+        "description": "The relay no longer accepts the stored code. This happens when a new code is generated on the device, or after re-flashing with --erase. Enter the code now shown on screen.",
+        "data": {
+          "pair_code": "Pairing code"
+        }
+      }
+    },
+    "error": {
+      "invalid_code": "That is not a valid pairing code. It is ten characters, and the letters I and O and the digits 0 and 1 are never used.",
+      "already_claimed": "Another reader already holds this stream. Either someone else has this pairing code, or the device has since generated a new one.",
+      "cannot_connect": "Could not reach the relay.",
+      "timeout": "The relay did not answer in time.",
+      "insecure_relay": "The relay URL must start with https://.",
+      "unknown": "Unexpected error. Check the Home Assistant log for details."
+    },
+    "abort": {
+      "already_configured": "That pairing code is already set up.",
+      "reauth_successful": "Re-paired successfully."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "PeekESP options",
+        "description": "How often to poll the relay. Every reader shares one request budget: at 30 seconds this costs about 2,880 requests a day against Cloudflare's free 100,000, and each agent and each display costs 17,280 of it at their 5-second default.",
+        "data": {
+          "scan_interval": "Poll interval"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "cpu": { "name": "CPU" },
+      "ram": { "name": "Memory" },
+      "storage": { "name": "Storage used" },
+      "storage_free": { "name": "Storage free" },
+      "storage_total": { "name": "Storage total" },
+      "temperature": { "name": "CPU temperature" },
+      "network_rx": { "name": "Network in" },
+      "network_tx": { "name": "Network out" },
+      "battery": { "name": "Battery" },
+      "battery_runtime": { "name": "Battery runtime" },
+      "boot_time": { "name": "Last boot" },
+      "last_seen": { "name": "Last reading" }
+    },
+    "binary_sensor": {
+      "online": { "name": "Reporting" },
+      "charging": { "name": "Charging" },
+      "ac_power": { "name": "AC power" }
+    },
+    "button": {
+      "identify": { "name": "Identify" },
+      "refresh": { "name": "Refresh now" },
+      "wake": { "name": "Wake" },
+      "standby": { "name": "Standby" },
+      "reboot": { "name": "Reboot display" }
+    }
+  }
+}
