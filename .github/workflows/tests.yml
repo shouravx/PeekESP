@@ -1,0 +1,33 @@
+name: Tests
+
+# The Python suites - the Home Assistant integration, the Raspberry Pi display
+# host, and the Linux agent with its peekesp wrapper - had only ever been run on
+# the laptop that wrote them. They are standard library plus Pillow and take
+# about fifteen seconds, so they run on every push rather than behind a paths
+# filter that someone would eventually forget to extend.
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  python:
+    name: Python suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Pillow for the display renderer, whose tests skip themselves without
+      # it - which would make a green run here mean less than it says. Node is
+      # already on the runner; the pairing cross-check against the Worker's
+      # JavaScript uses it.
+      - name: Pillow
+        run: python -m pip install --quiet Pillow
+
+      - name: Run every suite
+        run: python -m unittest discover -s tests -v

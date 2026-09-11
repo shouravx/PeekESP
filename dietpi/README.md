@@ -47,6 +47,9 @@ peekesp test                one reading, as this machine would report it
 sudo peekesp pair CODE      re-pair to a different device
 peekesp config              current settings
 sudo peekesp set KEY VALUE  interval SECONDS | relay URL | serve on|off
+sudo peekesp cmd VERB [N]   tell the display: reboot, standby, wake, refresh,
+                            identify, page N, bright 0-3
+peekesp check               is a newer release out
 sudo peekesp update         fetch the latest agent and restart
 sudo peekesp uninstall      remove the service, the files and the account
 peekesp version
@@ -86,6 +89,53 @@ sudo peekesp set relay https://my-worker.workers.dev
 
 `update` refuses to install a download that is not valid Python, because a
 truncated fetch would otherwise take the service down until the next release.
+
+### Telling the display what to do
+
+The same commands the Windows app sends, from the command line:
+
+```bash
+sudo peekesp cmd identify     # flash the screen - which display is this?
+sudo peekesp cmd refresh      # poll now instead of waiting out the interval
+sudo peekesp cmd standby      # screen off, polling slowed to once a minute
+sudo peekesp cmd wake
+sudo peekesp cmd page 2       # the machines first, then the clock, then power
+sudo peekesp cmd bright 1     # 0-3: 100 / 59 / 27 / 8 %
+sudo peekesp cmd reboot
+```
+
+The display polls and never listens, so a command is left at the relay and
+collected on its next poll — **queued**, not done. That is within about five
+seconds, or a minute if the display is in standby. A command still waiting
+after five minutes is dropped rather than delivered late, so a `standby` sent
+while the display was unplugged does not fire when it comes back.
+
+It needs root because the pairing code is the credential and the file holding
+it is readable by root only. The command is authorised with the push token
+derived from that code — the one this machine already pushes telemetry with —
+so it grants nothing this machine did not already have. Every command is undone
+by a button on the display, and none of them changes configuration.
+
+`bright` stops at 3 here even though the relay accepts up to 15: the display has
+four backlight levels and silently ignores anything past them, and a command
+that is accepted and quietly does nothing is the least useful way to fail.
+
+"Queued" means the relay accepted it for *this machine's* pairing code. If the
+display has since been given a new code, it reads a different stream and the
+command will never arrive — re-pair first with `sudo peekesp pair NEW-CODE`.
+
+### Is there an update
+
+```
+$ peekesp check
+installed 1.2.0; up to date (latest is 1.2.0)
+```
+
+It asks GitHub for the newest release and compares the versions as numbers, so
+1.10.0 is correctly newer than 1.9.0. The exit status is the answer — `0` up to
+date, `10` a newer release exists, `1` GitHub could not be reached — so it can
+drive a cron job or a monitoring check without parsing the sentence. A failed
+check never reports an update: a network error is not news.
 
 ## Several machines, one code
 

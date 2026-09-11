@@ -5,18 +5,20 @@ bump_version.py - set the version everywhere it is written down.
     python tools/bump_version.py 1.2.0
     python tools/bump_version.py --check
 
-The version appears in four files, and three of them fail the build when they
-disagree with the first:
+The version is written down in five files, and --check - which CI runs - fails
+the build when any of them disagrees with the first:
 
     VERSION                     the source of truth
     PeekESP/PeekESP.ino         FW_VERSION - reported over the wire, shown on
                                 the settings page, compared by the update check
     windows/peek_version.py     what the app reports
+    dietpi/peek-agent.py        AGENT_VERSION - what `peekesp version` prints
+                                and what `peekesp check` compares
     packaging/aur/PKGBUILD      pkgver, which the AUR shows and builds from
 
-Those guards catch drift, which is worth having - but catching drift at build
-time still leaves someone editing four files by hand and finding out about the
-fifth from a failed release. This edits all of them.
+That guard catches drift, which is worth having - but catching drift at build
+time still leaves someone editing the files by hand and finding out about the
+one they missed from a failed release. This edits all of them.
 
 --check makes no changes and exits non-zero on disagreement, which is what CI
 runs.
@@ -36,6 +38,8 @@ SITES = [
      re.compile(r'(?m)^(#define\s+FW_VERSION\s+")([^"]+)(")'), "FW_VERSION"),
     (REPO / "windows" / "peek_version.py",
      re.compile(r'(?m)^(__version__\s*=\s*")([^"]+)(")'), "__version__"),
+    (REPO / "dietpi" / "peek-agent.py",
+     re.compile(r'(?m)^(AGENT_VERSION\s*=\s*")([^"]+)(")'), "AGENT_VERSION"),
     (REPO / "packaging" / "aur" / "PKGBUILD",
      re.compile(r'(?m)^(pkgver=)([^\s]+)()'), "pkgver"),
 ]
@@ -110,7 +114,9 @@ def main():
         sys.exit(1)
 
     if a.check:
-        print(f"\nall four agree on {want}")
+        # Counted, not written out: this said "four" and went on saying it
+        # after a fifth file joined the list.
+        print(f"\nall {len(SITES) + 1} agree on {want}")
     else:
         print(f"\nversion is now {want} everywhere")
         print("A release still needs: python tools/export_firmware.py, then a tag.")

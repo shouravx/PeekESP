@@ -58,6 +58,168 @@ USER_AGENT = "PeekESP-agent/1.0 (+https://github.com/shouravx/PeekESP)"
 # enough on both sides and there is no URL to copy anywhere.
 RELAY_BASE = "https://peek-relay.peekesp.workers.dev"
 
+# Kept in step with the VERSION file by tools/bump_version.py, which CI runs
+# with --check. Before this the Linux agent carried no version at all, so
+# `peekesp version` could only print a path and a date, and there was nothing
+# to compare a release against.
+AGENT_VERSION = "1.2.0"
+
+RELEASES_API = "https://api.github.com/repos/shouravx/PeekESP/releases/latest"
+
+
+# --------------------------------------------------------------------------
+#  Commands for the display.
+#
+#  The display polls and never listens, so a command is left at the relay and
+#  collected on its next poll: queued, not done. The vocabulary is the relay's
+#  own closed set (COMMANDS in cloudflare/src/index.js). The relay would reject
+#  anything else too, but refusing it here names the valid verbs instead of
+#  printing an HTTP 400.
+# --------------------------------------------------------------------------
+COMMANDS = ("reboot", "standby", "wake", "refresh", "identify")
+
+# The verbs that take a number, and the highest one worth sending.
+#
+# The relay accepts 0-15 for both. The firmware bounds-checks and silently
+# ignores anything past what it has, so "bright 9" would be accepted and do
+# nothing - the least useful way for a command to fail. The display has four
+# backlight levels, so bright stops at 3. The page count depends on how many
+# machines the display is showing, which only the display knows, so page is
+# held to the relay's bound and nothing tighter.
+ARG_COMMANDS = {"page": 15, "bright": 3}
+
+
+def normalise_command(verb, arg=None):
+    """'Reboot' -> 'reboot'; ('bright', 2) or 'bright:2' -> 'bright:2'.
+
+    Raises ValueError with a message meant for a person."""
+    text = str(verb or "").strip().lower()
+    if arg is None and ":" in text:
+        text, _, arg = text.partition(":")
+    if text in COMMANDS:
+        if arg not in (None, ""):
+            raise ValueError("'%s' takes no number" % text)
+        return text
+    if text in ARG_COMMANDS:
+        if arg is None or str(arg).strip() == "":
+            raise ValueError("'%s' needs a number: %s N" % (text, text))
+        try:
+            n = int(str(arg).strip())
+        except ValueError:
+            raise ValueError("'%s' needs a whole number, not '%s'" % (text, arg))
+        if not 0 <= n <= ARG_COMMANDS[text]:
+            raise ValueError("%s must be 0-%d" % (text, ARG_COMMANDS[text]))
+        return "%s:%d" % (text, n)
+    raise ValueError("unknown command '%s'. Known: %s, page N, bright N"
+                     % (text, ", ".join(COMMANDS)))
+
+
+def send_command(code, verb, relay_base=RELAY_BASE, timeout=10):
+    """Leave a command for the display. Returns (ok, message).
+
+    Authorised with the push token this machine already derives from the
+    pairing code, so it grants nothing this machine did not already have:
+    anything that can push its telemetry can also ask its display to reboot.
+    """
+    import urllib.error
+    import urllib.request
+
+    try:
+        text = normalise_command(verb)
+        d = pair_derive(code)
+    except ValueError as e:
+        return False, str(e)
+
+    base = (relay_base or "").rstrip("/")
+    # Loopback may be plain HTTP - it is how this is tested, and how a relay
+    # run with `wrangler dev` is reached. Anywhere else would carry the push
+    # token in the clear, so it is refused before a connection is opened.
+    if not (base.startswith("https://")
+            or re.match(r"^http://(127\.0\.0\.1|localhost)(:\d+)?$", base)):
+        return False, "the relay must be an https:// URL, not %s" % (base or "nothing")
+
+    # The bare verb as text, not JSON. The Worker hands request.text()
+    # straight to its parser, so {"cmd": "reboot"} would be read as that
+    # literal string and refused as an unknown command.
+    req = urllib.request.Request(
+        "%s/command/%s" % (base, d["stream"]),
+        data=text.encode("ascii"),
+        method="POST",
+        headers={
+            "Content-Type": "text/plain",
+            "Authorization": "Bearer " + d["push"],
+            "User-Agent": USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return False, "the relay refused the credential derived from this pairing code"
+        if e.code == 400:
+            return False, "the relay rejected '%s'" % text
+        return False, "the relay answered HTTP %d %s" % (e.code, e.reason)
+    except (urllib.error.URLError, OSError) as e:
+        return False, "cannot reach %s: %s" % (base, getattr(e, "reason", e))
+    return True, ("%s queued - the display collects it on its next poll, within "
+                  "about 5 s, or a minute if it is in standby" % text)
+
+
+# --------------------------------------------------------------------------
+#  Is there a newer release.
+# --------------------------------------------------------------------------
+def _version_tuple(text):
+    """'v1.10.2' -> (1, 10, 2).
+
+    Numbers, not strings: "1.10.0" is newer than "1.9.0" and sorts before it
+    alphabetically, which is the classic way an update check goes quiet at
+    exactly the point it starts to matter."""
+    out = []
+    for part in str(text or "").strip().lstrip("vV").split(".")[:4]:
+        digits = "".join(c for c in part if c.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out) or (0,)
+
+
+def is_newer(latest, current):
+    a, b = _version_tuple(latest), _version_tuple(current)
+    n = max(len(a), len(b))
+    return a + (0,) * (n - len(a)) > b + (0,) * (n - len(b))
+
+
+def latest_release(url=RELEASES_API, timeout=8):
+    """The newest published version, or "" if it could not be found out.
+
+    Never raises. A failed check has to read as "could not check" - a network
+    error mistaken for news is how an update prompt teaches people to ignore
+    it.
+    """
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept": "application/vnd.github+json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+    except (urllib.error.URLError, OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("tag_name") or "").strip().lstrip("vV")[:20]
+
+
+def update_status(latest, current=AGENT_VERSION):
+    """(exit status, sentence): 0 up to date, 10 newer available, 1 unknown."""
+    if not latest:
+        return 1, "installed %s; could not reach GitHub to check" % current
+    if is_newer(latest, current):
+        return 10, "installed %s; %s is available" % (current, latest)
+    return 0, "installed %s; up to date (latest is %s)" % (current, latest)
+
 
 # --------------------------------------------------------------------------
 #  Pairing: the device shows a code, you type it here, and both ends derive
@@ -446,7 +608,39 @@ def main():
     ap.add_argument("--verify", action="store_true",
                     help="check the pairing code, print the stream it derives, "
                          "and exit without pushing anything")
+    ap.add_argument("--command", metavar="VERB", nargs="+",
+                    help="leave a command for the display and exit: "
+                         + ", ".join(COMMANDS) + ", page N, bright N")
+    ap.add_argument("--version", action="store_true",
+                    help="print this agent's version and exit")
+    ap.add_argument("--check-update", action="store_true",
+                    help="say whether a newer release exists and exit: "
+                         "0 up to date, 10 newer available, 1 could not check")
     args = ap.parse_args()
+
+    # The one-shot actions come first, before anything samples this machine or
+    # opens a socket - none of them is about telemetry.
+    if args.version:
+        print(AGENT_VERSION)
+        return
+
+    if args.check_update:
+        status, message = update_status(latest_release())
+        print(message)
+        raise SystemExit(status)
+
+    if args.command:
+        if not args.pair_code:
+            ap.error("--command needs a pairing code (--pair-code, or PEEK_PAIR_CODE)")
+        if len(args.command) > 2:
+            ap.error("--command takes a verb and at most one number")
+        try:
+            text = normalise_command(*args.command)
+        except ValueError as e:
+            ap.error(str(e))
+        ok, message = send_command(args.pair_code, text, args.relay_base)
+        print(message)
+        raise SystemExit(0 if ok else 1)
 
     if args.verify:
         if not args.pair_code:

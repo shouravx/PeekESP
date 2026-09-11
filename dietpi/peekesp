@@ -10,6 +10,9 @@
 #   peekesp pair CODE           re-pair to a different device
 #   peekesp config              current settings
 #   peekesp set KEY VALUE       interval | relay | serve
+#   peekesp cmd VERB [N]        tell the display: reboot, standby, wake,
+#                               refresh, identify, page N, bright N
+#   peekesp check               is a newer release out
 #   peekesp update              fetch the latest agent and restart
 #   peekesp uninstall
 #   peekesp version
@@ -99,6 +102,9 @@ peekesp - control the PeekESP telemetry agent
   sudo peekesp pair CODE      re-pair to a different device
   peekesp config              current settings
   sudo peekesp set KEY VALUE  interval SECONDS | relay URL | serve on|off
+  sudo peekesp cmd VERB [N]   tell the display: reboot | standby | wake |
+                              refresh | identify | page N | bright 0-3
+  peekesp check               is a newer release out
   sudo peekesp update         fetch the latest agent and restart
   sudo peekesp uninstall      remove the service, the files and the account
   peekesp version
@@ -307,9 +313,60 @@ uninstall)
     say "then drops it from the device on its own."
     ;;
 
+cmd|command)
+    installed
+    # Usage before the root check, so `peekesp cmd` on its own explains itself
+    # rather than asking for sudo first.
+    [ $# -ge 1 ] || die "usage: sudo peekesp cmd VERB [N]
+       reboot     restart the display; it keeps its settings
+       standby    screen off, polling slowed to once a minute
+       wake       screen back on
+       refresh    poll now instead of waiting out the interval
+       identify   flash the screen, to find which display this is
+       page N     jump to page N: the machines, then the clock, then power
+       bright N   backlight 0-3, for 100 / 59 / 27 / 8 %"
+    # Root, because the pairing code is the credential and the file holding it
+    # is 0600. The command is then authorised with the push token derived from
+    # that code - the one this machine already pushes with - so it grants
+    # nothing this machine did not already have.
+    need_root cmd "$@"
+    load_conf
+    [ -n "${PEEK_PAIR_CODE:-}" ] || die "no pairing code in $CONF - set one with:
+       sudo peekesp pair YOUR-CODE"
+    python3 "$AGENT" --pair-code "$PEEK_PAIR_CODE" \
+        --relay-base "${PEEK_RELAY_BASE:-https://peek-relay.peekesp.workers.dev}" \
+        --command "$@"
+    ;;
+
+check)
+    installed
+    # Read-only and needs no root: it asks GitHub for the newest release and
+    # compares it with the installed agent. The exit status carries the answer
+    # - 0 up to date, 10 newer available, 1 could not check - so a cron job or
+    # a monitoring check can act on it without parsing the sentence.
+    set +e
+    python3 "$AGENT" --check-update
+    rc=$?
+    set -e
+    if [ "$rc" -eq 10 ]; then
+        if [ "$PREFIX" = "/usr/lib/peekesp" ]; then
+            say "update it with your package manager:"
+            say "    sudo apt update && sudo apt install --only-upgrade peekesp"
+            say "    sudo pacman -Syu peekesp"
+        else
+            say "update it with:  sudo peekesp update"
+        fi
+    fi
+    exit "$rc"
+    ;;
+
 version)
     if [ -f "$AGENT" ]; then
-        say "agent     $AGENT"
+        # An agent older than --version answers with a usage error. "unknown"
+        # is the honest reading of that, and it must not fail the command: the
+        # release pipeline runs this to prove a fresh install works.
+        say "agent     $(python3 "$AGENT" --version 2>/dev/null || echo unknown)"
+        say "path      $AGENT"
         say "modified  $(date -r "$AGENT" '+%Y-%m-%d %H:%M' 2>/dev/null || echo unknown)"
     else
         say "not installed"
